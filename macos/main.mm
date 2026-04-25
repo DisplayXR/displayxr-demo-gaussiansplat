@@ -91,7 +91,7 @@ struct InputState {
     float cameraPosX = 0.0f, cameraPosY = 0.0f, cameraPosZ = 0.0f;
     bool resetViewRequested = false;
     ViewParams viewParams;
-    bool hudVisible = true;
+    bool hudVisible = false;  // Hidden by default; toggle with Tab.
     bool cameraMode = false;
     float nominalViewerZ = 0.5f;
     bool eyeTrackingModeToggleRequested = false;
@@ -107,13 +107,17 @@ struct InputState {
     float transitionDuration = 0.45f;
 
     // Auto-orbit (turntable) mode
-    bool animateEnabled = false;
+    bool animateEnabled = true;  // Always on; auto-orbit kicks in after 10 s idle.
     double lastInputTimeSec = 0.0;
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
 
-    // Scene-flip toggle (180° about display X axis, applied post-view-matrix).
-    bool flipY = false;
+    // Scene-flip toggles (post-view-matrix mirror through XZ or YZ plane).
+    // Per-format defaults are set by ApplyAutoFitForLoadedScene after load:
+    //   .spz (Niantic, RUB native): flipY=true,  flipX=false
+    //   .ply (gsplat-trainer):      flipY=false, flipX=true
+    bool flipY = true;
+    bool flipX = false;
     bool flipToggleRequested = false;
 
     // Drag-and-drop / pending file load
@@ -125,10 +129,22 @@ struct InputState {
     bool renderingModeChangeRequested = false;
 };
 
-// Default virtual-display height in meters: roughly a human's height.
-// Using a constant keeps parallax / IPD behaviour consistent across scenes
-// (splat AABBs vary wildly).
+// Fallback virtual-display height in meters when no scene is loaded
+// (or auto-fit fails). On scene load we replace this with a robust
+// percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
+
+// Comfort margin is baked into getMainObjectBounds (which picks a different
+// multiplier for single-object vs scene-with-central-object). Keep this at
+// 1.0 to mean "no extra margin on top of what the bounds method returned".
+static constexpr float kAutoFitVerticalComfort = 1.0f;
+
+// Cached auto-fit result for the currently loaded scene. Reused by Reset
+// so 'Space' returns to the framed pose rather than world origin.
+static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
+static float g_fitVHeight   = kDefaultVirtualDisplayHeightM;
+static float g_fitYaw       = 0.0f;
+static bool  g_fitValid     = false;
 
 // ============================================================================
 // Globals
@@ -173,6 +189,14 @@ static void mat4_identity(float* m) {
 // so depth and shader logic remain correct.
 static void view_apply_y_flip(float* view_col_major_16) {
     for (int i = 0; i < 4; i++) view_col_major_16[4 + i] = -view_col_major_16[4 + i];
+}
+
+// Mirror across the YZ plane: post-multiply view by diag(-1, 1, 1, 1).
+// PLY data from gsplat-trainer comes out X-mirrored vs SuperSplat in our
+// pipeline; this view-stage flip undoes it without needing to negate
+// position data + conjugate quaternions at load.
+static void view_apply_x_flip(float* view_col_major_16) {
+    for (int i = 0; i < 4; i++) view_col_major_16[i] = -view_col_major_16[i];
 }
 
 static void mat4_multiply(float* out, const float* a, const float* b) {
@@ -260,7 +284,7 @@ static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
 
 struct AppXrSession;
 static void UpdateTopBarButtonTitles(AppXrSession& xr);
-static void ResetVirtualDisplayHeightForNewScene();
+static void ApplyAutoFitForLoadedScene();
 
 // ============================================================================
 // Input timestamp helper
@@ -306,15 +330,26 @@ static void yaw_pitch_from_quat(XrQuaternionf q, float* yaw, float* pitch) {
 
 static void UpdateCameraMovement(InputState& input, float dt, float displayHeightM) {
     if (input.resetViewRequested) {
-        input.yaw = 0; input.pitch = 0;
-        input.cameraPosX = input.cameraPosY = input.cameraPosZ = 0;
+        input.pitch = 0;
         input.viewParams = ViewParams();
-        input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
+        if (g_fitValid) {
+            input.cameraPosX = g_fitCenter[0];
+            input.cameraPosY = g_fitCenter[1];
+            input.cameraPosZ = g_fitCenter[2];
+            input.yaw = g_fitYaw;
+            input.viewParams.virtualDisplayHeight = g_fitVHeight;
+        } else {
+            input.cameraPosX = input.cameraPosY = input.cameraPosZ = 0;
+            input.yaw = 0;
+            input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
+        }
         input.resetViewRequested = false;
         input.transitioning = false;
-        input.animateEnabled = false;
+        // Auto-orbit always on; resetting just resets the idle timer below.
         input.animationActive = false;
-        input.flipY = false;
+        // Preserve per-format flipY/flipX through Reset — they were set by
+        // ApplyAutoFitForLoadedScene based on file extension and shouldn't
+        // be reverted by Space.
         input.lastInputTimeSec = NowSec();
         return;
     }
@@ -404,9 +439,7 @@ static NSVisualEffectView *g_hudBackdrop = nil;  // frosted wrapper sized to hud
 
 static NSView   *g_topBar = nil;
 static NSButton *g_openButton = nil;
-static NSButton *g_orbitButton = nil;
 static NSButton *g_modeButton = nil;
-static NSButton *g_flipButton = nil;
 static NSView   *g_reticleView = nil;
 
 // Translucent dark background view used behind the top bar.
@@ -476,7 +509,7 @@ static void OpenLoadDialog() {
                         g_loadedFileName = GetPlyFilename(pathStr);
                         LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                             GetPlyFileSize(pathStr).c_str());
-                        ResetVirtualDisplayHeightForNewScene();
+                        ApplyAutoFitForLoadedScene();
                     } else {
                         LOG_ERROR("Failed to load scene: %s", path);
                         NSAlert *alert = [[NSAlert alloc] init];
@@ -529,7 +562,7 @@ static void OpenLoadDialog() {
 
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
-    g_input.yaw += (float)[event deltaX] * 0.005f;
+    g_input.yaw -= (float)[event deltaX] * 0.005f;
     g_input.pitch += (float)[event deltaY] * 0.005f;
     float maxPitch = 1.5f;
     if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
@@ -682,7 +715,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
                        NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
     g_window = [[NSWindow alloc] initWithContentRect:frame
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
-    [g_window setTitle:@"SR 3DGS OpenXR Ext macOS (Press ESC to exit)"];
+    [g_window setTitle:@"DisplayXR Gaussian Splat Viewer Demo"];
     [g_window setDelegate:delegate];
     [g_window center];
 
@@ -709,13 +742,14 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_hudView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [g_hudBackdrop addSubview:g_hudView];
 
-    // --- Top bar (Open / Auto-Orbit / Mode / Flip) — frosted vibrancy panel ---
+    // --- Top bar (Open / Auto-Orbit / Mode / Flip) — transparent so the
+    // buttons sit directly over the rendered content (no frosted panel
+    // hiding the top of the scene).
     const CGFloat barH = 48.0;
     NSRect barFrame = NSMakeRect(0, height - barH, width, barH);
-    NSVisualEffectView *topBar = [[NSVisualEffectView alloc] initWithFrame:barFrame];
-    [topBar setMaterial:NSVisualEffectMaterialHUDWindow];
-    [topBar setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
-    [topBar setState:NSVisualEffectStateActive];
+    NSView *topBar = [[NSView alloc] initWithFrame:barFrame];
+    [topBar setWantsLayer:YES];
+    [[topBar layer] setBackgroundColor:[[NSColor clearColor] CGColor]];
     [topBar setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
     g_topBar = topBar;
     [g_metalView addSubview:g_topBar];
@@ -723,39 +757,41 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     const CGFloat btnH = 32.0, btnY = (barH - btnH) * 0.5f;
     const CGFloat gap = 10.0;
     CGFloat x = 12.0;
-    CGFloat openW = 96.0, orbitW = 160.0, modeW = 220.0;
+    CGFloat openW = 96.0, modeW = 220.0;
 
-    g_openButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, openW, btnH)];
-    [g_openButton setTitle:@"Open…"];
-    [g_openButton setBezelStyle:NSBezelStyleRounded];
-    [g_openButton setTarget:nil];
-    [g_openButton setAction:@selector(openButtonClicked:)];
-    [g_topBar addSubview:g_openButton];
+    // Helper: wrap a button in a glassy NSVisualEffectView backdrop matching
+    // the HUD's HUDWindow material so the controls have the same look.
+    NSView * (^makeGlassyButton)(NSRect, NSString*, SEL, NSButton **) =
+        ^NSView *(NSRect frame, NSString *title, SEL act, NSButton **outBtn) {
+        NSVisualEffectView *bd = [[NSVisualEffectView alloc] initWithFrame:frame];
+        [bd setMaterial:NSVisualEffectMaterialHUDWindow];
+        [bd setBlendingMode:NSVisualEffectBlendingModeWithinWindow];
+        [bd setState:NSVisualEffectStateActive];
+        [bd setWantsLayer:YES];
+        bd.layer.cornerRadius = 6.0;
+        bd.layer.masksToBounds = YES;
+        NSButton *b = [[NSButton alloc] initWithFrame:bd.bounds];
+        [b setTitle:title];
+        [b setBezelStyle:NSBezelStyleInline];
+        [b setBordered:NO];
+        [b setTarget:nil];
+        [b setAction:act];
+        [b setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
+        [bd addSubview:b];
+        if (outBtn) *outBtn = b;
+        return bd;
+    };
+
+    NSView *openBd = makeGlassyButton(NSMakeRect(x, btnY, openW, btnH),
+                                       @"Open…", @selector(openButtonClicked:),
+                                       &g_openButton);
+    [g_topBar addSubview:openBd];
     x += openW + gap;
 
-    g_orbitButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, orbitW, btnH)];
-    [g_orbitButton setTitle:@"Auto-Orbit: Off"];
-    [g_orbitButton setBezelStyle:NSBezelStyleRounded];
-    [g_orbitButton setTarget:nil];
-    [g_orbitButton setAction:@selector(orbitButtonClicked:)];
-    [g_topBar addSubview:g_orbitButton];
-    x += orbitW + gap;
-
-    g_modeButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, modeW, btnH)];
-    [g_modeButton setTitle:@"Mode: —"];
-    [g_modeButton setBezelStyle:NSBezelStyleRounded];
-    [g_modeButton setTarget:nil];
-    [g_modeButton setAction:@selector(modeButtonClicked:)];
-    [g_topBar addSubview:g_modeButton];
-    x += modeW + gap;
-
-    const CGFloat flipW = 96.0;
-    g_flipButton = [[NSButton alloc] initWithFrame:NSMakeRect(x, btnY, flipW, btnH)];
-    [g_flipButton setTitle:@"Flip: Off"];
-    [g_flipButton setBezelStyle:NSBezelStyleRounded];
-    [g_flipButton setTarget:nil];
-    [g_flipButton setAction:@selector(flipButtonClicked:)];
-    [g_topBar addSubview:g_flipButton];
+    NSView *modeBd = makeGlassyButton(NSMakeRect(x, btnY, modeW, btnH),
+                                       @"Mode: —", @selector(modeButtonClicked:),
+                                       &g_modeButton);
+    [g_topBar addSubview:modeBd];
 
     // --- Reticle (non-interactive center crosshair) ---
     const CGFloat retSize = 20.0;
@@ -772,9 +808,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
 // Button action handlers (added as category on NSApplication)
 @interface NSApplication (TopBarActions)
 - (void)openButtonClicked:(id)sender;
-- (void)orbitButtonClicked:(id)sender;
 - (void)modeButtonClicked:(id)sender;
-- (void)flipButtonClicked:(id)sender;
 @end
 
 @implementation NSApplication (TopBarActions)
@@ -783,11 +817,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     MarkUserInput(g_input);
     g_input.loadRequested = true;
 }
-- (void)orbitButtonClicked:(id)sender {
-    (void)sender;
-    MarkUserInput(g_input);
-    g_input.animateToggleRequested = true;
-}
 - (void)modeButtonClicked:(id)sender {
     (void)sender;
     MarkUserInput(g_input);
@@ -795,11 +824,6 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         g_input.currentRenderingMode = (g_input.currentRenderingMode + 1) % g_input.renderingModeCount;
     }
     g_input.renderingModeChangeRequested = true;
-}
-- (void)flipButtonClicked:(id)sender {
-    (void)sender;
-    MarkUserInput(g_input);
-    g_input.flipToggleRequested = true;
 }
 @end
 
@@ -894,9 +918,6 @@ struct AppXrSession {
 };
 
 static void UpdateTopBarButtonTitles(AppXrSession& xr) {
-    if (g_orbitButton) {
-        [g_orbitButton setTitle:(g_input.animateEnabled ? @"Auto-Orbit: On" : @"Auto-Orbit: Off")];
-    }
     if (g_modeButton) {
         const char *name = "Unknown";
         if (xr.renderingModeCount > 0 &&
@@ -905,9 +926,6 @@ static void UpdateTopBarButtonTitles(AppXrSession& xr) {
             name = xr.renderingModeNames[g_input.currentRenderingMode];
         }
         [g_modeButton setTitle:[NSString stringWithFormat:@"Mode: %s", name]];
-    }
-    if (g_flipButton) {
-        [g_flipButton setTitle:(g_input.flipY ? @"Flip: On" : @"Flip: Off")];
     }
 }
 
@@ -1349,9 +1367,59 @@ static bool FileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static void ResetVirtualDisplayHeightForNewScene() {
-    g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
+// Compute robust scene bounds (5th–95th percentile per axis) and set the
+// display rig pose + vHeight to frame the scene. Display orientation is
+// kept identity (forward = world −Z): splats have no canonical front, and
+// any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
+// with mouse drag from a predictable starting pose.
+static void ApplyAutoFitForLoadedScene() {
+    float center[3], extent[3];
+    // Voxel-density flood-fill from the peak voxel: locates the main object
+    // by spatial connectivity (figure is a contiguous 3D blob, walls/floor
+    // are separated by air gaps that the flood-fill can't cross). 64³ grid.
+    if (g_gsRenderer.getMainObjectBounds(64u, center, extent)) {
+        g_fitCenter[0] = center[0];
+        g_fitCenter[1] = center[1];
+        g_fitCenter[2] = center[2];
+        float vh = extent[1] * kAutoFitVerticalComfort;
+        if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
+        g_fitVHeight = vh;
+
+        // EXPERIMENT: yaw scan disabled to test if RUB load convention now
+        // gives a natural yaw=0 facing (matching SuperSplat's default).
+        // float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
+        // g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
+        g_fitYaw = 0.0f;
+
+        g_fitValid = true;
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+                 center[0], center[1], center[2],
+                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+    } else {
+        g_fitValid = false;
+    }
+
+    g_input.cameraPosX = g_fitValid ? g_fitCenter[0] : 0.0f;
+    g_input.cameraPosY = g_fitValid ? g_fitCenter[1] : 0.0f;
+    g_input.cameraPosZ = g_fitValid ? g_fitCenter[2] : 0.0f;
+    g_input.yaw = g_fitValid ? g_fitYaw : 0.0f;
+    g_input.pitch = 0.0f;
+    g_input.viewParams.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM;
     g_input.viewParams.scaleFactor = 1.0f;
+
+    // Per-format Y/X-flip defaults (see flipY/flipX comments). SPZ comes
+    // through Niantic's RUB convention → needs Y-mirror at view stage. PLY
+    // from gsplat-trainer needs X-mirror to match SuperSplat orientation.
+    bool isPly = false;
+    if (g_loadedFileName.size() >= 4) {
+        std::string ext = g_loadedFileName.substr(g_loadedFileName.size() - 4);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        isPly = (ext == ".ply");
+    }
+    g_input.flipY = !isPly;
+    g_input.flipX = isPly;
+    LOG_INFO("Per-format flips: flipY=%d flipX=%d (%s)",
+             g_input.flipY, g_input.flipX, isPly ? "PLY" : "SPZ");
 }
 
 static void TryAutoLoadBundledScene() {
@@ -1367,7 +1435,7 @@ static void TryAutoLoadBundledScene() {
     if (g_gsRenderer.loadScene(path.c_str())) {
         g_loadedFileName = GetPlyFilename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
-        ResetVirtualDisplayHeightForNewScene();
+        ApplyAutoFitForLoadedScene();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
     }
@@ -1519,7 +1587,7 @@ int main() {
                 LOG_INFO("Loading dropped scene: %s", p.c_str());
                 if (g_gsRenderer.loadScene(p.c_str())) {
                     g_loadedFileName = GetPlyFilename(p);
-                    ResetVirtualDisplayHeightForNewScene();
+                    ApplyAutoFitForLoadedScene();
                 }
             }
         }
@@ -1634,7 +1702,17 @@ int main() {
 
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                        // The view-stage Y-flip (and X-flip) is post-applied to the view
+                        // matrix as view * diag(±1, ±1, 1, 1). For non-zero displayPose
+                        // axes, this leaves the display center at view-space y = -2·cy − 0.1
+                        // instead of -0.1, breaking the Kooima frustum's centering. Mirror
+                        // the corresponding axis of displayPose so the view-stage flip and
+                        // the projection stay aligned.
+                        float dispX = g_input.cameraPosX;
+                        float dispY = g_input.cameraPosY;
+                        if (g_input.flipX) dispX = -dispX;
+                        if (g_input.flipY) dispY = -dispY;
+                        cameraPose.position = {dispX, dispY, g_input.cameraPosZ};
 
                         XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
@@ -1699,6 +1777,9 @@ int main() {
 
                             if (g_input.flipY) {
                                 for (auto& v : eyeViews) view_apply_y_flip(v.view_matrix);
+                            }
+                            if (g_input.flipX) {
+                                for (auto& v : eyeViews) view_apply_x_flip(v.view_matrix);
                             }
                         }
 

@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <vector>
 #include "gs_vulkan_utils.h"
+#include "gs_scene_loader.h"  // GsVertex (used by filterFloaters signature)
 
 struct GsPickData {
     float px, py, pz;   // world-space position
@@ -62,6 +63,48 @@ struct GsRenderer {
     // Returns false if no scene is loaded; otherwise writes min/max xyz.
     bool getSceneBBox(float outMin[3], float outMax[3]) const;
 
+    // Find the display yaw (radians, around world +Y) that maximises the
+    // opacity-weighted mass of gaussians in front of the viewer. Tests
+    // numCandidates evenly-spaced yaws from 0 to 2π. Used by demos for
+    // initial framing so the user starts facing the captured side of the
+    // object rather than its back.
+    //
+    // displayCenter[3] = world position of the display rig (typically the
+    //                    robust scene centroid).
+    // viewerOffsetLocal[3] = viewer position in display-local coords (e.g.
+    //                       {0, 0.1, 0.6} matching nominalViewer).
+    // Returns 0.0 if no scene is loaded.
+    float findBestYaw(const float displayCenter[3],
+                      const float viewerOffsetLocal[3],
+                      uint32_t numCandidates = 8) const;
+
+    // Locate the main object via voxel-density flood-fill from the peak
+    // voxel. Voxelizes splats into a gridSize³ grid (opacity-weighted),
+    // finds the densest voxel, BFS-fills to neighbors at ≥ threshold × peak.
+    // The threshold is auto-adapted so the filled region falls between
+    // ~1 % and ~30 % of the grid. Returns the world-space bbox of the
+    // filled region.
+    //
+    // Works because the main object occupies a contiguous 3D blob, while
+    // walls/floor/ceiling are physically separated by air gaps that the
+    // flood-fill cannot cross at typical voxel sizes (≤ object–wall gap).
+    //
+    // gridSize: voxels per axis (64 is a good default — 25 cm voxels for
+    //           a 16 m scene, well under typical room air-gap distance).
+    // Returns false if no scene loaded or peak density is zero.
+    bool getMainObjectBounds(uint32_t gridSize,
+                             float outCenter[3], float outExtent[3]) const;
+
+    // Robust scene centroid + per-axis extent, excluding outlier gaussians.
+    // For each axis, takes the positions at the loPct / hiPct quantiles
+    // (e.g. 0.05 / 0.95) and returns center = midpoint, extent = hi − lo.
+    // Splat PLYs commonly contain stray gaussians far from the main cluster;
+    // a raw AABB is dominated by them. Percentile trimming matches what
+    // mature splat viewers do for auto-framing.
+    // Returns false if no scene is loaded.
+    bool getRobustSceneBounds(float loPct, float hiPct,
+                              float outCenter[3], float outExtent[3]) const;
+
     // Render one eye's view to a region of a Vulkan swapchain image.
     // Manages its own command buffers internally (allocate, record, submit, wait).
     // viewMatrix and projMatrix are column-major float[16].
@@ -100,7 +143,7 @@ private:
     // ── Derived dimensions ───────────────────────────────────────────────
     uint32_t tileX_ = 0;     // ceil(width/16)
     uint32_t tileY_ = 0;     // ceil(height/16)
-    uint32_t maxSortInstances_ = 0;  // numGaussians * 4
+    uint32_t maxSortInstances_ = 0;  // grows on overflow via growSortBuffers()
     uint32_t numPrefixSumIter_ = 0;  // ceil(log2(numGaussians))
 
     // ── GPU Buffers (14 total) ───────────────────────────────────────────
@@ -181,6 +224,10 @@ private:
     bool createPipelines();
     bool createBuffers();
     bool createDescriptorSets();
+    // Reallocate sort buffers + sort histogram to hold at least requiredCapacity
+    // tile fragments, and re-write the descriptor sets that bind them. Caller
+    // must have wait-idled the queue. No-op if requiredCapacity fits.
+    void growSortBuffers(uint32_t requiredCapacity);
     void dispatchPrecompCov3d();
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight);

@@ -41,7 +41,7 @@ using namespace DirectX;
 static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
 
 static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
-static const wchar_t* WINDOW_TITLE = L"SR 3DGS OpenXR Ext Vulkan (Press ESC to exit)";
+static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 
 // HUD overlay fractions
 static const float HUD_WIDTH_FRACTION = 0.30f;
@@ -53,11 +53,6 @@ static const float LOAD_BTN_HEIGHT_FRACTION = 0.04f;
 static const float LOAD_BTN_X_FRACTION = 0.87f;
 static const float LOAD_BTN_Y_FRACTION = 0.02f;
 
-// Auto-orbit button fractions (next to Load)
-static const float ORBIT_BTN_WIDTH_FRACTION = 0.12f;
-static const float ORBIT_BTN_HEIGHT_FRACTION = 0.04f;
-static const float ORBIT_BTN_X_FRACTION = 0.74f;
-static const float ORBIT_BTN_Y_FRACTION = 0.02f;
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
@@ -76,6 +71,58 @@ static GsRenderer g_gsRenderer;
 static std::atomic<bool> g_loadRequested{false};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
+
+// Fallback vHeight when no scene is loaded; replaced per-scene by auto-fit.
+static constexpr float kFallbackVirtualDisplayHeightM = 0.24f;
+// Comfort margin is baked into getMainObjectBounds (which picks a different
+// multiplier for single-object vs scene-with-central-object). Keep this at
+// 1.0 to mean "no extra margin on top of what the bounds method returned".
+static constexpr float kAutoFitVerticalComfort = 1.0f;
+
+// Cached auto-fit pose for the currently loaded scene. Reused by Reset
+// so 'Space' returns to the framed pose rather than world origin.
+static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
+static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
+static float g_fitYaw       = 0.0f;
+static std::atomic<bool> g_fitValid{false};
+
+// Compute robust scene bounds (5th–95th percentile per axis) and stage
+// new display-rig pose + vHeight on g_inputState. Display orientation is
+// kept identity (forward = world −Z): splats have no canonical front, and
+// any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
+// with mouse drag from a predictable starting pose.
+// Caller must hold g_sceneMutex (we read pickData_ from the renderer).
+static void ApplyAutoFitForLoadedScene_locked() {
+    float center[3], extent[3];
+    // Voxel-density flood-fill — see the macOS demo for rationale.
+    bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
+    if (ok) {
+        float vh = extent[1] * kAutoFitVerticalComfort;
+        if (!(vh > 1e-3f)) ok = false;
+        if (ok) {
+            g_fitCenter[0] = center[0];
+            g_fitCenter[1] = center[1];
+            g_fitCenter[2] = center[2];
+            g_fitVHeight = vh;
+            // Search 8 yaws to face the captured side of the scene.
+            float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
+            g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
+            LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+                     center[0], center[1], center[2],
+                     extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+        }
+    }
+    g_fitValid.store(ok);
+
+    std::lock_guard<std::mutex> lock(g_inputMutex);
+    g_inputState.cameraPosX = ok ? g_fitCenter[0] : 0.0f;
+    g_inputState.cameraPosY = ok ? g_fitCenter[1] : 0.0f;
+    g_inputState.cameraPosZ = ok ? g_fitCenter[2] : 0.0f;
+    g_inputState.yaw = ok ? g_fitYaw : 0.0f;
+    g_inputState.pitch = 0.0f;
+    g_inputState.viewParams.virtualDisplayHeight = ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
+    g_inputState.viewParams.scaleFactor = 1.0f;
+}
 
 // Fullscreen state
 static bool g_fullscreen = false;
@@ -122,16 +169,6 @@ static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH
             fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
 }
 
-static bool IsClickOnOrbitButton(int mouseX, int mouseY, int windowW, int windowH) {
-    if (windowW <= 0 || windowH <= 0) return false;
-    float fx = (float)mouseX / (float)windowW;
-    float fy = (float)mouseY / (float)windowH;
-    return (fx >= ORBIT_BTN_X_FRACTION &&
-            fx <= ORBIT_BTN_X_FRACTION + ORBIT_BTN_WIDTH_FRACTION &&
-            fy >= ORBIT_BTN_Y_FRACTION &&
-            fy <= ORBIT_BTN_Y_FRACTION + ORBIT_BTN_HEIGHT_FRACTION);
-}
-
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
     char exePath[MAX_PATH] = {0};
@@ -152,6 +189,7 @@ static void TryAutoLoadBundledScene() {
     if (g_gsRenderer.loadScene(path.c_str())) {
         g_loadedFileName = GetPlyFilename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+        ApplyAutoFitForLoadedScene_locked();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
     }
@@ -178,6 +216,7 @@ static void OpenLoadDialog(HWND hwnd) {
                 g_loadedFileName = GetPlyFilename(path);
                 LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                     GetPlyFileSize(path).c_str());
+                ApplyAutoFitForLoadedScene_locked();
             } else {
                 LOG_ERROR("Failed to load scene: %s", path.c_str());
                 MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
@@ -202,11 +241,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
             // Post to main thread — don't block WindowProc with file dialog
             PostMessage(hwnd, WM_USER + 1, 0, 0);
-            return 0;
-        }
-        if (IsClickOnOrbitButton(mx, my, g_windowWidth, g_windowHeight)) {
-            std::lock_guard<std::mutex> lock(g_inputMutex);
-            g_inputState.animateToggleRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -458,6 +492,16 @@ static void RenderThreadFunc(
         UpdatePerformanceStats(perfStats);
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
 
+        // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
+        // vHeight. For the splat demo, restore the per-scene auto-fit pose instead.
+        if (resetRequested && g_fitValid.load()) {
+            inputSnapshot.cameraPosX = g_fitCenter[0];
+            inputSnapshot.cameraPosY = g_fitCenter[1];
+            inputSnapshot.cameraPosZ = g_fitCenter[2];
+            inputSnapshot.yaw = g_fitYaw;
+            inputSnapshot.viewParams.virtualDisplayHeight = g_fitVHeight;
+        }
+
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             g_inputState.cameraPosX = inputSnapshot.cameraPosX;
@@ -471,7 +515,10 @@ static void RenderThreadFunc(
             g_inputState.animationActive = inputSnapshot.animationActive;
             if (resetRequested) {
                 g_inputState.viewParams = inputSnapshot.viewParams;
-                g_inputState.animateEnabled = false;
+                // Auto-orbit always on; reset only clears the in-flight
+                // transition. The shared UpdateCameraMovement may set
+                // animateEnabled=false on Space — re-assert true here.
+                g_inputState.animateEnabled = true;
                 g_inputState.transitioning = false;
             }
         }
@@ -1219,8 +1266,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("          L=Load  Tab=HUD  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
 
-    g_inputState.viewParams.virtualDisplayHeight = 0.24f;
+    g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
+    g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
+    g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
         using namespace std::chrono;
         g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(

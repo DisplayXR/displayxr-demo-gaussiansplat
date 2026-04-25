@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cmath>
+#include <cfloat>
 #include <algorithm>
 #include <string>
 #include <vector>
@@ -324,8 +325,10 @@ bool GsRenderer::createBuffers()
 {
     uint32_t N = numGaussians_;
     uint32_t totalTiles = tileX_ * tileY_;
-    maxSortInstances_ = N * 4;
-    // Ensure capacity for a single splat covering all tiles
+    // Initial multiplier sized for mono full-resolution viewport. SBS/3D modes
+    // generate ~4× fewer fragments per gaussian (smaller pixel-space radius),
+    // so this is generous for stereo. growSortBuffers() handles overflow.
+    maxSortInstances_ = N * 8;
     if (maxSortInstances_ < totalTiles)
         maxSortInstances_ = totalTiles;
 
@@ -971,9 +974,12 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkUnmapMemory(device_, totalSumHostBuffer_.memory);
     }
 
-    // Clamp to sort buffer capacity
+    // Sort capacity check: dense scenes in mono full-res can exceed the
+    // initial heuristic. Reallocate rather than truncate (which would drop
+    // the falloff fragments of every gaussian past the cap).
     if (numInstances > maxSortInstances_) {
-        numInstances = maxSortInstances_;
+        vkQueueWaitIdle(queue_);  // CMD1 already wait-idled, but be explicit
+        growSortBuffers(numInstances);
     }
 
     if (numInstances == 0) {
@@ -1260,6 +1266,415 @@ bool GsRenderer::getSceneBBox(float outMin[3], float outMax[3]) const
     outMin[0] = mn[0]; outMin[1] = mn[1]; outMin[2] = mn[2];
     outMax[0] = mx[0]; outMax[1] = mx[1]; outMax[2] = mx[2];
     return true;
+}
+
+bool GsRenderer::getRobustSceneBounds(float loPct, float hiPct,
+                                      float outCenter[3], float outExtent[3]) const
+{
+    if (pickData_.empty()) return false;
+    if (loPct < 0.0f) loPct = 0.0f;
+    if (hiPct > 1.0f) hiPct = 1.0f;
+    if (hiPct <= loPct) { hiPct = loPct + 1e-3f; if (hiPct > 1.0f) hiPct = 1.0f; }
+
+    const size_t n = pickData_.size();
+    std::vector<float> coord(n);
+    for (int axis = 0; axis < 3; axis++) {
+        for (size_t i = 0; i < n; i++) {
+            const auto& g = pickData_[i];
+            coord[i] = (axis == 0) ? g.px : (axis == 1) ? g.py : g.pz;
+        }
+        size_t loIdx = (size_t)(loPct * (float)(n - 1));
+        size_t hiIdx = (size_t)(hiPct * (float)(n - 1));
+        if (hiIdx <= loIdx) hiIdx = loIdx + 1;
+        if (hiIdx >= n) hiIdx = n - 1;
+        std::nth_element(coord.begin(), coord.begin() + loIdx, coord.end());
+        float lo = coord[loIdx];
+        std::nth_element(coord.begin() + loIdx + 1, coord.begin() + hiIdx, coord.end());
+        float hi = coord[hiIdx];
+        outCenter[axis] = 0.5f * (lo + hi);
+        outExtent[axis] = hi - lo;
+    }
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// getMainObjectBounds — voxelize splats into an opacity-weighted density
+// grid, find the peak voxel, BFS-flood-fill at adaptive threshold, return
+// the world-space bbox of the filled region. Walls/floor are physically
+// air-separated from the figure so the flood-fill stays on the figure.
+// ═════════════════════════════════════════════════════════════════════════
+
+bool GsRenderer::getMainObjectBounds(uint32_t gridSize,
+                                     float outCenter[3], float outExtent[3]) const
+{
+    if (pickData_.empty() || gridSize < 4) return false;
+    const uint32_t G = gridSize;
+    const size_t totalVoxels = (size_t)G * G * G;
+
+    // 1. Scene bounds via 5–95 percentile (ignores extreme outliers).
+    float vmin[3], vmax[3];
+    {
+        std::vector<float> coord(pickData_.size());
+        for (int axis = 0; axis < 3; axis++) {
+            for (size_t i = 0; i < pickData_.size(); i++) {
+                const auto& g = pickData_[i];
+                coord[i] = (axis == 0) ? g.px : (axis == 1) ? g.py : g.pz;
+            }
+            size_t loIdx = (size_t)(0.05f * (float)(coord.size() - 1));
+            size_t hiIdx = (size_t)(0.95f * (float)(coord.size() - 1));
+            if (hiIdx <= loIdx) hiIdx = loIdx + 1;
+            std::nth_element(coord.begin(), coord.begin() + loIdx, coord.end());
+            float lo = coord[loIdx];
+            std::nth_element(coord.begin() + loIdx + 1, coord.begin() + hiIdx, coord.end());
+            float hi = coord[hiIdx];
+            vmin[axis] = lo;
+            vmax[axis] = hi;
+            if (vmax[axis] - vmin[axis] < 1e-6f) return false;
+        }
+    }
+
+    // 2. Voxelize: opacity-weighted density per cell (idx = (x*G + y)*G + z).
+    std::vector<float> density(totalVoxels, 0.0f);
+    float invSize[3];
+    for (int a = 0; a < 3; a++) invSize[a] = (float)G / (vmax[a] - vmin[a]);
+    for (const auto& g : pickData_) {
+        float p[3] = {g.px, g.py, g.pz};
+        int idx[3];
+        bool inside = true;
+        for (int a = 0; a < 3; a++) {
+            int i = (int)((p[a] - vmin[a]) * invSize[a]);
+            if (i < 0 || i >= (int)G) { inside = false; break; }
+            idx[a] = i;
+        }
+        if (!inside) continue;
+        density[((size_t)idx[0] * G + (size_t)idx[1]) * G + (size_t)idx[2]] += g.opacity;
+    }
+
+    // 3. Find peak voxel.
+    float peakDensity = 0.0f;
+    size_t peakIdx = 0;
+    for (size_t i = 0; i < totalVoxels; i++) {
+        if (density[i] > peakDensity) { peakDensity = density[i]; peakIdx = i; }
+    }
+    if (peakDensity < 1e-6f) return false;
+
+    // 4. Flood-fill helper: BFS from peak including 6-neighbors with
+    //    density >= absThreshold. Returns the bool grid + count.
+    auto floodFill = [&](float absThreshold, std::vector<bool>& filled) -> size_t {
+        std::fill(filled.begin(), filled.end(), false);
+        if (density[peakIdx] < absThreshold) return 0;
+        filled[peakIdx] = true;
+        std::vector<size_t> queue;
+        queue.reserve(4096);
+        queue.push_back(peakIdx);
+        size_t count = 1, head = 0;
+        const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+        while (head < queue.size()) {
+            size_t idx = queue[head++];
+            int z = (int)(idx % G);
+            int y = (int)((idx / G) % G);
+            int x = (int)(idx / ((size_t)G * G));
+            for (int d = 0; d < 6; d++) {
+                int nx = x + dirs[d][0];
+                int ny = y + dirs[d][1];
+                int nz = z + dirs[d][2];
+                if (nx < 0 || nx >= (int)G || ny < 0 || ny >= (int)G ||
+                    nz < 0 || nz >= (int)G) continue;
+                size_t nidx = ((size_t)nx * G + (size_t)ny) * G + (size_t)nz;
+                if (filled[nidx] || density[nidx] < absThreshold) continue;
+                filled[nidx] = true;
+                queue.push_back(nidx);
+                count++;
+            }
+        }
+        return count;
+    };
+
+    // 5. Adaptive threshold search. Try thresholds from loose to tight; pick
+    //    the first one whose fill is in the [1 %, 30 %] range. If none fits
+    //    (e.g. tight object scene where everything connects), fall back to
+    //    the loosest-but-still-valid result.
+    const size_t minFill = std::max((size_t)16, totalVoxels / 100);
+    const size_t maxFill = totalVoxels / 3;
+    const float thresholds[] = {0.01f, 0.02f, 0.05f, 0.10f, 0.20f, 0.30f, 0.50f, 0.70f};
+
+    std::vector<bool> filled(totalVoxels, false);
+    std::vector<bool> bestFilled(totalVoxels, false);
+    size_t bestCount = 0;
+    float bestThresh = 0.30f;
+    for (float t : thresholds) {
+        size_t count = floodFill(t * peakDensity, filled);
+        if (count >= minFill && count <= maxFill) {
+            bestFilled = filled;
+            bestCount = count;
+            bestThresh = t;
+            break;
+        }
+        // Also remember the largest fill that's at most maxFill, in case
+        // nothing falls into the sweet spot.
+        if (count > bestCount && count <= maxFill) {
+            bestFilled = filled;
+            bestCount = count;
+            bestThresh = t;
+        }
+    }
+    if (bestCount == 0) return false;
+
+    // 6. Bbox of filled voxels in voxel coords, then convert to world.
+    int minVox[3] = {(int)G, (int)G, (int)G};
+    int maxVox[3] = {-1, -1, -1};
+    for (size_t idx = 0; idx < totalVoxels; idx++) {
+        if (!bestFilled[idx]) continue;
+        int z = (int)(idx % G);
+        int y = (int)((idx / G) % G);
+        int x = (int)(idx / ((size_t)G * G));
+        if (x < minVox[0]) minVox[0] = x; if (x > maxVox[0]) maxVox[0] = x;
+        if (y < minVox[1]) minVox[1] = y; if (y > maxVox[1]) maxVox[1] = y;
+        if (z < minVox[2]) minVox[2] = z; if (z > maxVox[2]) maxVox[2] = z;
+    }
+    float denseCenter[3], denseExt[3];
+    for (int a = 0; a < 3; a++) {
+        float voxSize = (vmax[a] - vmin[a]) / (float)G;
+        float denseMinW = vmin[a] + (float)minVox[a] * voxSize;
+        float denseMaxW = vmin[a] + (float)(maxVox[a] + 1) * voxSize;
+        denseCenter[a] = 0.5f * (denseMinW + denseMaxW);
+        denseExt[a] = denseMaxW - denseMinW;
+    }
+
+    // 7. Branch on regime: a high fill ratio means the dense cluster
+    //    occupies most of the scene's 5–95 bbox, so we have a single tight
+    //    object (butterfly) — use full min/max so sparse extremities like
+    //    antennae aren't clipped. A low fill ratio means the dense cluster
+    //    is a small central region inside a larger scene (KAWS gallery,
+    //    Leila room) — use the exact bbox of gaussians within the flood-
+    //    fill voxels (tighter than the voxel-aligned bbox).
+    float fillRatio = (float)bestCount / (float)totalVoxels;
+    const float kSingleObjectFillThresh = 0.02f;
+    const float kComfort = 1.10f;  // 10 % margin on the object bbox
+
+    bool isSingleObject = (fillRatio > kSingleObjectFillThresh);
+    if (isSingleObject) {
+        // Full min/max bounding box of all gaussians.
+        float fullMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
+        float fullMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        for (const auto& g : pickData_) {
+            if (g.px < fullMin[0]) fullMin[0] = g.px;
+            if (g.px > fullMax[0]) fullMax[0] = g.px;
+            if (g.py < fullMin[1]) fullMin[1] = g.py;
+            if (g.py > fullMax[1]) fullMax[1] = g.py;
+            if (g.pz < fullMin[2]) fullMin[2] = g.pz;
+            if (g.pz > fullMax[2]) fullMax[2] = g.pz;
+        }
+        for (int a = 0; a < 3; a++) {
+            outCenter[a] = 0.5f * (fullMin[a] + fullMax[a]);
+            outExtent[a] = (fullMax[a] - fullMin[a]) * kComfort;
+        }
+    } else {
+        // Gaussian-precise bbox + opacity-weighted centroid for in-flood-
+        // fill gaussians. Center on the centroid (pulls toward the densest
+        // part of the object — e.g. the can in a Leila scene — away from
+        // sparse appendages like a chain extending upward). Extent is
+        // symmetric around the centroid covering the full precise bbox so
+        // sparse extensions stay visible at the frame edge but don't
+        // dominate the framing center.
+        float preciseMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
+        float preciseMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+        double sumW = 0.0;
+        double centroidSum[3] = {0.0, 0.0, 0.0};
+        for (const auto& g : pickData_) {
+            int xi = (int)((g.px - vmin[0]) * invSize[0]);
+            int yi = (int)((g.py - vmin[1]) * invSize[1]);
+            int zi = (int)((g.pz - vmin[2]) * invSize[2]);
+            if (xi < 0 || xi >= (int)G || yi < 0 || yi >= (int)G ||
+                zi < 0 || zi >= (int)G) continue;
+            size_t vid = ((size_t)xi * G + (size_t)yi) * G + (size_t)zi;
+            if (!bestFilled[vid]) continue;
+            if (g.px < preciseMin[0]) preciseMin[0] = g.px;
+            if (g.px > preciseMax[0]) preciseMax[0] = g.px;
+            if (g.py < preciseMin[1]) preciseMin[1] = g.py;
+            if (g.py > preciseMax[1]) preciseMax[1] = g.py;
+            if (g.pz < preciseMin[2]) preciseMin[2] = g.pz;
+            if (g.pz > preciseMax[2]) preciseMax[2] = g.pz;
+            double w = g.opacity;
+            sumW += w;
+            centroidSum[0] += w * g.px;
+            centroidSum[1] += w * g.py;
+            centroidSum[2] += w * g.pz;
+        }
+        // Defensive fall-back (shouldn't trigger in practice).
+        if (preciseMin[0] > preciseMax[0] || sumW < 1e-6) {
+            for (int a = 0; a < 3; a++) {
+                outCenter[a] = denseCenter[a];
+                outExtent[a] = denseExt[a] * kComfort;
+            }
+        } else {
+            float centroid[3] = {(float)(centroidSum[0] / sumW),
+                                 (float)(centroidSum[1] / sumW),
+                                 (float)(centroidSum[2] / sumW)};
+            for (int a = 0; a < 3; a++) {
+                outCenter[a] = centroid[a];
+                float halfMax = std::max(preciseMax[a] - centroid[a],
+                                         centroid[a] - preciseMin[a]);
+                outExtent[a] = 2.0f * halfMax * kComfort;
+            }
+        }
+    }
+
+    printf("GsRenderer: main object %zu/%zu voxels (%.2f%% of grid, threshold %.2fx peak) — %s\n",
+           bestCount, totalVoxels,
+           100.0 * (double)fillRatio, bestThresh,
+           isSingleObject ? "SINGLE OBJECT (5-95 bbox + 1.1x)"
+                          : "SCENE w/ central object (dense bbox + 1.4x)");
+    return true;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// findBestYaw — test numCandidates evenly-spaced yaws and return the one
+// with the highest opacity-weighted gaussian mass in front of the viewer.
+// Operates on pickData_, so call after loadScene() succeeds.
+// ═════════════════════════════════════════════════════════════════════════
+
+float GsRenderer::findBestYaw(const float displayCenter[3],
+                              const float viewerOffsetLocal[3],
+                              uint32_t numCandidates) const
+{
+    if (pickData_.empty() || numCandidates == 0) return 0.0f;
+
+    const float ox = viewerOffsetLocal[0];
+    const float oy = viewerOffsetLocal[1];
+    const float oz = viewerOffsetLocal[2];
+    const float twoPi = 6.283185307179586f;
+
+    float bestYaw = 0.0f;
+    float bestMass = -1.0f;
+
+    for (uint32_t k = 0; k < numCandidates; k++) {
+        float theta = twoPi * (float)k / (float)numCandidates;
+        float c = std::cos(theta), s = std::sin(theta);
+
+        // Rotate viewer offset and display-forward (0,0,-1) by yaw around +Y.
+        // Ry: [c 0 s; 0 1 0; -s 0 c]
+        float vwx = displayCenter[0] + (c * ox + s * oz);
+        float vwy = displayCenter[1] + oy;
+        float vwz = displayCenter[2] + (-s * ox + c * oz);
+        float fwdX = -s;
+        float fwdY = 0.0f;
+        float fwdZ = -c;
+
+        float mass = 0.0f;
+        for (const auto& g : pickData_) {
+            float dx = g.px - vwx;
+            float dy = g.py - vwy;
+            float dz = g.pz - vwz;
+            float along = dx * fwdX + dy * fwdY + dz * fwdZ;
+            if (along > 0.0f) {
+                mass += g.opacity;
+            }
+        }
+
+        if (mass > bestMass) {
+            bestMass = mass;
+            bestYaw = theta;
+        }
+    }
+
+    printf("GsRenderer: best yaw = %.1f deg (visible mass = %.0f, candidates = %u)\n",
+           bestYaw * 57.2957795f, bestMass, numCandidates);
+    return bestYaw;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// growSortBuffers — reallocate sort/hist buffers + re-bind descriptors when
+// the per-frame tile-fragment count outgrows current capacity. Mirrors the
+// dynamic-multiplier strategy used upstream (shg8/3DGS.cpp). Caller must
+// have wait-idled the queue before invoking.
+// ═════════════════════════════════════════════════════════════════════════
+
+void GsRenderer::growSortBuffers(uint32_t requiredCapacity)
+{
+    if (requiredCapacity <= maxSortInstances_) return;
+
+    uint32_t oldCap = maxSortInstances_;
+    // 2× headroom so we don't grow next frame on small jitter.
+    uint32_t newCap = requiredCapacity * 2;
+    uint32_t totalTiles = tileX_ * tileY_;
+    if (newCap < totalTiles) newCap = totalTiles;
+
+    auto devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    auto ssboUsage = (VkBufferUsageFlags)(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+
+    gsDestroyBuffer(device_, sortKeysEvenBuffer_);
+    gsDestroyBuffer(device_, sortKeysOddBuffer_);
+    gsDestroyBuffer(device_, sortValsEvenBuffer_);
+    gsDestroyBuffer(device_, sortValsOddBuffer_);
+    gsDestroyBuffer(device_, sortHistBuffer_);
+
+    sortKeysEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 8, ssboUsage, devLocal);
+    sortKeysOddBuffer_ = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 8, ssboUsage, devLocal);
+    sortValsEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+    sortValsOddBuffer_ = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+
+    uint32_t globalInv = (newCap + numRadixSortBlocksPerWG_ * 256 - 1) /
+                         (numRadixSortBlocksPerWG_ * 256);
+    numSortWorkgroups_ = globalInv ? globalInv : 1;
+    sortHistBuffer_ = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssboUsage, devLocal);
+
+    maxSortInstances_ = newCap;
+
+    // Re-bind every descriptor that points at the recreated buffers.
+    writeBufferDS(device_, dsPreprocessSort_, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+    writeBufferDS(device_, dsPreprocessSort_, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+
+    writeBufferDS(device_, dsHistEven_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+    writeBufferDS(device_, dsHistEven_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortHistBuffer_.buffer, sortHistBuffer_.size);
+    writeBufferDS(device_, dsHistOdd_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysOddBuffer_.buffer, sortKeysOddBuffer_.size);
+    writeBufferDS(device_, dsHistOdd_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortHistBuffer_.buffer, sortHistBuffer_.size);
+
+    writeBufferDS(device_, dsSortEvenToOdd_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+    writeBufferDS(device_, dsSortEvenToOdd_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysOddBuffer_.buffer, sortKeysOddBuffer_.size);
+    writeBufferDS(device_, dsSortEvenToOdd_, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+    writeBufferDS(device_, dsSortEvenToOdd_, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsOddBuffer_.buffer, sortValsOddBuffer_.size);
+    writeBufferDS(device_, dsSortEvenToOdd_, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortHistBuffer_.buffer, sortHistBuffer_.size);
+
+    writeBufferDS(device_, dsSortOddToEven_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysOddBuffer_.buffer, sortKeysOddBuffer_.size);
+    writeBufferDS(device_, dsSortOddToEven_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+    writeBufferDS(device_, dsSortOddToEven_, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsOddBuffer_.buffer, sortValsOddBuffer_.size);
+    writeBufferDS(device_, dsSortOddToEven_, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+    writeBufferDS(device_, dsSortOddToEven_, 4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortHistBuffer_.buffer, sortHistBuffer_.size);
+
+    writeBufferDS(device_, dsTileBoundary_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortKeysEvenBuffer_.buffer, sortKeysEvenBuffer_.size);
+
+    writeBufferDS(device_, dsRenderSet0_, 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  sortValsEvenBuffer_.buffer, sortValsEvenBuffer_.size);
+
+    double mb = ((double)newCap * (8 + 8 + 4 + 4) +
+                 (double)numSortWorkgroups_ * 256 * 4) / (1024.0 * 1024.0);
+    printf("GsRenderer: grew sort buffers %u -> %u instances (%.1f MB total)\n",
+           oldCap, newCap, mb);
 }
 
 // ═════════════════════════════════════════════════════════════════════════
