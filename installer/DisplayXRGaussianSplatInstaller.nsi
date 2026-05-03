@@ -49,6 +49,13 @@ ShowUninstDetails show
 !include "x64.nsh"
 !include "LogicLib.nsh"
 !include "WordFunc.nsh"
+!insertmacro VersionCompare
+
+; Minimum runtime version that ships SimulatedRealityVulkanBeta.dll alongside
+; the runtime DLLs (added in runtime v1.2.0). The demo's Vulkan compositor
+; path delay-loads the SR weaver, so older runtime installs would crash with
+; STATUS_DLL_NOT_FOUND on session create.
+!define MIN_RUNTIME_VERSION "1.2.0"
 
 ;--------------------------------
 ; UI
@@ -82,9 +89,18 @@ Function .onInit
     ; runtime writes to the 64-bit view. Switch to 64-bit view to match.
     SetRegView 64
     ReadRegStr $0 HKLM "Software\DisplayXR\Runtime" "InstallPath"
+    ReadRegStr $1 HKLM "Software\DisplayXR\Runtime" "Version"
     SetRegView 32
     ${If} $0 == ""
         MessageBox MB_ICONSTOP "DisplayXR runtime is not installed.$\r$\n$\r$\nInstall the DisplayXR runtime first, then re-run this installer.$\r$\n$\r$\nGet it from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
+        Abort
+    ${EndIf}
+
+    ; Older runtimes don't bundle SimulatedRealityVulkanBeta.dll on PATH,
+    ; so the demo would crash at session create. Enforce a minimum.
+    ${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $2
+    ${If} $2 == 2
+        MessageBox MB_ICONSTOP "DisplayXR runtime $1 is too old.$\r$\n$\r$\nThis demo requires runtime ${MIN_RUNTIME_VERSION} or later.$\r$\n$\r$\nUpdate from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"
         Abort
     ${EndIf}
 FunctionEnd
