@@ -43,6 +43,7 @@
 
 #include <dlfcn.h>
 #include <mach-o/dyld.h>
+
 #include <unistd.h>
 #include <libgen.h>
 #include <sys/stat.h>
@@ -52,6 +53,7 @@
 #include "camera3d_view.h"
 #include "gs_renderer.h"
 #include "gs_scene_loader.h"
+#include "atlas_capture.h"
 
 // ============================================================================
 // Logging
@@ -112,16 +114,14 @@ struct InputState {
     bool animationActive = false;
     bool animateToggleRequested = false;     // set by UI button
 
-    // Scene-flip toggles (post-view-matrix mirror through XZ or YZ plane).
-    // Per-format defaults are set by ApplyAutoFitForLoadedScene after load:
-    //   .spz (Niantic, RUB native): flipY=true,  flipX=false
-    //   .ply (gsplat-trainer):      flipY=false, flipX=true
-    bool flipY = true;
-    bool flipX = false;
-    bool flipToggleRequested = false;
-
     // Drag-and-drop / pending file load
     std::string pendingLoadPath;
+
+    // 'I' key: capture the rendered atlas region (cols × rows × renderW × renderH)
+    // of the swapchain to <scene>_<cols>x<rows>.png in the working directory.
+    // Skipped for 1×1 (mono) layouts. Useful for grabbing the SBS image
+    // intended for shell launcher icons / 3D thumbnails.
+    bool captureAtlasRequested = false;
 
     // Unified rendering mode (V key cycles, 0-8 keys select directly)
     uint32_t currentRenderingMode = 1;   // Default: mode 1 (first 3D mode)
@@ -173,6 +173,9 @@ static float g_hudUpdateTimer = 0.0f;
 static uint32_t g_renderW = 0, g_renderH = 0;
 static uint32_t g_windowW = 0, g_windowH = 0;
 
+// Atlas capture helpers (filename / Pictures dir / flash overlay / Vulkan
+// readback) live in test_apps/common/atlas_capture* — see dxr_capture::*.
+
 // ============================================================================
 // Inline math — column-major float[16] matrices
 // ============================================================================
@@ -180,23 +183,6 @@ static uint32_t g_windowW = 0, g_windowH = 0;
 static void mat4_identity(float* m) {
     memset(m, 0, 16 * sizeof(float));
     m[0] = m[5] = m[10] = m[15] = 1.0f;
-}
-
-// Post-multiply the view matrix by a Y-reflection (world Y is negated):
-// view' = view * diag(1, -1, 1, 1).  Equivalent to mirroring the scene across
-// the XZ plane before viewing — exactly the fix for SPZ files whose training
-// convention inverts Y.  Not a rotation (det = -1), but preserves z ordering,
-// so depth and shader logic remain correct.
-static void view_apply_y_flip(float* view_col_major_16) {
-    for (int i = 0; i < 4; i++) view_col_major_16[4 + i] = -view_col_major_16[4 + i];
-}
-
-// Mirror across the YZ plane: post-multiply view by diag(-1, 1, 1, 1).
-// PLY data from gsplat-trainer comes out X-mirrored vs SuperSplat in our
-// pipeline; this view-stage flip undoes it without needing to negate
-// position data + conjugate quaternions at load.
-static void view_apply_x_flip(float* view_col_major_16) {
-    for (int i = 0; i < 4; i++) view_col_major_16[i] = -view_col_major_16[i];
 }
 
 static void mat4_multiply(float* out, const float* a, const float* b) {
@@ -347,9 +333,6 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.transitioning = false;
         // Auto-orbit always on; resetting just resets the idle timer below.
         input.animationActive = false;
-        // Preserve per-format flipY/flipX through Reset — they were set by
-        // ApplyAutoFitForLoadedScene based on file extension and shouldn't
-        // be reverted by Space.
         input.lastInputTimeSec = NowSec();
         return;
     }
@@ -563,6 +546,11 @@ static void OpenLoadDialog() {
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
     g_input.yaw -= (float)[event deltaX] * 0.005f;
+    // pitch += because the renderer Y-mirrors the world internally
+    // (gs_renderer.cpp); without this, mouse-drag-up would tilt the
+    // camera DOWN. cube_handle apps go the other way (-= deltaY)
+    // because they Y-flip at rasterization (negative VkViewport.height),
+    // not at view stage.
     g_input.pitch += (float)[event deltaY] * 0.005f;
     float maxPitch = 1.5f;
     if (g_input.pitch > maxPitch) g_input.pitch = maxPitch;
@@ -598,11 +586,11 @@ static void OpenLoadDialog() {
         case 'm': case 'M':
             g_input.animateToggleRequested = true;
             break;
-        case 'f': case 'F':
-            g_input.flipToggleRequested = true;
-            break;
         case 'c': case 'C':
             g_input.cameraMode = !g_input.cameraMode;
+            break;
+        case 'i': case 'I':
+            g_input.captureAtlasRequested = true;
             break;
         case 't': case 'T':
             g_input.eyeTrackingModeToggleRequested = true;
@@ -742,9 +730,8 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
     [g_hudView setAutoresizingMask:NSViewWidthSizable | NSViewHeightSizable];
     [g_hudBackdrop addSubview:g_hudView];
 
-    // --- Top bar (Open / Auto-Orbit / Mode / Flip) — transparent so the
-    // buttons sit directly over the rendered content (no frosted panel
-    // hiding the top of the scene).
+    // --- Top bar (Open / Mode) — transparent so the buttons sit directly
+    // over the rendered content (no frosted panel hiding the top of the scene).
     const CGFloat barH = 48.0;
     NSRect barFrame = NSMakeRect(0, height - barH, width, barH);
     NSView *topBar = [[NSView alloc] initWithFrame:barFrame];
@@ -1210,8 +1197,36 @@ static bool CreateSwapchains(AppXrSession& xr) {
         if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) selectedFmt = f;
     }
 
+    // Size the swapchain at init from the largest atlas any rendering mode
+    // could produce when the app is running full-screen — atlas dims per
+    // mode are (cols × scaleX × displayPixelW) × (rows × scaleY × displayPixelH).
+    // For sim_display and Leia SR this collapses to the panel resolution
+    // (max(cols × scaleX) ≤ 1 across all their advertised modes). The atlas
+    // the app actually writes per frame is smaller — driven by the live
+    // window size — but the swapchain has to accommodate full-screen so the
+    // app can resize / fullscreen at any time without reallocating. Falls
+    // back to recommended × (2,1) if display info is unavailable.
     uint32_t w = views[0].recommendedImageRectWidth * 2;
     uint32_t h = views[0].recommendedImageRectHeight;
+    if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
+        w = xr.displayPixelWidth;
+        h = xr.displayPixelHeight;
+        if (xr.renderingModeCount > 0) {
+            uint32_t maxAtlasW = 0, maxAtlasH = 0;
+            for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                uint32_t aw = (uint32_t)((double)xr.renderingModeTileColumns[i] *
+                                          xr.renderingModeScaleX[i] *
+                                          (double)xr.displayPixelWidth);
+                uint32_t ah = (uint32_t)((double)xr.renderingModeTileRows[i] *
+                                          xr.renderingModeScaleY[i] *
+                                          (double)xr.displayPixelHeight);
+                if (aw > maxAtlasW) maxAtlasW = aw;
+                if (ah > maxAtlasH) maxAtlasH = ah;
+            }
+            if (maxAtlasW > w) w = maxAtlasW;
+            if (maxAtlasH > h) h = maxAtlasH;
+        }
+    }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
     sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
@@ -1406,20 +1421,15 @@ static void ApplyAutoFitForLoadedScene() {
     g_input.pitch = 0.0f;
     g_input.viewParams.virtualDisplayHeight = g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM;
     g_input.viewParams.scaleFactor = 1.0f;
+    // Treat scene load as a fresh user interaction so the auto-orbit idle
+    // timer restarts. Without this, an asset loaded after the 10s idle
+    // threshold starts rotating immediately on first display.
+    MarkUserInput(g_input);
 
-    // Per-format Y/X-flip defaults (see flipY/flipX comments). SPZ comes
-    // through Niantic's RUB convention → needs Y-mirror at view stage. PLY
-    // from gsplat-trainer needs X-mirror to match SuperSplat orientation.
-    bool isPly = false;
-    if (g_loadedFileName.size() >= 4) {
-        std::string ext = g_loadedFileName.substr(g_loadedFileName.size() - 4);
-        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-        isPly = (ext == ".ply");
-    }
-    g_input.flipY = !isPly;
-    g_input.flipX = isPly;
-    LOG_INFO("Per-format flips: flipY=%d flipX=%d (%s)",
-             g_input.flipY, g_input.flipX, isPly ? "PLY" : "SPZ");
+    // Per-format orientation correction is now done at load time (PLY loader
+    // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
+    // GsRenderer::updateUniforms negates the Y row of proj_mat to match the
+    // +Y-up convention. No runtime view-stage flips needed.
 }
 
 static void TryAutoLoadBundledScene() {
@@ -1600,13 +1610,6 @@ int main() {
             UpdateTopBarButtonTitles(xr);
         }
 
-        // Handle Flip toggle (F key or button)
-        if (g_input.flipToggleRequested) {
-            g_input.flipToggleRequested = false;
-            g_input.flipY = !g_input.flipY;
-            UpdateTopBarButtonTitles(xr);
-        }
-
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
         // Handle rendering mode change (V=cycle, 0-3=direct, or Mode button)
@@ -1702,35 +1705,29 @@ int main() {
 
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        // The view-stage Y-flip (and X-flip) is post-applied to the view
-                        // matrix as view * diag(±1, ±1, 1, 1). For non-zero displayPose
-                        // axes, this leaves the display center at view-space y = -2·cy − 0.1
-                        // instead of -0.1, breaking the Kooima frustum's centering. Mirror
-                        // the corresponding axis of displayPose so the view-stage flip and
-                        // the projection stay aligned.
-                        float dispX = g_input.cameraPosX;
-                        float dispY = g_input.cameraPosY;
-                        if (g_input.flipX) dispX = -dispX;
-                        if (g_input.flipY) dispY = -dispY;
-                        cameraPose.position = {dispX, dispY, g_input.cameraPosZ};
+                        // GsRenderer Y-mirrors the world inside updateUniforms (see comment
+                        // in gs_renderer.cpp). The off-axis Kooima projection assumes the
+                        // mirror is reflected in the displayPose passed to display3d_compute_view,
+                        // so negate Y here to keep the eye-vs-display geometry consistent.
+                        cameraPose.position = {g_input.cameraPosX, -g_input.cameraPosY, g_input.cameraPosZ};
 
-                        XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
+                        // nominalViewer in render frame (Y mirrored) — used for
+                        // parallax-factor lerp, must match the eye/cameraPose frame.
+                        XrVector3f nominalViewer = {xr.nominalViewerX, -xr.nominalViewerY, xr.nominalViewerZ};
 
-                        float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 0.5f;
+                        // Per-view extent driven entirely by the current rendering
+                        // mode's view_scale and the live window size. Atlas dims
+                        // (used for the projection viewport per eye and for the 'I'
+                        // capture region) follow as cols × renderW × rows × renderH.
+                        // The swapchain was sized at creation time to fit the
+                        // largest atlas across all advertised modes, so no clamp
+                        // is needed here.
+                        float scaleX = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleX[g_input.currentRenderingMode] : 1.0f;
                         float scaleY = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount) ? xr.renderingModeScaleY[g_input.currentRenderingMode] : 1.0f;
-                        uint32_t tileW = xr.swapchain.width / (tileColumns ? tileColumns : 1);
-                        uint32_t tileH = xr.swapchain.height / (tileRows ? tileRows : 1);
-                        uint32_t renderW, renderH;
-                        if (monoMode) {
-                            renderW = g_windowW; renderH = g_windowH;
-                            if (renderW > xr.swapchain.width) renderW = xr.swapchain.width;
-                            if (renderH > xr.swapchain.height) renderH = xr.swapchain.height;
-                        } else {
-                            renderW = (uint32_t)(g_windowW * scaleX);
-                            renderH = (uint32_t)(g_windowH * scaleY);
-                            if (renderW > tileW) renderW = tileW;
-                            if (renderH > tileH) renderH = tileH;
-                        }
+                        uint32_t renderW = (uint32_t)((double)g_windowW * scaleX);
+                        uint32_t renderH = (uint32_t)((double)g_windowH * scaleY);
+                        if (renderW == 0) renderW = 1;
+                        if (renderH == 0) renderH = 1;
                         g_renderW = renderW; g_renderH = renderH;
 
                         // Per-view Kooima pose + projection — one entry per view in this
@@ -1762,6 +1759,12 @@ int main() {
                                 eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
                             }
                             for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
+                            // GsRenderer Y-mirrors the world; cameraPose Y is negated
+                            // below at the display3d_compute_views boundary. Eyes must
+                            // live in the same render frame so the asymmetric Kooima
+                            // projection's eye-vs-display geometry stays consistent —
+                            // otherwise vertical eye parallax comes out inverted.
+                            for (auto& e : rawEyePos) { e.y = -e.y; }
 
                             Display3DScreen screen = {winW_m, winH_m};
                             Display3DTunables tunables;
@@ -1774,13 +1777,6 @@ int main() {
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
                                 0.01f, 100.0f, eyeViews.data());
-
-                            if (g_input.flipY) {
-                                for (auto& v : eyeViews) view_apply_y_flip(v.view_matrix);
-                            }
-                            if (g_input.flipX) {
-                                for (auto& v : eyeViews) view_apply_x_flip(v.view_matrix);
-                            }
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1791,7 +1787,11 @@ int main() {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
-                            float ndcY = -(2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f);
+                            // Cocoa locationInWindow has y=0 at the BOTTOM of the window.
+                            // OpenGL/+Y-up NDC also has y=-1 at the bottom, so this maps
+                            // directly with no negation. (The Windows demo negates because
+                            // Win32 mouse y=0 is at the TOP.)
+                            float ndcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
 
                             // Build a center-eye Display3DView from the averaged processed
                             // display-space eye so unprojection is truly from the viewpoint
@@ -1824,10 +1824,17 @@ int main() {
                             XrVector3f centerEyeProcessed = (es != 0.0f)
                                 ? (XrVector3f){centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
                                 : centerEyeDisp;
+                            // Use a real-world-frame displayPose for picking — the unproject
+                            // ray needs to be in the same frame as the splats (un-Y-flipped
+                            // world). cameraPose has its Y negated for the renderer's view-
+                            // stage Y mirror; using it here would put rayOrigin in a mirror
+                            // frame and pickGaussian would intersect against splats in the
+                            // wrong frame.
+                            XrPosef cameraPoseWorld = cameraPose;
+                            cameraPoseWorld.position.y = g_input.cameraPosY;
                             Display3DView centerView;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &cameraPose, 0.01f, 100.0f, &centerView);
-                            if (g_input.flipY) view_apply_y_flip(centerView.view_matrix);
+                                                   &cameraPoseWorld, 0.01f, 100.0f, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
@@ -1838,37 +1845,24 @@ int main() {
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                // pickGaussian always operates on REAL splat positions, regardless
-                                // of whether the unproject used a Y-flipped view matrix. When flipY
-                                // is on, the user visually sees that splat mirrored across the XZ
-                                // plane — so the display should land at the visual location
-                                // (F_y * hitPos), not the real one. Recompute the alignment ray
-                                // from the un-flipped real eye to the visual hit.
-                                XrVector3f visualHit = {hitPos[0], hitPos[1], hitPos[2]};
-                                XrVector3f alignRayDir = rayDirV;
-                                if (g_input.flipY) {
-                                    visualHit.y = -visualHit.y;
-                                    XrVector3f realEye = {rayOriginV.x, -rayOriginV.y, rayOriginV.z};
-                                    float dx = visualHit.x - realEye.x;
-                                    float dy = visualHit.y - realEye.y;
-                                    float dz = visualHit.z - realEye.z;
-                                    float dl = sqrtf(dx*dx + dy*dy + dz*dz);
-                                    if (dl > 1e-6f) {
-                                        alignRayDir.x = dx / dl;
-                                        alignRayDir.y = dy / dl;
-                                        alignRayDir.z = dz / dl;
-                                    }
-                                }
-                                XrVector3f upHint = {0, 1, 0};
+                                // Both endpoints stored in WORLD frame (the same frame as
+                                // g_input.cameraPosX/Y/Z) so the slerp interpolates
+                                // consistently. cameraPose has its Y negated for the
+                                // display3d_compute_view boundary; we mustn't store that
+                                // negated copy as the slerp's "from" pose, otherwise the
+                                // mid-transition lerp drifts vertically toward 2·cy − y.
+                                XrPosef fromWorld;
+                                fromWorld.orientation = cameraPose.orientation;
+                                fromWorld.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
                                 XrPosef target;
-                                display3d_align_pose_to_ray(visualHit, alignRayDir, upHint, &target);
-                                g_input.transitionFrom = cameraPose;
+                                target.position = {hitPos[0], hitPos[1], hitPos[2]};
+                                target.orientation = cameraPose.orientation;
+                                g_input.transitionFrom = fromWorld;
                                 g_input.transitionTo = target;
                                 g_input.transitionT = 0.0f;
                                 g_input.transitioning = true;
-                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)%s",
-                                    visualHit.x, visualHit.y, visualHit.z,
-                                    g_input.flipY ? " [flipped]" : "");
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
+                                    hitPos[0], hitPos[1], hitPos[2]);
                             }
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima
@@ -1893,9 +1887,10 @@ int main() {
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
                                 }
 
-                                // Tile-aware viewport (2×2 atlas for Quad, SBS for stereo, etc.).
-                                uint32_t tileX = display3D ? (uint32_t)(eye % (int)tileColumns) : 0;
-                                uint32_t tileY = display3D ? (uint32_t)(eye / (int)tileColumns) : 0;
+                                // Tile-aware viewport: row-major eye layout in the atlas.
+                                // For mono (cols=rows=1) this collapses to (0, 0).
+                                uint32_t tileX = (uint32_t)(eye % (int)tileColumns);
+                                uint32_t tileY = (uint32_t)(eye / (int)tileColumns);
                                 uint32_t vpX = tileX * renderW;
                                 uint32_t vpY = tileY * renderH;
                                 tileOffsets[eye] = {vpX, vpY};
@@ -1926,6 +1921,51 @@ int main() {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
                                     targetImage, xr.swapchain.width, xr.swapchain.height,
                                     g_input.yaw, g_input.pitch);
+                            }
+
+                            // 'I' key: snapshot the rendered region to a PNG.
+                            // For multi-view modes (2×1 SBS, 1×2 stacked, 2×2 quad)
+                            // this is the full atlas; for 1×1 mono it's the single
+                            // rendered view. Anchored at the swapchain's top-left.
+                            if (g_input.captureAtlasRequested) {
+                                g_input.captureAtlasRequested = false;
+                                if (g_gsRenderer.hasScene()) {
+                                    uint32_t cols = tileColumns > 0 ? tileColumns : 1u;
+                                    uint32_t rows = tileRows > 0 ? tileRows : 1u;
+                                    uint32_t atlasW = cols * renderW;
+                                    uint32_t atlasH = rows * renderH;
+                                    if (atlasW <= xr.swapchain.width && atlasH <= xr.swapchain.height) {
+                                        // Strip extension from scene filename
+                                        // (e.g. "butterfly.spz" → "butterfly").
+                                        auto dot = g_loadedFileName.find_last_of('.');
+                                        std::string stem = (dot == std::string::npos)
+                                            ? g_loadedFileName
+                                            : g_loadedFileName.substr(0, dot);
+                                        if (stem.empty()) stem = "scene";
+                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                            stem, cols, rows);
+                                        // GS writes via compute imageStore — bytes are
+                                        // linear even on an sRGB swapchain; tell the helper
+                                        // to mirror the runtime's display-side decode.
+                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
+                                            vkDevice, physDevice, graphicsQueue, cmdPool,
+                                            targetImage, (int)swapFormat,
+                                            xr.swapchain.width, xr.swapchain.height,
+                                            0, 0, atlasW, atlasH, outPath,
+                                            /*linearBytesInSrgbImage=*/true);
+                                        if (ok) {
+                                            LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
+                                                     atlasW, atlasH, cols, rows, outPath.c_str());
+                                            dxr_capture::TriggerCaptureFlash(
+                                                (__bridge void*)g_metalView);
+                                        }
+                                    } else {
+                                        LOG_WARN("Capture skipped: atlas %ux%u exceeds swapchain %ux%u",
+                                                 atlasW, atlasH, xr.swapchain.width, xr.swapchain.height);
+                                    }
+                                } else {
+                                    LOG_WARN("Capture skipped: no scene loaded");
+                                }
                             }
 
                             ReleaseSwapchainImage(xr);
@@ -1965,7 +2005,6 @@ int main() {
                     const char *orbitLabel = g_input.animateEnabled
                         ? (g_input.animationActive ? "ON (running)" : "ON (idle countdown)")
                         : "OFF";
-                    const char *flipLabel = g_input.flipY ? "ON" : "OFF";
                     uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                         ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
                     NSMutableString *eyesStr = [NSMutableString string];
@@ -1977,7 +2016,7 @@ int main() {
                         @"%s\nSession: %d\n"
                         "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
-                        "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s  Flip: %s\n"
+                        "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
                         "Display: %.3f x %.3f m\n"
@@ -1985,13 +2024,13 @@ int main() {
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus splat  -/= Depth  Space=Reset\n"
-                        "M=Auto-Orbit  F=Flip  V=Mode  L=Load  Tab=HUD  ESC=Quit",
+                        "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
                         activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
-                        depthPct, g_input.viewParams.scaleFactor, orbitLabel, flipLabel,
+                        depthPct, g_input.viewParams.scaleFactor, orbitLabel,
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,

@@ -16,7 +16,10 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 
 #include "logging.h"
 #include "input_handler.h"
@@ -27,8 +30,10 @@
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
+#include "atlas_capture.h"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <mutex>
@@ -43,15 +48,29 @@ static const char* APP_NAME = "gaussian_splatting_handle_vk_win";
 static const wchar_t* WINDOW_CLASS = L"SR3DGSOpenXRExtVKClass";
 static const wchar_t* WINDOW_TITLE = L"DisplayXR Gaussian Splat Viewer Demo";
 
-// HUD overlay fractions
+// HUD overlay fractions. Layer spans full window height so chrome buttons
+// can sit at the window top while the info panel anchors to the bottom-left
+// (matching the macOS demo's split). The vk_native compositor now uses an
+// alpha-blended draw pass for window-space layers, so the empty middle of
+// the texture stays invisible. Font sizing is anchored to the legacy
+// 0.5-fraction so text doesn't grow with the taller texture.
 static const float HUD_WIDTH_FRACTION = 0.30f;
-static const float HUD_HEIGHT_FRACTION = 0.50f;
+static const float HUD_HEIGHT_FRACTION = 1.0f;
+static const float HUD_FONT_BASE_FRACTION = 0.50f;
 
-// Load button fractions (small button, top-right)
-static const float LOAD_BTN_WIDTH_FRACTION = 0.12f;
-static const float LOAD_BTN_HEIGHT_FRACTION = 0.04f;
-static const float LOAD_BTN_X_FRACTION = 0.87f;
-static const float LOAD_BTN_Y_FRACTION = 0.02f;
+// Top-bar buttons live inside the HUD overlay's window-space footprint
+// (left strip of the window, fracW × fracH = HUD_WIDTH_FRACTION × HUD_HEIGHT_FRACTION).
+// All values are absolute window-fractions for hit-testing; they're
+// translated into HUD-pixel coordinates when passed to RenderHudAndMap.
+static const float OPEN_BTN_X_FRACTION = 0.010f;
+static const float OPEN_BTN_Y_FRACTION = 0.010f;
+static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
+static const float OPEN_BTN_HEIGHT_FRACTION = 0.030f;
+
+static const float MODE_BTN_X_FRACTION = 0.075f;
+static const float MODE_BTN_Y_FRACTION = 0.010f;
+static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
+static const float MODE_BTN_HEIGHT_FRACTION = 0.030f;
 
 
 // sim_display output mode switching (legacy — replaced by unified rendering mode)
@@ -68,12 +87,26 @@ static UINT g_windowHeight = 720;
 
 // 3DGS state
 static GsRenderer g_gsRenderer;
+// Cross-thread scene-load queue: the file dialog runs on the main (message-pump)
+// thread, but the actual GsRenderer::loadScene() submits Vulkan work on the
+// graphics queue and so MUST run on the same thread that drives per-frame
+// rendering — otherwise concurrent vkQueueSubmit/vkQueueWaitIdle from two
+// threads on a single VkQueue is undefined behaviour and crashes some drivers
+// (NVIDIA in particular). Main thread posts the picked path here; the render
+// thread picks it up between frames.
 static std::atomic<bool> g_loadRequested{false};
+static std::string g_pendingLoadPath;
+static std::mutex g_pendingLoadPathMutex;
+// 'I' key: capture the multi-view atlas region (cols × rows × renderW × renderH)
+// of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
+// 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
+static std::atomic<bool> g_captureAtlasRequested{false};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
-// Fallback vHeight when no scene is loaded; replaced per-scene by auto-fit.
-static constexpr float kFallbackVirtualDisplayHeightM = 0.24f;
+// Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
+// extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
+static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
 // Comfort margin is baked into getMainObjectBounds (which picks a different
 // multiplier for single-object vs scene-with-central-object). Keep this at
 // 1.0 to mean "no extra margin on top of what the bounds method returned".
@@ -97,20 +130,23 @@ static void ApplyAutoFitForLoadedScene_locked() {
     // Voxel-density flood-fill — see the macOS demo for rationale.
     bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
     if (ok) {
+        g_fitCenter[0] = center[0];
+        g_fitCenter[1] = center[1];
+        g_fitCenter[2] = center[2];
         float vh = extent[1] * kAutoFitVerticalComfort;
-        if (!(vh > 1e-3f)) ok = false;
-        if (ok) {
-            g_fitCenter[0] = center[0];
-            g_fitCenter[1] = center[1];
-            g_fitCenter[2] = center[2];
-            g_fitVHeight = vh;
-            // Search 8 yaws to face the captured side of the scene.
-            float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
-            g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
-            LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
-                     center[0], center[1], center[2],
-                     extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
-        }
+        // Degenerate scene (all splats in a thin slice) — fall back to a
+        // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
+        if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+        g_fitVHeight = vh;
+        // Anchor at yaw=0 and trust the loader's RUB convention (PLY loader
+        // converts RDF+X-mirror → RUB at load time; SPZ is RUB-native and
+        // SuperSplat-authored scenes already face −Z at yaw=0). Matches
+        // macOS:1407 — the user can drag with LMB if a particular asset's
+        // authored orientation is off.
+        g_fitYaw = 0.0f;
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+                 center[0], center[1], center[2],
+                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -122,6 +158,26 @@ static void ApplyAutoFitForLoadedScene_locked() {
     g_inputState.pitch = 0.0f;
     g_inputState.viewParams.virtualDisplayHeight = ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
     g_inputState.viewParams.scaleFactor = 1.0f;
+
+    // Per-format orientation correction is now done at load time (PLY loader
+    // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
+    // Renderer's GsRenderer::updateUniforms negates the Y row of proj_mat to
+    // match the +Y-up convention. No runtime view-stage flips needed.
+
+    // Route the first post-load frame through the same reset path Space uses,
+    // so app-start view params (perspectiveFactor, scaleFactor, etc.) match
+    // the Space-reset state.
+    g_inputState.resetViewRequested = true;
+
+    // Treat scene load as a fresh user interaction so the auto-orbit idle
+    // timer restarts. Without this, an asset loaded after the 10s idle
+    // threshold starts rotating immediately on first display.
+    {
+        using namespace std::chrono;
+        g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
+            high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+        g_inputState.animationActive = false;
+    }
 }
 
 // Fullscreen state
@@ -158,16 +214,28 @@ static void ToggleFullscreen(HWND hwnd) {
     }
 }
 
-// Check if a mouse click falls within the load button region
-static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
+static bool PointInFractionRect(int mouseX, int mouseY, int windowW, int windowH,
+                                float xf, float yf, float wf, float hf) {
     if (windowW <= 0 || windowH <= 0) return false;
     float fx = (float)mouseX / (float)windowW;
     float fy = (float)mouseY / (float)windowH;
-    return (fx >= LOAD_BTN_X_FRACTION &&
-            fx <= LOAD_BTN_X_FRACTION + LOAD_BTN_WIDTH_FRACTION &&
-            fy >= LOAD_BTN_Y_FRACTION &&
-            fy <= LOAD_BTN_Y_FRACTION + LOAD_BTN_HEIGHT_FRACTION);
+    return (fx >= xf && fx <= xf + wf && fy >= yf && fy <= yf + hf);
 }
+
+static bool IsClickOnLoadButton(int mouseX, int mouseY, int windowW, int windowH) {
+    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
+        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
+        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION);
+}
+
+static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH) {
+    return PointInFractionRect(mouseX, mouseY, windowW, windowH,
+        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
+        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION);
+}
+
+// Atlas capture helpers live in test_apps/common/atlas_capture* — see
+// dxr_capture::CaptureAtlasRegionVk / TriggerCaptureFlash / MakeCapturePath.
 
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
@@ -210,18 +278,15 @@ static void OpenLoadDialog(HWND hwnd) {
     if (GetOpenFileNameA(&ofn)) {
         std::string path(filePath);
         if (ValidateSceneFile(path)) {
-            LOG_INFO("Loading 3DGS scene: %s", path.c_str());
-            std::lock_guard<std::mutex> lock(g_sceneMutex);
-            if (g_gsRenderer.loadScene(path.c_str())) {
-                g_loadedFileName = GetPlyFilename(path);
-                LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                    GetPlyFileSize(path).c_str());
-                ApplyAutoFitForLoadedScene_locked();
-            } else {
-                LOG_ERROR("Failed to load scene: %s", path.c_str());
-                MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
-                    "Load Error", MB_OK | MB_ICONERROR);
+            // Hand the path off to the render thread (see g_pendingLoadPath
+            // comment above). Doing the load here would race the render
+            // thread's per-frame queue submissions and crash NVIDIA drivers.
+            {
+                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
+                g_pendingLoadPath = path;
             }
+            g_loadRequested.store(true, std::memory_order_release);
+            LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
         } else {
             MessageBoxA(hwnd, "Invalid scene file. Supported formats: .ply, .spz", "Load Error", MB_OK | MB_ICONERROR);
         }
@@ -238,9 +303,29 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
+        // UpdateInputState above already set leftButton/dragging=true. For
+        // button clicks (which post a message to run a modal dialog or change
+        // mode), clear that drag state — otherwise the modal eats the
+        // matching WM_LBUTTONUP and subsequent mouse motion is interpreted as
+        // a scene drag.
         if (IsClickOnLoadButton(mx, my, g_windowWidth, g_windowHeight)) {
-            // Post to main thread — don't block WindowProc with file dialog
+            {
+                std::lock_guard<std::mutex> lock(g_inputMutex);
+                g_inputState.leftButton = false;
+                g_inputState.dragging = false;
+            }
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+            return 0;
+        }
+        if (IsClickOnModeButton(mx, my, g_windowWidth, g_windowHeight)) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.leftButton = false;
+            g_inputState.dragging = false;
+            if (g_inputState.renderingModeCount > 0) {
+                g_inputState.currentRenderingMode =
+                    (g_inputState.currentRenderingMode + 1) % g_inputState.renderingModeCount;
+            }
+            g_inputState.renderingModeChangeRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -253,6 +338,39 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     case WM_USER + 1:
         OpenLoadDialog(hwnd);
         return 0;
+
+    case dxr_capture::kFlashUserMsg:
+        // Render thread requested a capture-flash; start it on this thread
+        // (the message-pump thread that owns the HWND).
+        dxr_capture::TriggerCaptureFlash(hwnd);
+        return 0;
+
+    case WM_TIMER:
+        if (wParam == dxr_capture::kFlashTimerId) {
+            dxr_capture::TickCaptureFlash(hwnd);
+            return 0;
+        }
+        break;
+
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) {
+            PostMessage(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (wParam == VK_F11) {
+            ToggleFullscreen(hwnd);
+            return 0;
+        }
+        // L key = load shortcut
+        if (wParam == 'L') {
+            PostMessage(hwnd, WM_USER + 1, 0, 0);
+            return 0;
+        }
+        // I key = capture multi-view atlas
+        if (wParam == 'I' || wParam == 'i') {
+            g_captureAtlasRequested.store(true);
+        }
+        break;
 
     case WM_SIZE:
         if (wParam != SIZE_MINIMIZED) {
@@ -270,22 +388,6 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         g_running.store(false);
         PostQuitMessage(0);
         return 0;
-
-    case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) {
-            PostMessage(hwnd, WM_CLOSE, 0, 0);
-            return 0;
-        }
-        if (wParam == VK_F11) {
-            ToggleFullscreen(hwnd);
-            return 0;
-        }
-        // L key = load shortcut
-        if (wParam == 'L') {
-            PostMessage(hwnd, WM_USER + 1, 0, 0);
-            return 0;
-        }
-        break;
     }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -447,6 +549,18 @@ static void RenderThreadFunc(
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             inputSnapshot = g_inputState;
+        }
+        // Pitch sign flip for the GS demo: shared input_handler.cpp mutates
+        // pitch with `-= dy` (cube_handle convention, paired with negative
+        // VkViewport.height Y-flip at rasterization). The GS demo Y-flips
+        // at the *view* stage in gs_renderer.cpp instead — that inverts the
+        // visual response, so we negate here to restore drag-down → look-down.
+        // Only `renderPitch` is used downstream; `inputSnapshot.pitch` itself
+        // stays in shared-handler convention so the writeback at end of frame
+        // doesn't compound.
+        float renderPitch = -inputSnapshot.pitch;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
             resetRequested = g_inputState.resetViewRequested;
             animateToggle = g_inputState.animateToggleRequested;
             loadReq = g_inputState.loadRequested;
@@ -468,6 +582,33 @@ static void RenderThreadFunc(
         // Request main thread to open file dialog when L key or Load button was pressed.
         if (loadReq) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
+        }
+
+        // Drain a queued scene load (set by OpenLoadDialog on the main
+        // thread). We must run loadScene here because it submits Vulkan work
+        // on the graphics queue, and that queue is exclusively driven by this
+        // (render) thread for per-frame submissions — see g_pendingLoadPath.
+        if (g_loadRequested.exchange(false, std::memory_order_acquire)) {
+            std::string path;
+            {
+                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
+                path = std::move(g_pendingLoadPath);
+                g_pendingLoadPath.clear();
+            }
+            if (!path.empty()) {
+                LOG_INFO("Loading 3DGS scene: %s", path.c_str());
+                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                if (g_gsRenderer.loadScene(path.c_str())) {
+                    g_loadedFileName = GetPlyFilename(path);
+                    LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
+                        GetPlyFileSize(path).c_str());
+                    ApplyAutoFitForLoadedScene_locked();
+                } else {
+                    LOG_ERROR("Failed to load scene: %s", path.c_str());
+                    MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
+                        "Load Error", MB_OK | MB_ICONERROR);
+                }
+            }
         }
 
         // Handle rendering mode change (V=cycle, 0-8=direct)
@@ -535,8 +676,8 @@ static void RenderThreadFunc(
 
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
-                        inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
-                        inputSnapshot.yaw, inputSnapshot.pitch,
+                        inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
+                        inputSnapshot.yaw, renderPitch,
                         inputSnapshot.viewParams)) {
 
                         XrViewLocateInfo locateInfo = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -550,21 +691,33 @@ static void RenderThreadFunc(
                         xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
 
                         bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
-                        uint32_t eyeRenderW = xr->swapchain.width / 2;
-                        uint32_t eyeRenderH = xr->swapchain.height;
 
-                        uint32_t renderW, renderH;
-                        if (monoMode) {
-                            renderW = windowW;
-                            renderH = windowH;
-                            if (renderW > xr->swapchain.width) renderW = xr->swapchain.width;
-                            if (renderH > xr->swapchain.height) renderH = xr->swapchain.height;
+                        // Per-view extent driven entirely by the current rendering
+                        // mode's view_scale and the live window size. Atlas dims
+                        // (cols × renderW, rows × renderH) are what gets written to
+                        // the swapchain and snapshotted by the 'I' key. Swapchain
+                        // creation already sized for the largest atlas, so no clamp.
+                        // Falls back to the global recommendedViewScale (and 1.0 for
+                        // mono) if the runtime didn't advertise per-mode info.
+                        float scaleX, scaleY;
+                        uint32_t cols, rows;
+                        if (xr->renderingModeCount > 0) {
+                            uint32_t mode = inputSnapshot.currentRenderingMode;
+                            scaleX = xr->renderingModeScaleX[mode];
+                            scaleY = xr->renderingModeScaleY[mode];
+                            cols   = xr->renderingModeTileColumns[mode] ? xr->renderingModeTileColumns[mode] : 1u;
+                            rows   = xr->renderingModeTileRows[mode]    ? xr->renderingModeTileRows[mode]    : 1u;
+                        } else if (monoMode) {
+                            scaleX = 1.0f; scaleY = 1.0f; cols = 1u; rows = 1u;
                         } else {
-                            renderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                            renderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                            if (renderW > eyeRenderW) renderW = eyeRenderW;
-                            if (renderH > eyeRenderH) renderH = eyeRenderH;
+                            scaleX = xr->recommendedViewScaleX;
+                            scaleY = xr->recommendedViewScaleY;
+                            cols = 2u; rows = 1u;  // legacy SBS default
                         }
+                        uint32_t renderW = (uint32_t)((double)windowW * scaleX);
+                        uint32_t renderH = (uint32_t)((double)windowH * scaleY);
+                        if (renderW == 0) renderW = 1;
+                        if (renderH == 0) renderH = 1;
 
                         // App-side Kooima stereo projection
                         Display3DView stereoViews[2];
@@ -598,6 +751,13 @@ static void RenderThreadFunc(
                             rawLeft.x -= eyeOffsetX; rawLeft.y -= eyeOffsetY;
                             XrVector3f rawRight = rawViews[1].pose.position;
                             rawRight.x -= eyeOffsetX; rawRight.y -= eyeOffsetY;
+                            // GsRenderer::updateUniforms Y-mirrors the world; displayPose
+                            // below is fed in render frame (cameraPosY negated). The
+                            // rawEyes must live in the same render frame so the asymmetric
+                            // Kooima projection's eye-vs-display geometry stays consistent
+                            // — otherwise vertical eye parallax comes out inverted.
+                            rawLeft.y  = -rawLeft.y;
+                            rawRight.y = -rawRight.y;
                             if (monoMode) {
                                 XrVector3f center = {
                                     (rawLeft.x + rawRight.x) * 0.5f,
@@ -614,13 +774,19 @@ static void RenderThreadFunc(
 
                             XrPosef displayPose;
                             XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
-                                inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                renderPitch, inputSnapshot.yaw, 0);
                             XMFLOAT4 q;
                             XMStoreFloat4(&q, pOri);
                             displayPose.orientation = {q.x, q.y, q.z, q.w};
-                            displayPose.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
+                            // GsRenderer Y-mirrors the world inside updateUniforms (see comment
+                            // in gs_renderer.cpp). The off-axis Kooima projection assumes the
+                            // mirror is reflected in the displayPose passed to display3d_compute_views,
+                            // so negate Y here to keep the eye-vs-display geometry consistent.
+                            displayPose.position = {inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
 
-                            XrVector3f nominalViewer = {xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ};
+                            // nominalViewer in render frame too (Y mirrored) — used for
+                            // parallax-factor lerp, must match the eye/displayPose frame.
+                            XrVector3f nominalViewer = {xr->nominalViewerX, -xr->nominalViewerY, xr->nominalViewerZ};
                             Display3DScreen screen = {winW_m, winH_m};
 
                             XrVector3f rawEyes[2] = {rawLeft, rawRight};
@@ -657,8 +823,14 @@ static void RenderThreadFunc(
                             XrVector3f centerEyeProcessed = (es != 0.0f)
                                 ? XrVector3f{centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
                                 : centerEyeDisp;
+                            // Use a real-world-frame displayPose for picking — the unproject
+                            // ray needs to be in the same frame as the splats (un-Y-flipped
+                            // world). The render-time displayPose has its Y negated for the
+                            // renderer's view-stage Y mirror; using that here would put
+                            // rayOrigin in a mirror frame and pickGaussian would intersect
+                            // against splats in the wrong frame.
                             XrPosef displayPoseLocal;
-                            XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                            XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(renderPitch, inputSnapshot.yaw, 0);
                             XMFLOAT4 q;
                             XMStoreFloat4(&q, pOri);
                             displayPoseLocal.orientation = {q.x, q.y, q.z, q.w};
@@ -677,16 +849,33 @@ static void RenderThreadFunc(
                             float hitPos[3];
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                XrVector3f hitV = {hitPos[0], hitPos[1], hitPos[2]};
-                                XrVector3f upHint = {0, 1, 0};
+                                // Both endpoints stored in WORLD frame (the same frame as
+                                // inputSnapshot.cameraPosX/Y/Z and inputSnapshot.pitch/yaw)
+                                // so the slerp's writeback decodes back into world-frame
+                                // pitch/yaw. displayPoseLocal.orientation was built from
+                                // renderPitch (-pitch) for the click-pick centerView; we
+                                // must NOT reuse that render-frame quaternion here, else
+                                // the slerp's `state.pitch = asin(fwd.y)` decode produces
+                                // a sign-flipped pitch and the display rotates on teleport.
+                                XMVECTOR worldOriQ = XMQuaternionRotationRollPitchYaw(
+                                    inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                XMFLOAT4 wq;
+                                XMStoreFloat4(&wq, worldOriQ);
+                                XrQuaternionf worldOri = {wq.x, wq.y, wq.z, wq.w};
+
+                                XrPosef fromWorld;
+                                fromWorld.orientation = worldOri;
+                                fromWorld.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
                                 XrPosef target;
-                                display3d_align_pose_to_ray(hitV, rayDirV, upHint, &target);
+                                target.position = {hitPos[0], hitPos[1], hitPos[2]};
+                                target.orientation = worldOri;  // preserve current orientation — translate-only
                                 std::lock_guard<std::mutex> inputLock(g_inputMutex);
-                                g_inputState.transitionFrom = displayPoseLocal;
+                                g_inputState.transitionFrom = fromWorld;
                                 g_inputState.transitionTo = target;
                                 g_inputState.transitionT = 0.0f;
                                 g_inputState.transitioning = true;
-                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)", hitPos[0], hitPos[1], hitPos[2]);
+                                LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
+                                    hitPos[0], hitPos[1], hitPos[2]);
                             }
                         }
 
@@ -713,9 +902,9 @@ static void RenderThreadFunc(
                                     monoM2vView = inputSnapshot.viewParams.virtualDisplayHeight / xr->displayHeightM;
                                 float eyeScale = inputSnapshot.viewParams.perspectiveFactor * monoM2vView / inputSnapshot.viewParams.scaleFactor;
                                 XMVECTOR playerOri = XMQuaternionRotationRollPitchYaw(
-                                    inputSnapshot.pitch, inputSnapshot.yaw, 0);
+                                    renderPitch, inputSnapshot.yaw, 0);
                                 XMVECTOR playerPos = XMVectorSet(
-                                    inputSnapshot.cameraPosX, inputSnapshot.cameraPosY,
+                                    inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY,
                                     inputSnapshot.cameraPosZ, 0.0f);
                                 XMVECTOR worldPos = XMVector3Rotate(centerLocalPos * eyeScale, playerOri) + playerPos;
                                 XMVECTOR worldOri = XMQuaternionMultiply(localOri, playerOri);
@@ -760,11 +949,17 @@ static void RenderThreadFunc(
 
                             if (hasGsScene) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
-                                    uint32_t vpX = monoMode ? 0 : eye * renderW;
+                                    // Row-major eye placement in the atlas; for 2×1 SBS
+                                    // this is (0, renderW) at row 0; for mono (cols=1)
+                                    // it collapses to (0, 0).
+                                    uint32_t col = (uint32_t)eye % cols;
+                                    uint32_t row = (uint32_t)eye / cols;
+                                    uint32_t vpX = col * renderW;
+                                    uint32_t vpY = row * renderH;
                                     g_gsRenderer.renderEye(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
                                         xr->swapchain.width, xr->swapchain.height,
-                                        vpX, 0, renderW, renderH,
+                                        vpX, vpY, renderW, renderH,
                                         viewMat[eye], projMat[eye]);
                                 }
                             } else {
@@ -772,11 +967,62 @@ static void RenderThreadFunc(
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
 
+                            // 'I' key: dump the rendered atlas (cols × rows × renderW × renderH)
+                            // to %USERPROFILE%\Pictures\DisplayXR\<scene>-<n>_<cols>x<rows>.png.
+                            // Atlas dims come from the current rendering mode's tile layout
+                            // and view scale — works for mono (1×1), SBS (2×1), and any other
+                            // layout the runtime advertises. Filename auto-increments.
+                            if (g_captureAtlasRequested.exchange(false)) {
+                                if (hasGsScene) {
+                                    uint32_t atlasW = cols * renderW;
+                                    uint32_t atlasH = rows * renderH;
+                                    if (atlasW <= xr->swapchain.width &&
+                                        atlasH <= xr->swapchain.height) {
+                                        std::string sceneName;
+                                        {
+                                            std::lock_guard<std::mutex> lock(g_sceneMutex);
+                                            sceneName = g_loadedFileName;
+                                        }
+                                        // Strip extension from scene filename
+                                        // (e.g. "butterfly.spz" → "butterfly").
+                                        auto dot = sceneName.find_last_of('.');
+                                        std::string stem = (dot == std::string::npos)
+                                            ? sceneName : sceneName.substr(0, dot);
+                                        if (stem.empty()) stem = "scene";
+                                        std::string outPath = dxr_capture::MakeCapturePath(
+                                            stem, cols, rows);
+                                        // GS writes via compute imageStore — bytes are
+                                        // linear even on an sRGB swapchain; tell the helper
+                                        // to mirror the runtime's display-side decode.
+                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
+                                            vkDevice, physDevice,
+                                            graphicsQueue, renderCmdPool,
+                                            (*swapchainVkImages)[imageIndex],
+                                            (int)colorFormat,
+                                            xr->swapchain.width, xr->swapchain.height,
+                                            0, 0, atlasW, atlasH, outPath,
+                                            /*linearBytesInSrgbImage=*/true);
+                                        if (ok) {
+                                            LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
+                                                     atlasW, atlasH, cols, rows, outPath.c_str());
+                                            dxr_capture::PostFlashRequest(hwnd);
+                                        }
+                                    } else {
+                                        LOG_WARN("Capture skipped: atlas %ux%u exceeds swapchain %ux%u",
+                                                 atlasW, atlasH, xr->swapchain.width, xr->swapchain.height);
+                                    }
+                                } else {
+                                    LOG_WARN("Capture skipped: no scene loaded");
+                                }
+                            }
+
                             for (int eye = 0; eye < eyeCount; eye++) {
+                                uint32_t col = (uint32_t)eye % cols;
+                                uint32_t row = (uint32_t)eye / cols;
                                 projectionViews[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
                                 projectionViews[eye].subImage.swapchain = xr->swapchain.swapchain;
                                 projectionViews[eye].subImage.imageRect.offset = {
-                                    (int32_t)(monoMode ? 0 : eye * renderW), 0};
+                                    (int32_t)(col * renderW), (int32_t)(row * renderH)};
                                 projectionViews[eye].subImage.imageRect.extent = {
                                     (int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
@@ -790,8 +1036,11 @@ static void RenderThreadFunc(
                             rendered = false;
                         }
 
-                        // Render HUD to window-space layer swapchain
-                        if (rendered && inputSnapshot.hudVisible && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                        // Render HUD to window-space layer swapchain. Submitted
+                        // every frame so the chrome buttons (Open / Mode) stay
+                        // visible — the TAB toggle only hides the body backdrop
+                        // and text via the `drawBody` flag below.
+                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages) {
                             uint32_t hudImageIndex;
                             if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
@@ -814,19 +1063,21 @@ static void RenderThreadFunc(
                                 }
                                 modeText += sceneText;
 
-                                bool dispMonoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
-                                uint32_t dispRenderW, dispRenderH;
-                                if (dispMonoMode) {
-                                    dispRenderW = windowW;
-                                    dispRenderH = windowH;
-                                    if (dispRenderW > xr->swapchain.width) dispRenderW = xr->swapchain.width;
-                                    if (dispRenderH > xr->swapchain.height) dispRenderH = xr->swapchain.height;
+                                // Per-view extent for HUD display — same formula as the
+                                // render path (window × view_scale of the current mode).
+                                float dispScaleX, dispScaleY;
+                                if (xr->renderingModeCount > 0) {
+                                    uint32_t mode = inputSnapshot.currentRenderingMode;
+                                    dispScaleX = xr->renderingModeScaleX[mode];
+                                    dispScaleY = xr->renderingModeScaleY[mode];
                                 } else {
-                                    dispRenderW = (uint32_t)(windowW * xr->recommendedViewScaleX);
-                                    dispRenderH = (uint32_t)(windowH * xr->recommendedViewScaleY);
-                                    if (dispRenderW > xr->swapchain.width / 2) dispRenderW = xr->swapchain.width / 2;
-                                    if (dispRenderH > xr->swapchain.height) dispRenderH = xr->swapchain.height;
+                                    dispScaleX = xr->recommendedViewScaleX;
+                                    dispScaleY = xr->recommendedViewScaleY;
                                 }
+                                uint32_t dispRenderW = (uint32_t)((double)windowW * dispScaleX);
+                                uint32_t dispRenderH = (uint32_t)((double)windowH * dispScaleY);
+                                if (dispRenderW == 0) dispRenderW = 1;
+                                if (dispRenderH == 0) dispRenderH = 1;
                                 std::wstring perfText = FormatPerformanceInfo(perfStats.fps, perfStats.frameTimeMs,
                                     dispRenderW, dispRenderH, windowW, windowH);
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
@@ -841,9 +1092,9 @@ static void RenderThreadFunc(
                                     xr->eyeTrackingActive, xr->isEyeTracking,
                                     xr->activeEyeTrackingMode, xr->supportedEyeTrackingModes);
 
-                                float fwdX = -sinf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
-                                float fwdY =  sinf(inputSnapshot.pitch);
-                                float fwdZ = -cosf(inputSnapshot.yaw) * cosf(inputSnapshot.pitch);
+                                float fwdX = -sinf(inputSnapshot.yaw) * cosf(renderPitch);
+                                float fwdY =  sinf(renderPitch);
+                                float fwdZ = -cosf(inputSnapshot.yaw) * cosf(renderPitch);
                                 std::wstring cameraText = FormatCameraInfo(
                                     inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
                                     fwdX, fwdY, fwdZ);
@@ -867,9 +1118,45 @@ static void RenderThreadFunc(
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"
                                     L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
+                                // Top-bar buttons. Translate window-fraction click
+                                // regions into HUD-pixel coords using the HUD's
+                                // own footprint constants (the HUD covers window
+                                // fraction (0,0) → (HUD_WIDTH_FRACTION,
+                                // HUD_HEIGHT_FRACTION); inside that, pixel space
+                                // is (0,0) → (hudWidth, hudHeight)).
+                                std::vector<HudButton> buttons;
+                                {
+                                    auto toHudPx = [&](float xf, float yf, float wf, float hf, const std::wstring& label) {
+                                        HudButton b;
+                                        b.label = label;
+                                        b.x = (xf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
+                                        b.y = (yf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        b.width  = (wf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
+                                        b.height = (hf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        return b;
+                                    };
+                                    buttons.push_back(toHudPx(
+                                        OPEN_BTN_X_FRACTION, OPEN_BTN_Y_FRACTION,
+                                        OPEN_BTN_WIDTH_FRACTION, OPEN_BTN_HEIGHT_FRACTION,
+                                        L"Open…"));
+                                    std::wstring modeLabel = L"Mode";
+                                    if (xr->renderingModeCount > 0 &&
+                                        inputSnapshot.currentRenderingMode < xr->renderingModeCount &&
+                                        xr->renderingModeNames[inputSnapshot.currentRenderingMode]) {
+                                        const char* nm = xr->renderingModeNames[inputSnapshot.currentRenderingMode];
+                                        modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
+                                    }
+                                    buttons.push_back(toHudPx(
+                                        MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
+                                        MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION,
+                                        modeLabel));
+                                }
+
                                 uint32_t srcRowPitch = 0;
                                 const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText);
+                                    cameraText, stereoText, helpText, buttons,
+                                    /*drawBody=*/inputSnapshot.hudVisible,
+                                    /*bodyAtBottom=*/true);
                                 if (pixels) {
                                     const uint8_t* src = (const uint8_t*)pixels;
                                     uint8_t* dst = (uint8_t*)hudStagingMapped;
@@ -940,23 +1227,18 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Render load button to its own window-space layer
-                        // (Simple text rendered via D2D into a small swapchain)
-                        // TODO: Implement load button swapchain rendering
-                        // For now, the L key shortcut and click detection handle loading
                     }
                 }
 
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
                 if (rendered && hudSubmitted) {
-                    float hudAR = (float)hudWidth / (float)hudHeight;
-                    float windowAR = (windowW > 0 && windowH > 0) ? (float)windowW / (float)windowH : 1.0f;
-                    float fracW = HUD_WIDTH_FRACTION;
-                    float fracH = fracW * windowAR / hudAR;
-                    if (fracH > 1.0f) { fracH = 1.0f; fracW = hudAR / windowAR; }
+                    // Layer spans the full HUD footprint (full window height
+                    // by HUD_WIDTH_FRACTION). Empty regions (alpha=0) are
+                    // invisible thanks to the alpha-blended composite path
+                    // in the vk_native compositor.
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, fracW, fracH, 0.0f, submitViewCount);
+                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f, submitViewCount);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
                 } else {
@@ -1173,7 +1455,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     uint32_t hudHeight = (uint32_t)(xr.swapchain.height * HUD_HEIGHT_FRACTION);
 
     HudRenderer hudRenderer = {};
-    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight);
+    uint32_t hudFontBaseHeight = (uint32_t)(xr.swapchain.height * HUD_FONT_BASE_FRACTION);
+    bool hudOk = InitializeHudRenderer(hudRenderer, hudWidth, hudHeight, hudFontBaseHeight);
     if (!hudOk) {
         LOG_WARN("HUD renderer init failed - HUD will not be displayed");
     }

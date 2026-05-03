@@ -145,16 +145,37 @@ bool CreateSwapchain(XrSessionManager& xr) {
 
     const auto& view = xr.configViews[0];
 
-    // If display info is available (via XR_EXT_display_info), use native display resolution.
-    // Otherwise fall back to recommended dimensions from xrEnumerateViewConfigurationViews.
+    // Size the swapchain at init from the largest atlas any rendering mode
+    // could produce when the app is running full-screen — atlas dims per mode
+    // are (cols × scaleX × displayPixelW) × (rows × scaleY × displayPixelH).
+    // For sim_display and Leia SR this collapses to the panel resolution
+    // (max(cols × scaleX) ≤ 1 across all their advertised modes). The atlas
+    // the app actually writes per frame is smaller — driven by the live
+    // window size — but the swapchain has to accommodate full-screen so the
+    // app can resize / fullscreen at any time without reallocating. Falls
+    // back to recommended × (2,1) if display info is unavailable.
     uint32_t width, height;
     if (xr.displayPixelWidth > 0 && xr.displayPixelHeight > 0) {
-        // Native display res — app manages viewport scaling via recommendedViewScaleX/Y
         width = xr.displayPixelWidth;
         height = xr.displayPixelHeight;
-        LOG_INFO("Swapchain at native display res %ux%u (from XR_EXT_display_info)", width, height);
+        if (xr.renderingModeCount > 0) {
+            uint32_t maxAtlasW = 0, maxAtlasH = 0;
+            for (uint32_t i = 0; i < xr.renderingModeCount; i++) {
+                uint32_t aw = (uint32_t)((double)xr.renderingModeTileColumns[i] *
+                                          xr.renderingModeScaleX[i] *
+                                          (double)xr.displayPixelWidth);
+                uint32_t ah = (uint32_t)((double)xr.renderingModeTileRows[i] *
+                                          xr.renderingModeScaleY[i] *
+                                          (double)xr.displayPixelHeight);
+                if (aw > maxAtlasW) maxAtlasW = aw;
+                if (ah > maxAtlasH) maxAtlasH = ah;
+            }
+            if (maxAtlasW > width)  width  = maxAtlasW;
+            if (maxAtlasH > height) height = maxAtlasH;
+        }
+        LOG_INFO("Swapchain at max-atlas %ux%u (display %ux%u, %u modes)",
+                 width, height, xr.displayPixelWidth, xr.displayPixelHeight, xr.renderingModeCount);
     } else {
-        // Fallback: use recommended from xrEnumerateViewConfigurationViews
         width = view.recommendedImageRectWidth * 2;
         height = view.recommendedImageRectHeight;
         LOG_INFO("Swapchain at recommended %ux%u (no display info)", width, height);
@@ -584,12 +605,17 @@ bool EndFrameWithWindowSpaceHud(
     const XrCompositionLayerProjectionView* projViews,
     float hudX, float hudY, float hudWidth, float hudHeight,
     float hudDisparity,
-    uint32_t viewCount
+    uint32_t viewCount,
+    int32_t srcX, int32_t srcY,
+    int32_t srcW, int32_t srcH
 ) {
     XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     projectionLayer.space = xr.localSpace;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = projViews;
+
+    if (srcW < 0) srcW = (int32_t)xr.hudSwapchain.width;
+    if (srcH < 0) srcH = (int32_t)xr.hudSwapchain.height;
 
     // Window-space HUD layer
     XrCompositionLayerWindowSpaceEXT hudLayer = {};
@@ -597,11 +623,8 @@ bool EndFrameWithWindowSpaceHud(
     hudLayer.next = nullptr;
     hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     hudLayer.subImage.swapchain = xr.hudSwapchain.swapchain;
-    hudLayer.subImage.imageRect.offset = {0, 0};
-    hudLayer.subImage.imageRect.extent = {
-        (int32_t)xr.hudSwapchain.width,
-        (int32_t)xr.hudSwapchain.height
-    };
+    hudLayer.subImage.imageRect.offset = {srcX, srcY};
+    hudLayer.subImage.imageRect.extent = {srcW, srcH};
     hudLayer.subImage.imageArrayIndex = 0;
     hudLayer.x = hudX;
     hudLayer.y = hudY;

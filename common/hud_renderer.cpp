@@ -12,7 +12,7 @@
 #pragma comment(lib, "d2d1.lib")
 #pragma comment(lib, "dwrite.lib")
 
-bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
+bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h, uint32_t fontBaseHeight) {
     hud.width = w;
     hud.height = h;
 
@@ -62,9 +62,12 @@ bool InitializeHudRenderer(HudRenderer& hud, uint32_t w, uint32_t h) {
         return false;
     }
 
-    // Scale font sizes proportionally based on HUD dimensions.
-    // Base reference: 470px height (full layout with all sections).
-    float fontScale = h / 470.0f;
+    // Scale font sizes proportionally. Base reference: 470px height (full
+    // layout with all sections). Caller may pass `fontBaseHeight` if the
+    // texture is taller than the layout it should be sized for (e.g. a HUD
+    // layer that spans the full window for chrome-buttons-at-top placement).
+    uint32_t scaleH = (fontBaseHeight > 0) ? fontBaseHeight : h;
+    float fontScale = scaleH / 470.0f;
     float normalFontSize = 20.0f * fontScale;
     float smallFontSize = 15.0f * fontScale;
     hud.normalFontSize = normalFontSize;
@@ -93,27 +96,36 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
     const std::wstring& eyeText,
     const std::wstring& cameraText,
     const std::wstring& stereoText,
-    const std::wstring& helpText)
+    const std::wstring& helpText,
+    const std::vector<HudButton>& buttons,
+    bool drawBody,
+    bool bodyAtBottom)
 {
-    // Clear render texture with semi-transparent black
+    // bodyAtBottom mode clears to transparent and draws a tight backdrop
+    // only behind the body region (so a full-window-height HUD layer stays
+    // mostly invisible). Legacy mode keeps the full-texture translucent
+    // clear so existing apps that fill the HUD top-down look identical.
     ID3D11RenderTargetView* rtv = nullptr;
     hud.device->CreateRenderTargetView(hud.renderTex.Get(), nullptr, &rtv);
     if (rtv) {
-        float clearColor[4] = {0.0f, 0.0f, 0.0f, 0.5f};
+        float clearColor[4];
+        if (bodyAtBottom) {
+            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+            clearColor[2] = 0.0f; clearColor[3] = 0.0f;
+        } else {
+            clearColor[0] = 0.0f; clearColor[1] = 0.0f;
+            clearColor[2] = 0.0f; clearColor[3] = drawBody ? 0.5f : 0.0f;
+        }
         hud.context->ClearRenderTargetView(rtv, clearColor);
         rtv->Release();
     }
 
-    // Flow-based layout: position each section sequentially based on
-    // actual font size and line count, with proportional padding.
     float normalLineH = hud.normalFontSize * 1.4f;
     float smallLineH = hud.smallFontSize * 1.4f;
     float px = 12.0f * (hud.width / 380.0f);   // left padding
     float tw = (float)hud.width - 2.0f * px;    // text width
     float gap = smallLineH * 0.3f;              // inter-section gap
-    float y = gap;                               // top padding
 
-    // Render each section and advance Y cursor
     struct Section { const std::wstring& text; bool isSmall; };
     Section sections[] = {
         {sessionText, false},
@@ -126,13 +138,58 @@ const void* RenderHudAndMap(HudRenderer& hud, uint32_t* rowPitch,
         {helpText, true},
     };
 
-    for (const auto& s : sections) {
-        if (s.text.empty()) continue;
-        float lh = s.isSmall ? smallLineH : normalLineH;
-        float h = lh * countLines(s.text);
-        RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
-            s.text, px, y, tw, h, s.isSmall);
-        y += h + gap;
+    if (drawBody) {
+        // Reserve top of the texture for buttons (if any) so body text
+        // doesn't overlap them. Without buttons this collapses to top padding.
+        float buttonBandBottom = 0.0f;
+        for (const auto& b : buttons) {
+            float bb = b.y + b.height;
+            if (bb > buttonBandBottom) buttonBandBottom = bb;
+        }
+
+        // Compute total body height (sections + inter-section gaps).
+        float bodyH = 0.0f;
+        bool firstSec = true;
+        for (const auto& s : sections) {
+            if (s.text.empty()) continue;
+            float lh = s.isSmall ? smallLineH : normalLineH;
+            bodyH += lh * countLines(s.text);
+            if (!firstSec) bodyH += gap;
+            firstSec = false;
+        }
+
+        float y;
+        if (bodyAtBottom) {
+            float bottomPad = gap * 1.5f;
+            y = (float)hud.height - bodyH - bottomPad;
+            float topLimit = (buttonBandBottom > 0.0f) ? (buttonBandBottom + gap) : gap;
+            if (y < topLimit) y = topLimit;
+            float pad = gap;
+            // 50% black backdrop behind body region only — relies on the
+            // compositor honoring source alpha for the empty regions.
+            RenderFilledRect(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+                px - pad, y - pad,
+                tw + 2.0f * pad, bodyH + 2.0f * pad,
+                0.0f, 0.0f, 0.0f, 0.5f, 8.0f);
+        } else {
+            y = (buttonBandBottom > 0.0f) ? (buttonBandBottom + gap) : gap;
+        }
+
+        for (const auto& s : sections) {
+            if (s.text.empty()) continue;
+            float lh = s.isSmall ? smallLineH : normalLineH;
+            float h = lh * countLines(s.text);
+            RenderText(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+                s.text, px, y, tw, h, s.isSmall);
+            y += h + gap;
+        }
+    }
+
+    // Buttons drawn last so they sit on top of any backdrop, and unconditionally
+    // — the toggle hides the body text, not the chrome.
+    for (const auto& b : buttons) {
+        RenderButton(hud.overlay, hud.device.Get(), hud.renderTex.Get(),
+            b.label, b.x, b.y, b.width, b.height, b.hovered, /*useSmallFont=*/true);
     }
 
     // Copy render texture to staging texture, then map for CPU read
