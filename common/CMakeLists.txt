@@ -45,6 +45,14 @@ if(WIN32)
     )
 endif()
 
+# Atlas capture (multi-view 'I' key) — generic helper goes in
+# sr_common_base; per-API back-ends are added directly to the
+# executable (they need Vulkan / Cocoa headers the lib does not pull in).
+list(APPEND SR_COMMON_BASE_SOURCES
+    atlas_capture.cpp
+    atlas_capture.h
+)
+
 add_library(sr_common_base STATIC ${SR_COMMON_BASE_SOURCES})
 
 target_include_directories(sr_common_base PUBLIC

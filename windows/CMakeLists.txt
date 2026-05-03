@@ -67,6 +67,8 @@ add_executable(gaussian_splatting_handle_vk_win WIN32
     main.cpp
     xr_session.cpp
     xr_session.h
+    # 'I' key atlas capture: VK readback (filename + flash come via sr_common_base)
+    ${CMAKE_SOURCE_DIR}/common/atlas_capture_vk.cpp
     sr_3dgs_openxr_ext_vk.manifest
     resource.rc
 )
