@@ -385,6 +385,12 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     // 64-bit atomics are optional — sort.comp uses CAS fallback when unavailable
     features12.shaderBufferInt64Atomics = supported12.shaderBufferInt64Atomics;
     features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
+    // Required for the DisplayXR shell IPC path: the runtime imports the
+    // service's per-client cross-process workspace_sync_fence as a VK
+    // timeline semaphore so the service can ID3D11DeviceContext4::Wait on
+    // our render completion. Without this, every view ships with a stale
+    // fence value and the service skips the blit (manifest: black window).
+    features12.timelineSemaphore = supported12.timelineSemaphore;
 
     VkDeviceCreateInfo createInfo = {};
     createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
