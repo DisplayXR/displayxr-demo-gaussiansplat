@@ -669,7 +669,9 @@ static void RenderThreadFunc(
         if (xr->sessionRunning) {
             XrFrameState frameState;
             if (BeginFrame(*xr, frameState)) {
-                XrCompositionLayerProjectionView projectionViews[2] = {};
+                // Sized to runtime's max possible view count (sim_display Quad mode = 4).
+                // Active mode's view count drives how many slots are actually filled and submitted.
+                XrCompositionLayerProjectionView projectionViews[8] = {};
                 bool rendered = false;
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
@@ -686,11 +688,25 @@ static void RenderThreadFunc(
                         locateInfo.space = xr->localSpace;
 
                         XrViewState viewState = {XR_TYPE_VIEW_STATE};
-                        uint32_t viewCount = 2;
-                        XrView rawViews[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
-                        xrLocateViews(xr->session, &locateInfo, &viewState, 2, &viewCount, rawViews);
+                        // Over-allocate to the runtime's max possible view_count (sim_display
+                        // reports 4 for Quad mode; LeiaSR reports 2). Hardcoding 2 here used
+                        // to fail with XR_ERROR_SIZE_INSUFFICIENT under sim_display.
+                        uint32_t viewCount = 8;
+                        XrView rawViews[8];
+                        for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
                         bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+
+                        // View count for the active rendering mode (1=mono, 2=stereo, 4=quad).
+                        // Sized off the runtime's per-mode advertisement so the eye-loop and
+                        // per-view buffers (rawEyes / stereoViews / viewMat / projectionViews)
+                        // all line up with what xrEndFrame expects.
+                        uint32_t activeViewCount = (xr->renderingModeCount > 0)
+                            ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2u;
+                        if (activeViewCount == 0) activeViewCount = 1u;
+                        if (activeViewCount > 8) activeViewCount = 8u;
+                        const int eyeCount = monoMode ? 1 : (int)activeViewCount;
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -719,8 +735,8 @@ static void RenderThreadFunc(
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
 
-                        // App-side Kooima stereo projection
-                        Display3DView stereoViews[2];
+                        // App-side Kooima projection (per-view, sized to active mode)
+                        Display3DView stereoViews[8];
                         bool useAppProjection = (xr->hasDisplayInfoExt && xr->displayWidthM > 0.0f);
                         if (useAppProjection) {
                             float dispPxW = xr->displayPixelWidth > 0 ? (float)xr->displayPixelWidth : (float)xr->swapchain.width;
@@ -747,23 +763,28 @@ static void RenderThreadFunc(
                                 }
                             }
 
-                            XrVector3f rawLeft = rawViews[0].pose.position;
-                            rawLeft.x -= eyeOffsetX; rawLeft.y -= eyeOffsetY;
-                            XrVector3f rawRight = rawViews[1].pose.position;
-                            rawRight.x -= eyeOffsetX; rawRight.y -= eyeOffsetY;
+                            // Build per-view raw eye positions in render frame.
                             // GsRenderer::updateUniforms Y-mirrors the world; displayPose
                             // below is fed in render frame (cameraPosY negated). The
                             // rawEyes must live in the same render frame so the asymmetric
                             // Kooima projection's eye-vs-display geometry stays consistent
                             // — otherwise vertical eye parallax comes out inverted.
-                            rawLeft.y  = -rawLeft.y;
-                            rawRight.y = -rawRight.y;
+                            XrVector3f rawEyes[8];
                             if (monoMode) {
-                                XrVector3f center = {
-                                    (rawLeft.x + rawRight.x) * 0.5f,
-                                    (rawLeft.y + rawRight.y) * 0.5f,
-                                    (rawLeft.z + rawRight.z) * 0.5f};
-                                rawLeft = rawRight = center;
+                                // Mono center = average of left/right raw views (0 and 1).
+                                XrVector3f l = rawViews[0].pose.position;
+                                XrVector3f r = rawViews[1].pose.position;
+                                rawEyes[0].x = (l.x + r.x) * 0.5f - eyeOffsetX;
+                                rawEyes[0].y = -((l.y + r.y) * 0.5f - eyeOffsetY);
+                                rawEyes[0].z = (l.z + r.z) * 0.5f;
+                            } else {
+                                for (int i = 0; i < eyeCount; i++) {
+                                    XrVector3f e = rawViews[i].pose.position;
+                                    e.x -= eyeOffsetX;
+                                    e.y -= eyeOffsetY;
+                                    e.y = -e.y;
+                                    rawEyes[i] = e;
+                                }
                             }
 
                             Display3DTunables tunables;
@@ -789,9 +810,8 @@ static void RenderThreadFunc(
                             XrVector3f nominalViewer = {xr->nominalViewerX, -xr->nominalViewerY, xr->nominalViewerZ};
                             Display3DScreen screen = {winW_m, winH_m};
 
-                            XrVector3f rawEyes[2] = {rawLeft, rawRight};
                             display3d_compute_views(
-                                rawEyes, 2, &nominalViewer,
+                                rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
                                 0.01f, 100.0f, stereoViews);
                         }
@@ -880,7 +900,7 @@ static void RenderThreadFunc(
                         }
 
                         rendered = true;
-                        int eyeCount = monoMode ? 1 : 2;
+                        // eyeCount already computed above from active mode's view count
 
                         // Mono center eye
                         XMMATRIX monoViewMatrix, monoProjMatrix;
@@ -915,8 +935,9 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Build per-eye view/projection matrices (column-major float[16])
-                        float viewMat[2][16], projMat[2][16];
+                        // Build per-eye view/projection matrices (column-major float[16]).
+                        // Sized to the runtime's max view count so Quad mode (4 views) fits.
+                        float viewMat[8][16], projMat[8][16];
                         for (int eye = 0; eye < eyeCount; eye++) {
                             if (useAppProjection) {
                                 int srcEye = monoMode ? 0 : eye;
@@ -1232,6 +1253,8 @@ static void RenderThreadFunc(
 
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
+                if (submitViewCount == 0) submitViewCount = 1;
+                if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered && hudSubmitted) {
                     // Layer spans the full HUD footprint (full window height
                     // by HUD_WIDTH_FRACTION). Empty regions (alpha=0) are
@@ -1551,6 +1574,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
+    // Align runtime active rendering mode with app's default (currentRenderingMode=1).
+    // Without this, app UI labels show mode 1 (Anaglyph) but the runtime stays at its
+    // own default (mode 0 Passthrough on sim_display) until the user presses V.
+    g_inputState.renderingModeChangeRequested = true;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
