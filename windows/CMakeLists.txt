@@ -69,7 +69,6 @@ add_executable(gaussian_splatting_handle_vk_win WIN32
     xr_session.h
     # 'I' key atlas capture: VK readback (filename + flash come via sr_common_base)
     ${CMAKE_SOURCE_DIR}/common/atlas_capture_vk.cpp
-    sr_3dgs_openxr_ext_vk.manifest
     resource.rc
 )
 
@@ -90,8 +89,11 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
 )
 
 if(MSVC)
+    file(RELATIVE_PATH _manifest_rel
+        "${CMAKE_BINARY_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest")
     set_target_properties(gaussian_splatting_handle_vk_win PROPERTIES
-        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest"
+        LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${_manifest_rel}"
     )
 endif()
 
