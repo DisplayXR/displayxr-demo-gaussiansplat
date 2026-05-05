@@ -4,10 +4,10 @@ set "REPO=%~dp0.."
 set "BIN_DIR=%REPO%\build\windows"
 set "OUT_DIR=%~dp0"
 if "%OUT_DIR:~-1%"=="\" set "OUT_DIR=%OUT_DIR:~0,-1%"
-if "%VERSION%"=="" set "VERSION=1.2.0"
+if "%VERSION%"=="" set "VERSION=1.2.1"
 if "%VERSION_MAJOR%"=="" set "VERSION_MAJOR=1"
 if "%VERSION_MINOR%"=="" set "VERSION_MINOR=2"
-if "%VERSION_PATCH%"=="" set "VERSION_PATCH=0"
+if "%VERSION_PATCH%"=="" set "VERSION_PATCH=1"
 
 if not exist "%BIN_DIR%\gaussian_splatting_handle_vk_win.exe" (
     echo ERROR: demo binary not found at %BIN_DIR%\gaussian_splatting_handle_vk_win.exe
