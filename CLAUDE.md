@@ -100,6 +100,34 @@ The dev machine has a Leia SR Windows display. After build, launch the produced 
 
 For autonomous transparent-window pixel inspection (when transparency lands): use `BitBlt` from the desktop window DC, NOT `PrintWindow`. PrintWindow returns opaque black for DComp-composed transparent windows.
 
+## Testing the dev build inside the DisplayXR Shell launcher
+
+Workspace controllers (the DisplayXR Shell, third-party verticals) discover apps via manifests under two registered-mode dirs (per `docs/specs/displayxr-app-manifest.md` in the runtime repo, §5):
+
+```
+%LOCALAPPDATA%\DisplayXR\apps\          ← per-user, wins precedence
+%ProgramData%\DisplayXR\apps\           ← system-wide, written by this demo's installer
+```
+
+The production installer (`installer\DisplayXRGaussianSplatInstaller.nsi`) writes a system-wide manifest pointing at `C:\Program Files\DisplayXR\Demos\GaussianSplat\gaussian_splatting_handle_vk_win.exe` — i.e. the **installed** binary, not your local dev build.
+
+To make the shell launcher route to your **dev build** without uninstalling/reinstalling:
+
+```bat
+scripts\build_windows.bat
+scripts\dev_register.bat
+```
+
+`dev_register.bat` drops a `%LOCALAPPDATA%\DisplayXR\apps\gaussian_splatting-dev.displayxr.json` with `exe_path` pointing at this repo's `build\windows\gaussian_splatting_handle_vk_win.exe`. Per the spec's dedup rule, `%LOCALAPPDATA%` wins over `%ProgramData%`, so the shell tile launches the dev binary. Restart the shell (or toggle the workspace) to pick up the new tile.
+
+To remove the dev override (shell falls back to the installed `%ProgramData%` entry):
+
+```bat
+scripts\dev_register.bat --unregister
+```
+
+The build script itself does NOT auto-register — registration is opt-in to keep the build hermetic.
+
 ## Sibling repos
 
 | Repo | Purpose |
