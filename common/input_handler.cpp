@@ -175,6 +175,12 @@ bool UpdateInputState(InputState& state, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_KEYDOWN:
         MarkUserInput(state);
         state.lastKey = GetKeyName(wParam);
+        // Ctrl+T: transparent background toggle. Intercept before the
+        // plain-'T' eye-tracking handler in the switch below.
+        if (wParam == 'T' && (GetKeyState(VK_CONTROL) & 0x8000) != 0) {
+            state.transparentBgToggleRequested = true;
+            return true;
+        }
         switch (wParam) {
         case 'W': state.keyW = true; break;
         case 'A': state.keyA = true; break;

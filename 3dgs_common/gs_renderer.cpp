@@ -301,11 +301,12 @@ bool GsRenderer::createPipelines()
         vkDestroyShaderModule(device_, mod, nullptr);
     }
 
-    // 8. render: set0 = {SSBO, SSBO, SSBO}, set1 = {storage image}, push = 3*uint
+    // 8. render: set0 = {SSBO, SSBO, SSBO}, set1 = {storage image}, push = 4*uint
+    // (width, height, apply_srgb, transparent_bg)
     dslRenderSet0_ = createDSLayout(device_, {S, S, S});
     dslRenderSet1_ = createDSLayout(device_, {I});
     layoutRender_ = createPipeLayout(device_,
-        {dslRenderSet0_, dslRenderSet1_}, 3 * sizeof(uint32_t));
+        {dslRenderSet0_, dslRenderSet1_}, 4 * sizeof(uint32_t));
     {
         auto mod = createShaderModule(device_, render_comp_data,
                                       sizeof(render_comp_data));
@@ -899,7 +900,8 @@ void GsRenderer::renderEye(VkImage swapchainImage,
                            uint32_t viewportWidth,
                            uint32_t viewportHeight,
                            const float viewMatrix[16],
-                           const float projMatrix[16])
+                           const float projMatrix[16],
+                           bool transparentBg)
 {
     if (!hasScene()) return;
 
@@ -1007,8 +1009,13 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         growSortBuffers(numInstances);
     }
 
-    if (numInstances == 0) {
-        // No visible gaussians — skip sort and render, just clear
+    if (numInstances == 0 && !transparentBg) {
+        // Opaque mode: skip sort + render. The runtime's opaque
+        // composition hides the stale swapchain pixels, so this is a
+        // pure perf optimization.
+        // In transparent mode we cannot early-return — stale splat
+        // pixels would ghost over the desktop. Fall through and let
+        // the render compute shader fill the viewport with (0,0,0,0).
         return;
     }
 
@@ -1120,7 +1127,8 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         // so the compositor's sampler decodes sRGB→linear on read, and the
         // display surface re-encodes linear→sRGB on output (single gamma).
         // Manual linearToSrgb() would cause double encoding (washed out colors).
-        uint32_t renderPC[3] = {viewportWidth, viewportHeight, 0u};
+        uint32_t renderPC[4] = {viewportWidth, viewportHeight, 0u,
+                                transparentBg ? 1u : 0u};
         vkCmdPushConstants(cmd, layoutRender_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(renderPC), renderPC);
 

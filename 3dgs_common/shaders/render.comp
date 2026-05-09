@@ -27,6 +27,7 @@ layout (push_constant) uniform Constants {
     uint width;
     uint height;
     uint apply_srgb;
+    uint transparent_bg;
 };
 
 layout (local_size_x = TILE_WIDTH, local_size_y = TILE_HEIGHT, local_size_z = 1) in;
@@ -87,5 +88,9 @@ void main() {
         c = vec3(linearToSrgb(c.x), linearToSrgb(c.y), linearToSrgb(c.z));
     }
 
-    imageStore(output_image, ivec2(curr_uv), vec4(c, 1.0f));
+    // Transparent mode: emit premultiplied alpha = 1 - T (splat coverage).
+    // Pixels untouched by any splat have T == 1 → alpha 0 (desktop shows
+    // through). Opaque mode keeps the historical alpha = 1 output.
+    float outAlpha = (transparent_bg != 0u) ? (1.0f - T) : 1.0f;
+    imageStore(output_image, ivec2(curr_uv), vec4(c, outAlpha));
 }

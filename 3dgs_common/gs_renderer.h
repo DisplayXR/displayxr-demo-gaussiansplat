@@ -108,6 +108,9 @@ struct GsRenderer {
     // Render one eye's view to a region of a Vulkan swapchain image.
     // Manages its own command buffers internally (allocate, record, submit, wait).
     // viewMatrix and projMatrix are column-major float[16].
+    // transparentBg=true makes the render shader output premultiplied alpha
+    // (1 - T) so background-uncovered pixels are 0 — the runtime then strips
+    // them on the chroma-key pass for desktop see-through.
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -117,7 +120,8 @@ struct GsRenderer {
                    uint32_t viewportWidth,
                    uint32_t viewportHeight,
                    const float viewMatrix[16],
-                   const float projMatrix[16]);
+                   const float projMatrix[16],
+                   bool transparentBg = false);
 
     // Clean up all resources.
     void cleanup();

@@ -10,7 +10,7 @@ This is a **standalone repo**. It evolves independently — there is no source-m
 
 ## Runtime dependency
 
-Requires the **DisplayXR runtime v1.1.0 or newer** for `XR_EXT_display_info` v12 fields (rendering-mode tile layout + rendering-mode-changed events).
+Requires the **DisplayXR runtime v1.3.0 or newer**. v1.3.0 ships the Vulkan transparent-window bridge (PR #215) that this demo now relies on unconditionally — the HWND is created with `WS_EX_NOREDIRECTIONBITMAP` and the session with `transparentBackgroundEnabled = XR_TRUE`, so older runtimes will produce a broken/black window. (v1.1.0+ is still required for the `XR_EXT_display_info` v12 rendering-mode fields the demo also queries.)
 
 Install via `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). Latest tag at the time of writing is `v1.3.0` (2026-05-09). The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is **optional** — only needed for the spatial workspace shell, which this demo does not use.
 

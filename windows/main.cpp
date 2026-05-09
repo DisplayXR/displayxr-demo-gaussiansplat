@@ -101,6 +101,11 @@ static std::mutex g_pendingLoadPathMutex;
 // of the swapchain to a PNG in %USERPROFILE%\Pictures\DisplayXR\. Skipped for
 // 1×1 (mono) layouts. Helper lives in test_apps/common/atlas_capture*.
 static std::atomic<bool> g_captureAtlasRequested{false};
+// Ctrl+T: opaque ⇄ transparent background. Always-on session-level
+// transparency is wired at xrCreateSession; this flag only flips the
+// renderer's output alpha (1 → 1-T) so background-uncovered pixels
+// punch through to the desktop.
+static std::atomic<bool> g_transparentBg{false};
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
@@ -402,7 +407,11 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = hInstance;
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    // Null background brush + WS_EX_NOREDIRECTIONBITMAP (below) are required
+    // by the runtime's transparent-window bridge (DComp + KMT shared texture).
+    // Both must be set even when the demo defaults to opaque, because session
+    // transparency is wired at xrCreateSession time and cannot be toggled later.
+    wc.hbrBackground = nullptr;
     wc.lpszClassName = WINDOW_CLASS;
 
     if (!RegisterClassEx(&wc)) {
@@ -416,7 +425,8 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
-    HWND hwnd = CreateWindowEx(0, WINDOW_CLASS, WINDOW_TITLE, WS_OVERLAPPEDWINDOW,
+    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
+        WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT, CW_USEDEFAULT,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
@@ -569,6 +579,12 @@ static void RenderThreadFunc(
             g_inputState.fullscreenToggleRequested = false;
             g_inputState.renderingModeChangeRequested = false;
             g_inputState.eyeTrackingModeToggleRequested = false;
+            if (g_inputState.transparentBgToggleRequested) {
+                g_inputState.transparentBgToggleRequested = false;
+                bool now = !g_transparentBg.load();
+                g_transparentBg.store(now);
+                LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
+            }
             g_inputState.animateToggleRequested = false;
             g_inputState.loadRequested = false;
             if (animateToggle) {
@@ -981,7 +997,8 @@ static void RenderThreadFunc(
                                         (*swapchainVkImages)[imageIndex], colorFormat,
                                         xr->swapchain.width, xr->swapchain.height,
                                         vpX, vpY, renderW, renderH,
-                                        viewMat[eye], projMat[eye]);
+                                        viewMat[eye], projMat[eye],
+                                        g_transparentBg.load());
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,

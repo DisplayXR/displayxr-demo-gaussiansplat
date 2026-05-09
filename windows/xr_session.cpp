@@ -428,10 +428,18 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
 
     XrWin32WindowBindingCreateInfoEXT sessionTarget = {XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT};
     sessionTarget.windowHandle = hwnd;
+    // Always-on transparent-window support. The runtime wires DComp + the
+    // KMT-shared-texture bridge based on these fields at xrCreateSession;
+    // they cannot be flipped at runtime. Ctrl+T at the app level only
+    // changes the renderer's output alpha — the chroma-key strip pass is
+    // a no-op when alpha == 1 throughout, so opaque mode looks identical
+    // to a non-transparent session. Requires runtime ≥ v1.3.0.
+    sessionTarget.transparentBackgroundEnabled = XR_TRUE;
+    sessionTarget.chromaKeyColor = 0; // 0 → DP picks default magenta
 
     if (xr.hasWin32WindowBindingExt && hwnd) {
         vkBinding.next = &sessionTarget;
-        LOG_INFO("Using XR_EXT_win32_window_binding with window handle");
+        LOG_INFO("Using XR_EXT_win32_window_binding with window handle (transparent-bg ENABLED)");
     }
 
     XrSessionCreateInfo sessionInfo = {XR_TYPE_SESSION_CREATE_INFO};

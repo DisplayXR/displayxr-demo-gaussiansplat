@@ -86,6 +86,11 @@ struct InputState {
     // Eye tracking mode toggle (T key)
     bool eyeTrackingModeToggleRequested = false;
 
+    // Background transparency toggle (Ctrl+T): flips the renderer between
+    // opaque clear and premultiplied alpha = 1 - T (desktop see-through).
+    // Requires the session to have been created with transparentBackgroundEnabled.
+    bool transparentBgToggleRequested = false;
+
     // 'I' key: snapshot the rendered atlas (cols × rows × renderW × renderH)
     // to %USERPROFILE%\Pictures\DisplayXR\<app>-<N>_<cols>x<rows>.png. Skipped
     // for 1×1 (mono) layouts. Filename auto-increments per (cols×rows).

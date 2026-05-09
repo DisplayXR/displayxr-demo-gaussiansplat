@@ -506,6 +506,10 @@ bool EndFrame(XrSessionManager& xr, XrTime displayTime, const XrCompositionLayer
     projectionLayer.space = xr.localSpace;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = views;
+    // Always blend with source alpha. In opaque mode the renderer outputs
+    // alpha=1 so this is a no-op; in transparent mode (Ctrl+T) it lets the
+    // runtime's chroma-key strip pass punch through to the desktop.
+    projectionLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 
     const XrCompositionLayerBaseHeader* layers[] = {
         (XrCompositionLayerBaseHeader*)&projectionLayer
@@ -613,6 +617,9 @@ bool EndFrameWithWindowSpaceHud(
     projectionLayer.space = xr.localSpace;
     projectionLayer.viewCount = viewCount;
     projectionLayer.views = projViews;
+    // Same source-alpha blend bit as EndFrame() above — required for the
+    // Ctrl+T transparent-bg path; harmless when opaque (alpha=1).
+    projectionLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 
     if (srcW < 0) srcW = (int32_t)xr.hudSwapchain.width;
     if (srcH < 0) srcH = (int32_t)xr.hudSwapchain.height;
