@@ -51,11 +51,12 @@ ShowUninstDetails show
 !include "WordFunc.nsh"
 !insertmacro VersionCompare
 
-; Minimum runtime version that ships SimulatedRealityVulkanBeta.dll alongside
-; the runtime DLLs (added in runtime v1.2.0). The demo's Vulkan compositor
-; path delay-loads the SR weaver, so older runtime installs would crash with
-; STATUS_DLL_NOT_FOUND on session create.
-!define MIN_RUNTIME_VERSION "1.2.0"
+; Minimum runtime version. Bumped to 1.3.0 with the Ctrl+T transparent-bg
+; toggle: the demo now creates the HWND with WS_EX_NOREDIRECTIONBITMAP and the
+; session with transparentBackgroundEnabled=XR_TRUE unconditionally, which
+; only render correctly against runtime ≥ 1.3.0's VK→D3D11 KMT-shared-texture
+; / DComp bridge (PR #215). Older runtimes produce a broken/black window.
+!define MIN_RUNTIME_VERSION "1.3.0"
 
 ;--------------------------------
 ; UI
