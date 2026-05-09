@@ -4,9 +4,6 @@
 # Top-level CMakeLists.txt for the displayxr-demo-gaussiansplat standalone
 # repo. Orchestrates the shared `common` and `3dgs_common` libraries, then
 # dispatches to macos/ or windows/ for the platform-specific executable.
-#
-# Authored in displayxr-runtime-pvt as CMakeLists.top.txt; the publish
-# workflow renames it to CMakeLists.txt when syncing to the public repo.
 
 cmake_minimum_required(VERSION 3.21)
 project(displayxr-demo-gaussiansplat LANGUAGES C CXX)
