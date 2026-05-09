@@ -12,7 +12,7 @@ This is a **standalone repo**. It evolves independently — there is no source-m
 
 Requires the **DisplayXR runtime v1.1.0 or newer** for `XR_EXT_display_info` v12 fields (rendering-mode tile layout + rendering-mode-changed events).
 
-Install via `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). Latest tag at the time of writing is `v1.2.4` (2026-05-07). The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is **optional** — only needed for the spatial workspace shell, which this demo does not use.
+Install via `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). Latest tag at the time of writing is `v1.3.0` (2026-05-09). The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is **optional** — only needed for the spatial workspace shell, which this demo does not use.
 
 Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON` env var needed). On the dev machine, the installed runtime DLL lives at `C:\Program Files\DisplayXR\Runtime\DisplayXRClient.dll`.
 
@@ -62,7 +62,7 @@ The runtime's VK native compositor handles the rest (atlas → display processor
 
 ## Transparency support
 
-The runtime's PR #215 (merged 2026-05-09 to displayxr-runtime main; not yet tagged at the time of writing — will land in the next runtime release tag) adds Vulkan transparent-window support via a VK→D3D11 KMT-shared-texture → DComp + flip-model swapchain bridge. App-side contract:
+The DisplayXR runtime **v1.3.0** (released 2026-05-09 — `DisplayXRSetup-1.3.0.801.exe` on the [runtime releases page](https://github.com/DisplayXR/displayxr-runtime/releases/tag/v1.3.0)) adds Vulkan transparent-window support via a VK→D3D11 KMT-shared-texture → DComp + flip-model swapchain bridge. App-side contract:
 
 1. HWND created with `WS_EX_NOREDIRECTIONBITMAP` + null background brush.
 2. `XrWin32WindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE` and `chromaKeyColor = 0` (DP picks default magenta) at session create.
