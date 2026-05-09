@@ -2,7 +2,7 @@
 
 Real-time 3D Gaussian Splatting viewer for glasses-free 3D displays, built on the DisplayXR runtime via OpenXR with Vulkan. Loads `.spz` and `.ply` files, renders with asymmetric per-eye Kooima projection for the full stereo/multiview experience.
 
-> **Requires the DisplayXR runtime v1.1.0 or newer.** Install from [`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases/releases). Older runtimes lack the `XR_EXT_display_info` v12 fields (rendering-mode tile layout + rendering-mode-changed events) that this demo queries.
+> **Requires the DisplayXR runtime v1.1.0 or newer.** Download `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). Older runtimes lack the `XR_EXT_display_info` v12 fields (rendering-mode tile layout + rendering-mode-changed events) that this demo queries. The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is optional — install it on top of the runtime only if you want the spatial workspace shell.
 
 ## Download
 
@@ -37,7 +37,7 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 - CMake ≥ 3.21 + Ninja
 - [Vulkan SDK](https://www.lunarg.com/vulkan-sdk/) (includes `glslangValidator`)
 - [OpenXR loader](https://github.com/KhronosGroup/OpenXR-SDK) (find_package-visible)
-- A DisplayXR-compatible runtime (install from [displayxr-shell-releases](https://github.com/DisplayXR/displayxr-shell-releases) for the real 3D display path; the demo also runs against the null compositor with `SIM_DISPLAY_OUTPUT=anaglyph`)
+- A DisplayXR-compatible runtime (install via `DisplayXRSetup-*.exe` from [displayxr-runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases) for the real 3D display path; the demo also runs against the null compositor with `SIM_DISPLAY_OUTPUT=anaglyph`)
 
 ### macOS
 ```bash
