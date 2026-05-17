@@ -14,6 +14,8 @@ Requires the **DisplayXR runtime v1.3.0 or newer**. v1.3.0 ships the Vulkan tran
 
 Install via `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). Latest tag at the time of writing is `v1.3.0` (2026-05-09). The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is **optional** — only needed for the spatial workspace shell, which this demo does not use.
 
+**F11 fullscreen requires post-v1.3.2 runtime** (fixed in [displayxr-runtime#236](https://github.com/DisplayXR/displayxr-runtime/pull/236), merged 2026-05-17 — will ship in the next runtime release). On v1.3.2 and earlier, F11 fullscreens to the top-left corner then crashes inside the Vulkan ICD: the per-app VK native compositor's DComp transparent-window bridge had no resize path, so `comp_vk_native_target_resize` freed the aliased DComp views and then called `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` with a `VK_NULL_HANDLE` surface. The shell-launched path (out-of-process `d3d11_service` compositor) is unaffected — F11 always worked there because shell-mode bypasses the per-app VK compositor entirely. Bump this paragraph's version pin once the next runtime release ships.
+
 Apps load the runtime via the registry-resolved manifest (no `XR_RUNTIME_JSON` env var needed). On the dev machine, the installed runtime DLL lives at `C:\Program Files\DisplayXR\Runtime\DisplayXRClient.dll`.
 
 ## Repo layout
