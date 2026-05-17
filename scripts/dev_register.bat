@@ -60,11 +60,11 @@ set "EXE_FWD=%EXE_PATH:\=/%"
 (
     echo {
     echo   "schema_version": 1,
-    echo   "name": "Gaussian Splat Viewer ^(dev^)",
+    echo   "name": "Gaussian Splat Viewer (dev)",
     echo   "type": "3d",
     echo   "category": "demo",
     echo   "display_mode": "auto",
-    echo   "description": "DEV BUILD: Interactive viewer for 3D Gaussian Splatting scenes ^(.spz / .ply^). Drag-and-drop a scene or press L to load.",
+    echo   "description": "DEV BUILD: Interactive viewer for 3D Gaussian Splatting scenes (.spz / .ply). Drag-and-drop a scene or press L to load.",
     echo   "icon": "icon.png",
     echo   "icon_3d": "icon_sbs.png",
     echo   "icon_3d_layout": "sbs-lr",
