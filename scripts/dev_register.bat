@@ -1,15 +1,15 @@
 @echo off
 setlocal EnableDelayedExpansion
 REM ============================================================================
-REM dev_register.bat — Register the just-built dev binary with any DisplayXR
+REM dev_register.bat ? Register the just-built dev binary with any DisplayXR
 REM workspace controller (e.g. the DisplayXR Shell).
 REM
 REM Drops a registered-mode app manifest + icons into:
 REM     %LOCALAPPDATA%\DisplayXR\apps\
 REM
-REM Per `docs/specs/displayxr-app-manifest.md` §5, %LOCALAPPDATA% wins
+REM Per `docs/specs/displayxr-app-manifest.md` ?5, %LOCALAPPDATA% wins
 REM precedence over %ProgramData%, so this dev manifest overrides whatever
-REM the production installer dropped (if any) — no admin needed, no
+REM the production installer dropped (if any) ? no admin needed, no
 REM uninstall of the production demo, and no edit of the system-wide
 REM ProgramData manifest. Workspace controllers re-scan on activate, so
 REM restart the shell (or toggle the workspace) and the new tile points at
@@ -49,7 +49,7 @@ if not exist "%EXE_PATH%" (
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
 REM Copy icons next to the manifest (icon paths in the manifest are
-REM resolved relative to the manifest file per spec §2.3).
+REM resolved relative to the manifest file per spec ?2.3).
 if exist "%ICON_PNG%" copy /y "%ICON_PNG%" "%TARGET_DIR%\icon.png" >nul
 if exist "%ICON_SBS%" copy /y "%ICON_SBS%" "%TARGET_DIR%\icon_sbs.png" >nul
 
