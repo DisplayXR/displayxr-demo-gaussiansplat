@@ -326,11 +326,9 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             g_inputState.leftButton = false;
             g_inputState.dragging = false;
-            if (g_inputState.renderingModeCount > 0) {
-                g_inputState.currentRenderingMode =
-                    (g_inputState.currentRenderingMode + 1) % g_inputState.renderingModeCount;
-            }
-            g_inputState.renderingModeChangeRequested = true;
+            // Mode button = cycle request (V-key equivalent). Main loop
+            // reads runtime's current mode and computes the target.
+            g_inputState.cycleRenderingModeRequested = true;
             return 0;
         }
         SetCapture(hwnd);
@@ -555,6 +553,8 @@ static void RenderThreadFunc(
         bool resetRequested = false;
         bool animateToggle = false;
         bool loadReq = false;
+        bool cycleModeRequested = false;
+        int32_t absoluteModeRequest = -1;
         uint32_t windowW, windowH;
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -577,7 +577,10 @@ static void RenderThreadFunc(
             g_inputState.resetViewRequested = false;
             g_inputState.teleportRequested = false;
             g_inputState.fullscreenToggleRequested = false;
-            g_inputState.renderingModeChangeRequested = false;
+            cycleModeRequested = g_inputState.cycleRenderingModeRequested;
+            g_inputState.cycleRenderingModeRequested = false;
+            absoluteModeRequest = g_inputState.absoluteRenderingModeRequested;
+            g_inputState.absoluteRenderingModeRequested = -1;
             g_inputState.eyeTrackingModeToggleRequested = false;
             if (g_inputState.transparentBgToggleRequested) {
                 g_inputState.transparentBgToggleRequested = false;
@@ -627,11 +630,17 @@ static void RenderThreadFunc(
             }
         }
 
-        // Handle rendering mode change (V=cycle, 0-8=direct)
-        if (inputSnapshot.renderingModeChangeRequested) {
-            if (xr->pfnRequestDisplayRenderingModeEXT && xr->session != XR_NULL_HANDLE) {
-                xr->pfnRequestDisplayRenderingModeEXT(xr->session, inputSnapshot.currentRenderingMode);
-            }
+        // Rendering mode requests (V/mode-button=cycle, 0-8=absolute). Single
+        // source of truth: runtime owns current mode via xr->currentModeIndex.
+        if (cycleModeRequested && xr->pfnRequestDisplayRenderingModeEXT &&
+            xr->session != XR_NULL_HANDLE && xr->renderingModeCount > 0) {
+            uint32_t next = (xr->currentModeIndex + 1) % xr->renderingModeCount;
+            xr->pfnRequestDisplayRenderingModeEXT(xr->session, next);
+        }
+        if (absoluteModeRequest >= 0 && xr->pfnRequestDisplayRenderingModeEXT &&
+            xr->session != XR_NULL_HANDLE &&
+            (uint32_t)absoluteModeRequest < xr->renderingModeCount) {
+            xr->pfnRequestDisplayRenderingModeEXT(xr->session, (uint32_t)absoluteModeRequest);
         }
 
         // Handle eye tracking mode toggle (T key)
@@ -712,14 +721,14 @@ static void RenderThreadFunc(
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
 
-                        bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode]);
+                        bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
 
                         // View count for the active rendering mode (1=mono, 2=stereo, 4=quad).
                         // Sized off the runtime's per-mode advertisement so the eye-loop and
                         // per-view buffers (rawEyes / stereoViews / viewMat / projectionViews)
                         // all line up with what xrEndFrame expects.
                         uint32_t activeViewCount = (xr->renderingModeCount > 0)
-                            ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2u;
+                            ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2u;
                         if (activeViewCount == 0) activeViewCount = 1u;
                         if (activeViewCount > 8) activeViewCount = 8u;
                         const int eyeCount = monoMode ? 1 : (int)activeViewCount;
@@ -734,7 +743,7 @@ static void RenderThreadFunc(
                         float scaleX, scaleY;
                         uint32_t cols, rows;
                         if (xr->renderingModeCount > 0) {
-                            uint32_t mode = inputSnapshot.currentRenderingMode;
+                            uint32_t mode = xr->currentModeIndex;
                             scaleX = xr->renderingModeScaleX[mode];
                             scaleY = xr->renderingModeScaleY[mode];
                             cols   = xr->renderingModeTileColumns[mode] ? xr->renderingModeTileColumns[mode] : 1u;
@@ -1105,7 +1114,7 @@ static void RenderThreadFunc(
                                 // render path (window × view_scale of the current mode).
                                 float dispScaleX, dispScaleY;
                                 if (xr->renderingModeCount > 0) {
-                                    uint32_t mode = inputSnapshot.currentRenderingMode;
+                                    uint32_t mode = xr->currentModeIndex;
                                     dispScaleX = xr->renderingModeScaleX[mode];
                                     dispScaleY = xr->renderingModeScaleY[mode];
                                 } else {
@@ -1121,10 +1130,10 @@ static void RenderThreadFunc(
                                 std::wstring dispText = FormatDisplayInfo(xr->displayWidthM, xr->displayHeightM,
                                     xr->nominalViewerX, xr->nominalViewerY, xr->nominalViewerZ);
                                 dispText += L"\n" + FormatScaleInfo(xr->recommendedViewScaleX, xr->recommendedViewScaleY);
-                                dispText += L"\n" + FormatMode(inputSnapshot.currentRenderingMode, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
-                                    (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeNames[inputSnapshot.currentRenderingMode] : nullptr,
+                                dispText += L"\n" + FormatMode(xr->currentModeIndex, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
+                                    (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeNames[xr->currentModeIndex] : nullptr,
                                     xr->renderingModeCount,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[inputSnapshot.currentRenderingMode] : true);
+                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
@@ -1179,9 +1188,9 @@ static void RenderThreadFunc(
                                         L"Open…"));
                                     std::wstring modeLabel = L"Mode";
                                     if (xr->renderingModeCount > 0 &&
-                                        inputSnapshot.currentRenderingMode < xr->renderingModeCount &&
-                                        xr->renderingModeNames[inputSnapshot.currentRenderingMode]) {
-                                        const char* nm = xr->renderingModeNames[inputSnapshot.currentRenderingMode];
+                                        xr->currentModeIndex < xr->renderingModeCount &&
+                                        xr->renderingModeNames[xr->currentModeIndex]) {
+                                        const char* nm = xr->renderingModeNames[xr->currentModeIndex];
                                         modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
                                     }
                                     buttons.push_back(toHudPx(
@@ -1269,7 +1278,7 @@ static void RenderThreadFunc(
                 }
 
                 // Submit frame
-                uint32_t submitViewCount = (xr->renderingModeCount > 0 && inputSnapshot.currentRenderingMode < xr->renderingModeCount) ? xr->renderingModeViewCounts[inputSnapshot.currentRenderingMode] : 2;
+                uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered && hudSubmitted) {
@@ -1591,10 +1600,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
-    // Align runtime active rendering mode with app's default (currentRenderingMode=1).
-    // Without this, app UI labels show mode 1 (Anaglyph) but the runtime stays at its
-    // own default (mode 0 Passthrough on sim_display) until the user presses V.
-    g_inputState.renderingModeChangeRequested = true;
+    // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
+    // The main loop's dispatch picks this up on the first frame and calls
+    // xrRequestDisplayRenderingModeEXT(1); the runtime event drives xr.currentModeIndex.
+    g_inputState.absoluteRenderingModeRequested = 1;
     g_inputState.hudVisible = false;     // hidden by default; toggle with Tab
     g_inputState.animateEnabled = true;  // auto-orbit always on after 10 s idle
     {
