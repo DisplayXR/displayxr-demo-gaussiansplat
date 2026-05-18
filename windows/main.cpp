@@ -1133,7 +1133,8 @@ static void RenderThreadFunc(
                                 dispText += L"\n" + FormatMode(xr->currentModeIndex, xr->pfnRequestDisplayRenderingModeEXT != nullptr,
                                     (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeNames[xr->currentModeIndex] : nullptr,
                                     xr->renderingModeCount,
-                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true);
+                                    xr->renderingModeCount > 0 ? xr->renderingModeDisplay3D[xr->currentModeIndex] : true,
+                                    xr->renderingModeCount > 0 ? xr->renderingModeIsRequestable[xr->currentModeIndex] : true);
                                 std::wstring eyeText = FormatEyeTrackingInfo(
                                     xr->eyePositions, (uint32_t)eyeCount,
                                     xr->eyeTrackingActive, xr->isEyeTracking,
@@ -1192,6 +1193,13 @@ static void RenderThreadFunc(
                                         xr->renderingModeNames[xr->currentModeIndex]) {
                                         const char* nm = xr->renderingModeNames[xr->currentModeIndex];
                                         modeLabel = L"Mode: " + std::wstring(nm, nm + strlen(nm));
+                                    }
+                                    // v13: surface workspace mode-lock so user
+                                    // knows clicking the Mode button is a no-op.
+                                    if (xr->renderingModeCount > 0 &&
+                                        xr->currentModeIndex < xr->renderingModeCount &&
+                                        !xr->renderingModeIsRequestable[xr->currentModeIndex]) {
+                                        modeLabel += L" [locked]";
                                     }
                                     buttons.push_back(toHudPx(
                                         MODE_BTN_X_FRACTION, MODE_BTN_Y_FRACTION,
