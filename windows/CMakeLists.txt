@@ -89,6 +89,14 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
 )
 
 if(MSVC)
+    # /utf-8: tell MSVC the source files are UTF-8 (and the runtime
+    # char set is UTF-8). Without this MSVC reads source literals
+    # using the system codepage (Windows-1252 on US machines) and
+    # mangles multi-byte glyphs like the "…" in "Open…" into
+    # Mojibake (e.g. "Openâ€¦") at compile time. Affects the button
+    # labels rendered by sr_common's HUD.
+    target_compile_options(gaussian_splatting_handle_vk_win PRIVATE /utf-8)
+
     file(RELATIVE_PATH _manifest_rel
         "${CMAKE_BINARY_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest")
