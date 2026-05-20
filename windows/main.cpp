@@ -787,6 +787,31 @@ static void RenderThreadFunc(
                 bool hudSubmitted = false;
                 bool loadBtnSubmitted = false;
 
+                // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
+                // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
+                // sized once at session create). When the workspace tile is
+                // resized to a different aspect, the runtime stretches the
+                // swapchain per-axis to fit the layer rect — which distorts
+                // glyphs and button shapes. Fix: pick layer-rect fractions
+                // (layerFracW × layerFracH, in HWND fractions) that match the
+                // swapchain aspect so both axes stretch by the same factor
+                // (uniform scaling, no distortion). Same pattern as the runtime
+                // test apps (test_apps/cube_handle_d3d11_win/main.cpp ~L800).
+                // Prefer layerFracH = 1.0 (full window height, keeps the info
+                // panel anchored to the window bottom); on extremely tall tiles
+                // where that would push layerFracW past 1.0, clamp width and
+                // shrink height instead.
+                const float hudAR = (hudHeight > 0)
+                    ? (float)hudWidth / (float)hudHeight : 1.0f;
+                const float windowAR = (windowW > 0 && windowH > 0)
+                    ? (float)windowW / (float)windowH : 1.0f;
+                float layerFracH = 1.0f;
+                float layerFracW = hudAR / windowAR;
+                if (layerFracW > 1.0f) {
+                    layerFracW = 1.0f;
+                    layerFracH = windowAR / hudAR;
+                }
+
                 if (frameState.shouldRender) {
                     if (LocateViews(*xr, frameState.predictedDisplayTime,
                         inputSnapshot.cameraPosX, -inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ,
@@ -1253,11 +1278,9 @@ static void RenderThreadFunc(
                                     L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
 
                                 // Top-bar buttons. Translate window-fraction click
-                                // regions into HUD-pixel coords using the HUD's
-                                // own footprint constants (the HUD covers window
-                                // fraction (0,0) → (HUD_WIDTH_FRACTION,
-                                // HUD_HEIGHT_FRACTION); inside that, pixel space
-                                // is (0,0) → (hudWidth, hudHeight)).
+                                // regions into HUD-pixel coords scaled by the
+                                // per-frame layer footprint (layerFracW/H, computed
+                                // below the HUD block).
                                 std::vector<HudButton> buttons;
                                 {
                                     // Hover tracking: compare current cursor (in HWND
@@ -1269,13 +1292,17 @@ static void RenderThreadFunc(
                                         ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
                                     const float my_frac = (g_windowHeight > 0)
                                         ? (float)inputSnapshot.mouseY / (float)g_windowHeight : 0.0f;
+                                    // HWND-fraction → HUD-pixel mapping must divide by
+                                    // the current layer footprint (layerFracW/H), not the
+                                    // legacy constants, otherwise on-screen position
+                                    // drifts as the tile aspect changes.
                                     auto toHudPx = [&](float xf, float yf, float wf, float hf, const std::wstring& label) {
                                         HudButton b;
                                         b.label = label;
-                                        b.x = (xf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
-                                        b.y = (yf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
-                                        b.width  = (wf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
-                                        b.height = (hf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        b.x = (xf / layerFracW) * (float)hudWidth;
+                                        b.y = (yf / layerFracH) * (float)hudHeight;
+                                        b.width  = (wf / layerFracW) * (float)hudWidth;
+                                        b.height = (hf / layerFracH) * (float)hudHeight;
                                         b.hovered = (mx_frac >= xf && mx_frac <= xf + wf &&
                                                      my_frac >= yf && my_frac <= yf + hf);
                                         return b;
@@ -1387,12 +1414,15 @@ static void RenderThreadFunc(
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
                 if (rendered && hudSubmitted) {
-                    // Layer spans the full HUD footprint (full window height
-                    // by HUD_WIDTH_FRACTION). Empty regions (alpha=0) are
-                    // invisible thanks to the alpha-blended composite path
-                    // in the vk_native compositor.
+                    // Layer footprint sized per-frame to match the HUD
+                    // swapchain's aspect (computed above as layerFracW ×
+                    // layerFracH), so the runtime's swapchain→layer rect
+                    // mapping is uniform across both axes — glyphs and
+                    // buttons keep their proportions on any tile aspect.
+                    // Empty regions stay alpha=0 (compositor honors source
+                    // alpha for window-space layers).
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, HUD_WIDTH_FRACTION, HUD_HEIGHT_FRACTION, 0.0f, submitViewCount);
+                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
                 } else {
