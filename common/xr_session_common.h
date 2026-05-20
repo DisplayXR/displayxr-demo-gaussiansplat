@@ -27,6 +27,7 @@
 #include <openxr/openxr_platform.h>
 #include <openxr/XR_EXT_win32_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
+#include <openxr/XR_EXT_workspace_file_dialog.h>
 #include <DirectXMath.h>
 #include <vector>
 #include <string>
@@ -81,6 +82,20 @@ struct XrSessionManager {
     // Extension support (used by ext app, ignored by non-ext app)
     bool hasWin32WindowBindingExt = false;
     bool hasDisplayInfoExt = false;
+    // XR_EXT_workspace_file_dialog (#228 Tier 1 spatial file picker). When
+    // the runtime + active workspace controller advertise this, we route
+    // the demo's "Load .ply/.spz" button through xrRequestFilePickerEXT
+    // and let a spatial picker UI appear in the workspace. Falls back to
+    // GetOpenFileNameA otherwise (workspace mode without a Tier 1 picker,
+    // or any non-DisplayXR runtime). See PollEvents for the completion
+    // path that fills filePickerLast* below.
+    bool hasFileDialogExt = false;
+    PFN_xrRequestFilePickerEXT pfnRequestFilePickerEXT = nullptr;
+    bool filePickerInFlight = false;             //!< Set when xrRequestFilePickerEXT returned SUCCESS; cleared on event arrival.
+    bool filePickerHasResult = false;            //!< Set by PollEvents when the completion event arrives; consumed + cleared by the main loop.
+    XrAsyncRequestIdEXT filePickerRequestId = 0;
+    XrFilePickerResultEXT filePickerLastResult = (XrFilePickerResultEXT)0;
+    char filePickerLastPath[XR_MAX_FILE_PICKER_PATH_LENGTH_EXT] = {};
 
     // Display info from XR_EXT_display_info (static display properties)
     float recommendedViewScaleX = 1.0f;

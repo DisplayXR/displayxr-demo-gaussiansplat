@@ -336,6 +336,27 @@ bool PollEvents(XrSessionManager& xr) {
             xr.currentModeIndex = modeEvent->currentModeIndex;
             break;
         }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_EXT: {
+            // #228 Tier 1: spatial file picker delivered a result. Store on
+            // the session manager; the main loop consumes filePickerHasResult
+            // and routes the path through the same g_pendingLoadPath queue
+            // the Win32 GetOpenFileNameA path uses.
+            auto* pe = (XrEventDataFilePickerCompleteEXT*)&event;
+            if (pe->requestId == xr.filePickerRequestId) {
+                xr.filePickerLastResult = pe->result;
+                strncpy(xr.filePickerLastPath, pe->path, sizeof(xr.filePickerLastPath) - 1);
+                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
+                xr.filePickerInFlight = false;
+                xr.filePickerHasResult = true;
+                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
+                    (unsigned long long)pe->requestId, (int)pe->result, pe->path);
+            } else {
+                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
+                    (unsigned long long)pe->requestId,
+                    (unsigned long long)xr.filePickerRequestId);
+            }
+            break;
+        }
         default:
             LOG_DEBUG("Received event type: %d", event.type);
             break;

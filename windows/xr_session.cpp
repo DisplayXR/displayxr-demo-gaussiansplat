@@ -50,11 +50,15 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) {
             xr.hasDisplayInfoExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
+            xr.hasFileDialogExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -68,6 +72,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasDisplayInfoExt) {
         enabledExtensions.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
+    }
+    if (xr.hasFileDialogExt) {
+        enabledExtensions.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -140,6 +147,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnRequestDisplayRenderingModeEXT);
         xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
+    }
+
+    // #228 Tier 1 spatial file picker — resolve the app-side entrypoint
+    // when the extension is enabled. Resolution failure is non-fatal: we
+    // just fall through to the Win32 GetOpenFileNameA path at call time.
+    if (xr.hasFileDialogExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrRequestFilePickerEXT",
+            (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
+        LOG_INFO("xrRequestFilePickerEXT: %s",
+            xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;

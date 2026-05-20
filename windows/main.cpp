@@ -268,8 +268,73 @@ static void TryAutoLoadBundledScene() {
     }
 }
 
-// Open a file dialog and load a .ply or .spz scene (called from main thread)
+// Hand a picked path off to the render thread for scene load. Validates the
+// extension first; on failure pops a MessageBox and returns false. Used by
+// both the Win32 GetOpenFileNameA path and the #228 spatial picker result
+// drained in the main loop.
+static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
+    if (!ValidateSceneFile(path)) {
+        MessageBoxA(hwnd, "Invalid scene file. Supported formats: .ply, .spz", "Load Error", MB_OK | MB_ICONERROR);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
+        g_pendingLoadPath = path;
+    }
+    g_loadRequested.store(true, std::memory_order_release);
+    LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
+    return true;
+}
+
+// Open a file dialog and load a .ply or .spz scene (called from main thread).
+//
+// Path A — workspace + Tier 1 picker available:
+//     xrRequestFilePickerEXT fires async. The completion event is drained
+//     by PollEvents (common/xr_session_common.cpp) into xr.filePickerLast*;
+//     the main loop dispatches to QueueSceneLoad on result arrival.
+//
+// Path B — workspace mode but no controller / no Tier 1 picker, OR running
+// outside a workspace (standalone window), OR running on a non-DisplayXR
+// OpenXR runtime: xrRequestFilePickerEXT either returns
+// XR_FILE_PICKER_FALLBACK_TIER0_EXT (workspace fallback) or the PFN is
+// null (extension absent). Either way fall through to GetOpenFileNameA
+// and keep the existing standalone UX.
 static void OpenLoadDialog(HWND hwnd) {
+    // Path A: spatial picker, when available + not already in flight.
+    if (g_xr != nullptr && g_xr->pfnRequestFilePickerEXT != nullptr &&
+        !g_xr->filePickerInFlight) {
+        XrFilePickerInfoEXT info = {XR_TYPE_FILE_PICKER_INFO_EXT};
+        info.mode = XR_FILE_PICKER_MODE_OPEN_EXT;
+        strncpy(info.title, "Load Gaussian Splatting Scene",
+                sizeof(info.title) - 1);
+        info.filterCount = 3;
+        strncpy(info.filters[0].description, "3DGS Files",
+                sizeof(info.filters[0].description) - 1);
+        strncpy(info.filters[0].extensions, "*.ply;*.spz",
+                sizeof(info.filters[0].extensions) - 1);
+        strncpy(info.filters[1].description, "PLY Files",
+                sizeof(info.filters[1].description) - 1);
+        strncpy(info.filters[1].extensions, "*.ply",
+                sizeof(info.filters[1].extensions) - 1);
+        strncpy(info.filters[2].description, "SPZ Files",
+                sizeof(info.filters[2].description) - 1);
+        strncpy(info.filters[2].extensions, "*.spz",
+                sizeof(info.filters[2].extensions) - 1);
+
+        XrAsyncRequestIdEXT rid = 0;
+        XrResult r = g_xr->pfnRequestFilePickerEXT(g_xr->session, &info, &rid);
+        if (r == XR_SUCCESS) {
+            g_xr->filePickerInFlight = true;
+            g_xr->filePickerRequestId = rid;
+            LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x requestId=%llu",
+                r, (unsigned long long)rid);
+            return; // wait for completion event in the main loop
+        }
+        // r == XR_FILE_PICKER_FALLBACK_TIER0_EXT or an error → fall through.
+        LOG_INFO("[#228] xrRequestFilePickerEXT -> rc=0x%x (falling back to Win32)", r);
+    }
+
+    // Path B: existing Win32 file dialog (unchanged behavior).
     OPENFILENAMEA ofn = {};
     char filePath[MAX_PATH] = {};
     ofn.lStructSize = sizeof(ofn);
@@ -281,20 +346,7 @@ static void OpenLoadDialog(HWND hwnd) {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
 
     if (GetOpenFileNameA(&ofn)) {
-        std::string path(filePath);
-        if (ValidateSceneFile(path)) {
-            // Hand the path off to the render thread (see g_pendingLoadPath
-            // comment above). Doing the load here would race the render
-            // thread's per-frame queue submissions and crash NVIDIA drivers.
-            {
-                std::lock_guard<std::mutex> lock(g_pendingLoadPathMutex);
-                g_pendingLoadPath = path;
-            }
-            g_loadRequested.store(true, std::memory_order_release);
-            LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
-        } else {
-            MessageBoxA(hwnd, "Invalid scene file. Supported formats: .ply, .spz", "Load Error", MB_OK | MB_ICONERROR);
-        }
+        QueueSceneLoad(hwnd, std::string(filePath));
     }
 }
 
@@ -690,6 +742,28 @@ static void RenderThreadFunc(
         }
 
         PollEvents(*xr);
+
+        // #228 Tier 1: drain a spatial-picker result if one arrived this
+        // tick. PollEvents wrote the path + result code onto the session
+        // manager; we route it through the same QueueSceneLoad path the
+        // Win32 GetOpenFileNameA branch uses. The render thread picks the
+        // queued path up via g_pendingLoadPath.
+        if (xr->filePickerHasResult) {
+            xr->filePickerHasResult = false;
+            if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_SUCCESS_EXT &&
+                xr->filePickerLastPath[0] != '\0') {
+                QueueSceneLoad(hwnd, std::string(xr->filePickerLastPath));
+            } else if (xr->filePickerLastResult == XR_FILE_PICKER_RESULT_CANCELLED_EXT) {
+                LOG_INFO("[#228] User cancelled spatial picker — no scene load");
+            } else {
+                // PICKER_FAILED / INVALID_PATH — log and silently drop.
+                // Don't auto-fall-back to Win32: the user already cancelled
+                // out of the spatial flow, surfacing another dialog would
+                // feel like a bug. They can click Load again if needed.
+                LOG_WARN("[#228] Spatial picker delivered result=%d (no load)",
+                    (int)xr->filePickerLastResult);
+            }
+        }
 
         if (xr->sessionRunning) {
             XrFrameState frameState;
