@@ -308,6 +308,15 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
 // null (extension absent). Either way fall through to GetOpenFileNameA
 // and keep the existing standalone UX.
 static void OpenLoadDialog(HWND hwnd) {
+    // Already showing a spatial picker — second click on Open is a
+    // no-op. Without this guard the prior "filePickerInFlight" check
+    // would skip Path A and fall through to GetOpenFileNameA, opening
+    // BOTH the spatial picker AND a flat Win32 dialog stacked on top.
+    if (g_xr != nullptr && g_xr->filePickerInFlight) {
+        LOG_INFO("[#228] OpenLoadDialog: spatial picker already in flight, ignoring");
+        return;
+    }
+
     // Path A: spatial picker, when available + not already in flight.
     if (g_xr != nullptr && g_xr->pfnRequestFilePickerEXT != nullptr &&
         !g_xr->filePickerInFlight) {
@@ -1256,6 +1265,15 @@ static void RenderThreadFunc(
                                 // is (0,0) → (hudWidth, hudHeight)).
                                 std::vector<HudButton> buttons;
                                 {
+                                    // Hover tracking: compare current cursor (in HWND
+                                    // pixel space, captured by WM_MOUSEMOVE into
+                                    // inputSnapshot.mouseX/Y) against the button's
+                                    // HWND-fraction rect. Hovered buttons get a
+                                    // visual highlight in the HUD renderer.
+                                    const float mx_frac = (g_windowWidth > 0)
+                                        ? (float)inputSnapshot.mouseX / (float)g_windowWidth : 0.0f;
+                                    const float my_frac = (g_windowHeight > 0)
+                                        ? (float)inputSnapshot.mouseY / (float)g_windowHeight : 0.0f;
                                     auto toHudPx = [&](float xf, float yf, float wf, float hf, const std::wstring& label) {
                                         HudButton b;
                                         b.label = label;
@@ -1263,6 +1281,8 @@ static void RenderThreadFunc(
                                         b.y = (yf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
                                         b.width  = (wf / HUD_WIDTH_FRACTION)  * (float)hudWidth;
                                         b.height = (hf / HUD_HEIGHT_FRACTION) * (float)hudHeight;
+                                        b.hovered = (mx_frac >= xf && mx_frac <= xf + wf &&
+                                                     my_frac >= yf && my_frac <= yf + hf);
                                         return b;
                                     };
                                     buttons.push_back(toHudPx(
