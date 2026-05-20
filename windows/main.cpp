@@ -62,13 +62,21 @@ static const float HUD_FONT_BASE_FRACTION = 0.50f;
 // (left strip of the window, fracW × fracH = HUD_WIDTH_FRACTION × HUD_HEIGHT_FRACTION).
 // All values are absolute window-fractions for hit-testing; they're
 // translated into HUD-pixel coordinates when passed to RenderHudAndMap.
-static const float OPEN_BTN_X_FRACTION = 0.010f;
-static const float OPEN_BTN_Y_FRACTION = 0.010f;
+/* Button positions in HWND fractions. Inset from the corner is large
+ * enough to clear the runtime's 20-pixel content-click inset around
+ * each workspace tile (used for edge-drag/resize). At fraction 0.010
+ * with a typical small workspace tile (≈500 compositor px wide), the
+ * button rendered inside ≈5 compositor px — inside the 20px inset, so
+ * clicks were eaten by the resize zone instead of being forwarded to
+ * this app. 0.045 / 0.060 stays past the inset on any sane tile size
+ * while keeping the button visually anchored to the top-left. */
+static const float OPEN_BTN_X_FRACTION = 0.045f;
+static const float OPEN_BTN_Y_FRACTION = 0.060f;
 static const float OPEN_BTN_WIDTH_FRACTION  = 0.060f;
 static const float OPEN_BTN_HEIGHT_FRACTION = 0.030f;
 
-static const float MODE_BTN_X_FRACTION = 0.075f;
-static const float MODE_BTN_Y_FRACTION = 0.010f;
+static const float MODE_BTN_X_FRACTION = 0.110f;
+static const float MODE_BTN_Y_FRACTION = 0.060f;
 static const float MODE_BTN_WIDTH_FRACTION  = 0.140f;
 static const float MODE_BTN_HEIGHT_FRACTION = 0.030f;
 
