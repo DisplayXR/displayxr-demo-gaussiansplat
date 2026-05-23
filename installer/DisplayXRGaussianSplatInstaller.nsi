@@ -214,10 +214,22 @@ Section "Uninstall"
     nsExec::ExecToLog 'taskkill /f /im gaussian_splatting_handle_vk_win.exe'
     Pop $0
 
+    ; The DisplayXR Shell periodically scans %ProgramData%\DisplayXR\apps\
+    ; and may hold an open handle to gaussian_splatting.displayxr.json, which
+    ; makes the Delete below silently fail (issue #10). Kill it first; the
+    ; user re-invokes the shell to get it back. Sleep 500 gives Windows a
+    ; moment to release the handle.
+    DetailPrint "Stopping DisplayXR Shell to release manifest handles..."
+    nsExec::ExecToLog 'taskkill /f /im displayxr-shell.exe'
+    Pop $0
+    Sleep 500
+
     ; Remove the registered-mode manifest + icons.
-    Delete "$APPDATA\DisplayXR\apps\gaussian_splatting.displayxr.json"
-    Delete "$APPDATA\DisplayXR\apps\icon.png"
-    Delete "$APPDATA\DisplayXR\apps\icon_sbs.png"
+    ; /REBOOTOK schedules deletion on next reboot if the file is still locked
+    ; at uninstall time (belt-and-suspenders on top of the taskkill above).
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\gaussian_splatting.displayxr.json"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\icon.png"
+    Delete /REBOOTOK "$APPDATA\DisplayXR\apps\icon_sbs.png"
     RMDir "$APPDATA\DisplayXR\apps"
 
     ; Remove install dir contents.
