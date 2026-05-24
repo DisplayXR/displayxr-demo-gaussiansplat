@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<installer-gui-script minSpecVersion="2">
+    <title>Gaussian Splat Viewer</title>
+    <organization>com.displayxr</organization>
+    <os-version min="13.0" />
+    <license file="LICENSE" />
+    <welcome file="welcome.html" />
+    <choices-outline>
+        <line choice="demo" />
+    </choices-outline>
+    <choice id="demo" visible="true" start_selected="true" enabled="false"
+        title="Gaussian Splat Viewer"
+        description="DisplayXR demo: real-time 3D Gaussian Splatting viewer for glasses-free 3D displays. Loads .spz / .ply scenes and renders with asymmetric per-eye Kooima projection. Requires the DisplayXR runtime to be installed.">
+        <pkg-ref id="com.displayxr.gaussiansplat" />
+    </choice>
+    <pkg-ref id="com.displayxr.gaussiansplat" version="1.0" onConclusion="none">gaussiansplat.pkg</pkg-ref>
+</installer-gui-script>
