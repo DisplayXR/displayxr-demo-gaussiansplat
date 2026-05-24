@@ -97,8 +97,10 @@ Function .onInit
         Abort
     ${EndIf}
 
-    ; Older runtimes don't bundle SimulatedRealityVulkanBeta.dll on PATH,
-    ; so the demo would crash at session create. Enforce a minimum.
+    ; Enforce the minimum runtime version for the Vulkan transparent-window
+    ; bridge (PR #215) this demo relies on. The Leia SR Vulkan weaver DLL is
+    ; the Leia plug-in's concern (it ships + loads SimulatedRealityVulkanBeta.dll
+    ; itself) — the demo neither bundles nor depends on it being on PATH.
     ${VersionCompare} "$1" "${MIN_RUNTIME_VERSION}" $2
     ${If} $2 == 2
         MessageBox MB_ICONSTOP "DisplayXR runtime $1 is too old.$\r$\n$\r$\nThis demo requires runtime ${MIN_RUNTIME_VERSION} or later.$\r$\n$\r$\nUpdate from:$\r$\nhttps://github.com/DisplayXR/displayxr-runtime/releases"

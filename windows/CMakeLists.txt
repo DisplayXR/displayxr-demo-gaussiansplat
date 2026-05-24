@@ -118,16 +118,11 @@ if(TARGET OpenXR::openxr_loader)
     endif()
 endif()
 
-# Copy SimulatedRealityVulkanBeta.dll from ../common if present (vendored by
-# the publish step from the original test_apps/common/).
-set(VK_WEAVER_DLL "${CMAKE_SOURCE_DIR}/common/SimulatedRealityVulkanBeta.dll")
-if(EXISTS "${VK_WEAVER_DLL}")
-    add_custom_command(TARGET gaussian_splatting_handle_vk_win POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${VK_WEAVER_DLL}"
-            "$<TARGET_FILE_DIR:gaussian_splatting_handle_vk_win>/SimulatedRealityVulkanBeta.dll"
-    )
-endif()
+# SimulatedRealityVulkanBeta.dll (the Leia SR Vulkan weaver) is intentionally
+# NOT bundled here. It is a Leia SDK binary shipped by the Leia plug-in
+# installer next to DisplayXR-LeiaSR.dll, which loads it from its own directory
+# (displayxr-leia-plugin, leia_dp_factory_vk). Vendor binaries must not appear
+# in vendor-neutral DisplayXR demos.
 
 # Copy bundled default scene next to the exe.
 set(BUNDLED_SCENE "${CMAKE_CURRENT_SOURCE_DIR}/assets/butterfly.spz")
