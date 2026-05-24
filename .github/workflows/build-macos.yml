@@ -40,8 +40,11 @@ jobs:
         # No `openxr-loader` formula exists in Homebrew core. The build
         # script clones KhronosGroup/OpenXR-SDK-Source and installs the
         # loader under /tmp/openxr-install (mirroring the runtime repo).
+        # `glslang` provides glslangValidator, required by 3dgs_common's
+        # shader compile step (otherwise CMake configure fails with
+        # "glslangValidator required").
         run: |
-          brew install cmake ninja vulkan-headers vulkan-loader molten-vk
+          brew install cmake ninja glslang vulkan-headers vulkan-loader molten-vk
           BREW_PREFIX=$(brew --prefix)
           echo "VULKAN_SDK=$BREW_PREFIX" >> "$GITHUB_ENV"
 
