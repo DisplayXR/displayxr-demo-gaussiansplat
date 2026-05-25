@@ -4,7 +4,7 @@ set "REPO=%~dp0.."
 set "BIN_DIR=%REPO%\build\windows"
 set "OUT_DIR=%~dp0"
 if "%OUT_DIR:~-1%"=="\" set "OUT_DIR=%OUT_DIR:~0,-1%"
-if "%VERSION%"=="" set "VERSION=1.4.0"
+if "%VERSION%"=="" set "VERSION=1.4.1"
 REM Derive MAJOR/MINOR/PATCH from VERSION (e.g. 1.4.2 -> 1 / 4 / 2) so callers
 REM (CI on a v* tag) only need to set VERSION, not all four vars.
 for /f "tokens=1,2,3 delims=." %%a in ("%VERSION%") do (
