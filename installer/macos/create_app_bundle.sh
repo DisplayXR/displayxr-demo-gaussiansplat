@@ -56,6 +56,8 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
     <string>${BUNDLE_DISPLAY_NAME}</string>
     <key>CFBundleDisplayName</key>
     <string>${BUNDLE_DISPLAY_NAME}</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
@@ -92,6 +94,41 @@ if [ -f "$ARTIFACT_DIR/assets/butterfly.spz" ]; then
 fi
 if [ -d "$ARTIFACT_DIR/displayxr" ]; then
     cp -R "$ARTIFACT_DIR/displayxr/." "$APP_BUNDLE/Contents/Resources/displayxr/"
+fi
+
+# --- App icon (Contents/Resources/AppIcon.icns) ---
+# Reuse the same 512x512 DisplayXR icon the shell manifest uses
+# (displayxr/icon.png) so the app shows a real icon in Finder / Spotlight /
+# Dock instead of the generic placeholder. Built with stock sips + iconutil.
+# Non-fatal: a missing source or a tool hiccup warns and falls back to the
+# generic icon rather than aborting the whole bundle build.
+make_app_icns() {
+    local src="$1" out="$2" iconset spec px nm
+    iconset="$(mktemp -d)/AppIcon.iconset"
+    mkdir -p "$iconset" || return 1
+    # Source is 512x512 → emit sizes up to 512 (256@2x). 512@2x (1024) is
+    # omitted rather than upscaled, to avoid a blurry largest slot.
+    for spec in 16:16x16 32:16x16@2x 32:32x32 64:32x32@2x 128:128x128 \
+                256:128x128@2x 256:256x256 512:256x256@2x 512:512x512; do
+        px="${spec%%:*}"; nm="${spec##*:}"
+        if ! sips -z "$px" "$px" "$src" --out "$iconset/icon_$nm.png" >/dev/null 2>&1; then
+            rm -rf "$(dirname "$iconset")"; return 1
+        fi
+    done
+    local rc=0
+    iconutil -c icns "$iconset" -o "$out" || rc=1
+    rm -rf "$(dirname "$iconset")"
+    return $rc
+}
+ICON_SRC="$ARTIFACT_DIR/displayxr/icon.png"
+if [ -f "$ICON_SRC" ]; then
+    if make_app_icns "$ICON_SRC" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"; then
+        echo "App icon set from $ICON_SRC"
+    else
+        echo "WARN: app icon generation failed — bundle will use the generic icon." >&2
+    fi
+else
+    echo "WARN: app icon source not found at $ICON_SRC — bundle will use the generic icon." >&2
 fi
 
 # --- Resources/lib: bundled support dylibs ---
