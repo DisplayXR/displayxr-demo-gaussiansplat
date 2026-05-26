@@ -91,11 +91,23 @@ jobs:
           # installer's File "${BIN_DIR}\openxr_loader.dll" can't silently miss
           # (the runtime's copy is not on an app's DLL search path). Source is
           # the Khronos loader we downloaded into openxr_sdk.
-          $dll = Get-ChildItem -Path openxr_sdk -Recurse -Filter openxr_loader.dll | Select-Object -First 1
-          if (-not $dll) { Write-Host "::error::openxr_loader.dll not found under openxr_sdk"; exit 1 }
+          #
+          # The Khronos zip ships THREE loaders — x64, Win32 (x86), AND arm64.
+          # Select x64 explicitly: a naive recursive first-match can grab the
+          # arm64 build (it sorts first), which the x64 demo exe then fails to
+          # load with a "bad image" error at startup (DisplayXR/displayxr-demo-
+          # gaussiansplat shipped this in v1.4.2 — exit 0xC000007B on launch).
+          $dll = Get-ChildItem -Path openxr_sdk -Recurse -Filter openxr_loader.dll |
+                 Where-Object { $_.FullName -match '[\\/]x64[\\/]' } | Select-Object -First 1
+          if (-not $dll) { Write-Host "::error::x64 openxr_loader.dll not found under openxr_sdk"; exit 1 }
+          # Defense in depth: verify the PE machine is actually x64 (0x8664).
+          $bytes = [System.IO.File]::ReadAllBytes($dll.FullName)
+          $peOff = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOff + 4)
+          if ($machine -ne 0x8664) { Write-Host ("::error::staged openxr_loader.dll is not x64 (PE machine=0x{0:X})" -f $machine); exit 1 }
           New-Item -ItemType Directory -Force build\windows | Out-Null
           Copy-Item $dll.FullName build\windows\openxr_loader.dll -Force
-          Write-Host "Staged $($dll.FullName) -> build\windows\openxr_loader.dll"
+          Write-Host "Staged x64 $($dll.FullName) -> build\windows\openxr_loader.dll"
 
       - name: Build installer
         shell: cmd
