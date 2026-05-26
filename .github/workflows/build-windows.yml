@@ -83,6 +83,20 @@ jobs:
             -DOpenXR_ROOT="${{ github.workspace }}/openxr_sdk"
           cmake --build build
 
+      - name: Stage OpenXR loader next to demo binary
+        shell: pwsh
+        run: |
+          # An OpenXR app must ship its own openxr_loader.dll next to the exe.
+          # CMake POST_BUILD already attempts this, but guarantee it here so the
+          # installer's File "${BIN_DIR}\openxr_loader.dll" can't silently miss
+          # (the runtime's copy is not on an app's DLL search path). Source is
+          # the Khronos loader we downloaded into openxr_sdk.
+          $dll = Get-ChildItem -Path openxr_sdk -Recurse -Filter openxr_loader.dll | Select-Object -First 1
+          if (-not $dll) { Write-Host "::error::openxr_loader.dll not found under openxr_sdk"; exit 1 }
+          New-Item -ItemType Directory -Force build\windows | Out-Null
+          Copy-Item $dll.FullName build\windows\openxr_loader.dll -Force
+          Write-Host "Staged $($dll.FullName) -> build\windows\openxr_loader.dll"
+
       - name: Build installer
         shell: cmd
         env:
@@ -105,6 +119,14 @@ jobs:
             exit 1
           }
           Write-Host "PASS: installer contains no SimulatedReality* binary."
+          # The demo must ship the OpenXR loader next to its exe (apps carry
+          # their own; the runtime's copy is not on an app's DLL search path).
+          # Mirrors the macOS bundle's libopenxr_loader assertion.
+          if ($listing -notmatch 'openxr_loader\.dll') {
+            Write-Host "::error::installer is missing openxr_loader.dll — OpenXR apps must bundle the loader."
+            exit 1
+          }
+          Write-Host "PASS: installer bundles openxr_loader.dll."
 
       - name: Upload installer
         uses: actions/upload-artifact@v4
