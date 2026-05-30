@@ -88,13 +88,22 @@ The CMakeLists has historically broken on dev paths with spaces (e.g. `C:\Users\
 
 ## Releasing
 
-Each demo cuts its own release tag (`vX.Y.Z`) on its own cadence. Manual flow:
-1. Bump `installer/build-installer.bat` version (or equivalent).
-2. Tag `vX.Y.Z` and push.
-3. Run `installer\build-installer.bat` (or wait for CI if configured).
-4. `gh release create` with the installer asset attached.
+Each demo cuts its own release tag (`vX.Y.Z`) on its own cadence. The
+preferred path is the user-level `/dxr-release` skill — it detects
+this repo, tags HEAD, watches CI, and reports the dispatched bump +
+installer mirror outcome. Manual fallback: `git tag -a vX.Y.Z -m ... && git push origin vX.Y.Z`.
 
-There is **no automated runtime-side trigger** — the demo's release cadence is independent of the runtime's.
+**Automatic versions.json bump on tag push.** As of 2026-05, this
+repo's `build-windows.yml` ends with a `DispatchVersionsBump` job
+that fires a `repository_dispatch` at
+`displayxr-runtime/versions-bump.yml` with `field: "gauss_demo"`.
+The runtime side updates `versions.json[gauss_demo]` AND mirrors the
+file to `displayxr-installer/main`, so the dev orchestrator and the
+meta-installer bundle both pick up the new pin within ~30 s of
+build completion — no manual PR to either repo.
+
+Full spec:
+[`displayxr-runtime/docs/specs/runtime/versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md).
 
 ## Testing
 
