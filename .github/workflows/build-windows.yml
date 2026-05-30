@@ -161,7 +161,7 @@ jobs:
           prerelease: false
 
   # On v* tag push, after BuildInstaller succeeds, tell
-  # displayxr-runtime to bump versions.json[demos.gaussiansplat] to
+  # displayxr-runtime to bump versions.json[gauss_demo] to
   # this tag. Only the Windows workflow dispatches — the macOS
   # workflow racing on the same tag would just no-op against the
   # idempotent handler, but a single dispatch is cleaner.
@@ -190,7 +190,7 @@ jobs:
           event-type: versions-bump
           client-payload: |
             {
-              "field":       "demos.gaussiansplat",
+              "field":       "gauss_demo",
               "tag":         "${{ github.ref_name }}",
               "source_repo": "${{ github.repository }}"
             }
