@@ -159,3 +159,38 @@ jobs:
           fail_on_unmatched_files: true
           draft: false
           prerelease: false
+
+  # On v* tag push, after BuildInstaller succeeds, tell
+  # displayxr-runtime to bump versions.json[demos.gaussiansplat] to
+  # this tag. Only the Windows workflow dispatches — the macOS
+  # workflow racing on the same tag would just no-op against the
+  # idempotent handler, but a single dispatch is cleaner.
+  #
+  # Spec: DisplayXR/displayxr-runtime
+  # docs/specs/runtime/versions-json-autobump.md.
+  DispatchVersionsBump:
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && github.repository == 'DisplayXR/displayxr-demo-gaussiansplat' }}
+    needs: [BuildInstaller]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint dispatch token
+        id: dispatch-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DISPLAYXR_APP_ID }}
+          private-key: ${{ secrets.DISPLAYXR_APP_PRIVATE_KEY }}
+          owner: DisplayXR
+          repositories: displayxr-runtime
+
+      - name: Dispatch versions.json bump
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: DisplayXR/displayxr-runtime
+          event-type: versions-bump
+          client-payload: |
+            {
+              "field":       "demos.gaussiansplat",
+              "tag":         "${{ github.ref_name }}",
+              "source_repo": "${{ github.repository }}"
+            }
