@@ -69,8 +69,10 @@ typedef struct Display3DView {
  * @param screen         Physical screen dimensions
  * @param tunables       View factors (or NULL for defaults: all 1.0)
  * @param display_pose   Display pose in world space (or NULL for identity)
- * @param near_z         Near clip plane distance
- * @param far_z          Far clip plane distance
+ * @param clip_front     Pop-out clip as a fraction of the per-eye eye->display
+ *                       (ZDP) distance: near = ez * (1 - clip_front).
+ * @param clip_back      Recede clip as a fraction: far = ez * (1 + clip_back).
+ *                       clip_back = 0 => far at the ZDP (foreground only).
  * @param out_views      Output array of N views
  */
 void
@@ -80,8 +82,8 @@ display3d_compute_views(const XrVector3f *raw_eyes,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
-                               float near_z,
-                               float far_z,
+                               float clip_front,
+                               float clip_back,
                                Display3DView *out_views);
 
 /*!
@@ -164,8 +166,9 @@ display3d_apply_eye_factors_n(const XrVector3f *raw_eyes,
  * @param screen         Physical screen dimensions
  * @param tunables       View factors (perspective_factor, virtual_display_height)
  * @param display_pose   Display pose in world space (or NULL for identity)
- * @param near_z         Near clip plane distance
- * @param far_z          Far clip plane distance
+ * @param clip_front     Pop-out clip fraction: near = ez * (1 - clip_front).
+ * @param clip_back      Recede clip fraction: far = ez * (1 + clip_back);
+ *                       0 => far at the ZDP (foreground only).
  * @param out            Output view for this eye
  */
 void
@@ -173,8 +176,8 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const Display3DScreen *screen,
                        const Display3DTunables *tunables,
                        const XrPosef *display_pose,
-                       float near_z,
-                       float far_z,
+                       float clip_front,
+                       float clip_back,
                        Display3DView *out);
 
 /*!

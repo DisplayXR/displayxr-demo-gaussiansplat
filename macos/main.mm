@@ -1773,10 +1773,18 @@ int main() {
                             tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
+                            // ZDP-relative clip planes (computed per-eye from eye.z inside
+                            // display3d_compute_view): near = ez*(1-clip_front), far =
+                            // ez*(1+clip_back). Scales with the virtual display (zoom) so
+                            // large scenes don't clip. macOS has no transparent-bg mode, so
+                            // clip_back stays 2.0 (no foreground-only ZDP clamp here).
+                            const float clip_front = 0.5f;
+                            const float clip_back  = 2.0f;
+
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                0.01f, 100.0f, eyeViews.data());
+                                clip_front, clip_back, eyeViews.data());
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1834,7 +1842,7 @@ int main() {
                             cameraPoseWorld.position.y = g_input.cameraPosY;
                             Display3DView centerView;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &cameraPoseWorld, 0.01f, 100.0f, &centerView);
+                                                   &cameraPoseWorld, 0.5f, 2.0f, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
