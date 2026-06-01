@@ -1071,14 +1071,32 @@ static void RenderThreadFunc(
                             }
                         }
 
+                        // Foreground-only clip: in transparent mode, cull splats
+                        // behind the virtual display plane so only popping-out
+                        // content shows. Suppressed under the shell's external
+                        // multi-compositor (non-controller workspace session,
+                        // where the per-app transparent bridge is bypassed) —
+                        // signalled by renderingModeIsRequestable being false.
+                        bool standalone = (xr->renderingModeCount == 0) ||
+                            (xr->currentModeIndex < xr->renderingModeCount &&
+                             xr->renderingModeIsRequestable[xr->currentModeIndex]);
+                        bool foregroundClip = g_transparentBg.load() && standalone;
+
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
                         float viewMat[8][16], projMat[8][16];
+                        float clipFar[8] = {0};  // per-eye view-space far cull (0 = off)
                         for (int eye = 0; eye < eyeCount; eye++) {
                             if (useAppProjection) {
                                 int srcEye = monoMode ? 0 : eye;
                                 memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
                                 memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
+                                // eye_display.z = eye->display-plane forward distance,
+                                // same world units as the shader's p_view.z.
+                                if (foregroundClip) {
+                                    float cf = stereoViews[srcEye].eye_display.z;
+                                    clipFar[eye] = (cf > 0.2f) ? cf : 0.0f;  // never cull at/behind near
+                                }
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
                                 XMMATRIX v = monoMode ? monoViewMatrix :
@@ -1118,7 +1136,7 @@ static void RenderThreadFunc(
                                         xr->swapchain.width, xr->swapchain.height,
                                         vpX, vpY, renderW, renderH,
                                         viewMat[eye], projMat[eye],
-                                        g_transparentBg.load());
+                                        g_transparentBg.load(), clipFar[eye]);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,

@@ -23,6 +23,7 @@ layout (std140, set = 1, binding = 0) uniform Params {
     uint height;
     float tan_fovx;
     float tan_fovy;
+    float clip_far;   // view-space far cull distance; 0 = disabled
 };
 
 layout (std430, set = 1, binding = 1) writeonly buffer VertexAttributes {
@@ -128,6 +129,13 @@ void main() {
 
     vec4 p_view = view_mat * vertices[index].position;
     if (p_view.z <= 0.2f) {
+        return;
+    }
+
+    // Foreground-only clip (transparent mode): cull splats past the display
+    // plane. clip_far is the eye->plane forward distance; p_view.z is the
+    // splat's forward distance (view_mat has +Z = forward). 0 = disabled.
+    if (clip_far > 0.0f && p_view.z > clip_far) {
         return;
     }
 

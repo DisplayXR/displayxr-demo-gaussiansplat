@@ -38,8 +38,9 @@ struct alignas(16) GsUniformBuffer {
     uint32_t height;           // offset 148
     float tan_fovx;            // offset 152
     float tan_fovy;            // offset 156
+    float clip_far;            // offset 160 — view-space far cull (0 = disabled)
 };
-static_assert(sizeof(GsUniformBuffer) == 160, "GsUniformBuffer must be 160 bytes");
+static_assert(sizeof(GsUniformBuffer) == 176, "GsUniformBuffer must be 176 bytes");
 
 // ── Helper: create a compute pipeline from SPIR-V ───────────────────────
 static VkShaderModule createShaderModule(VkDevice device, const uint32_t* code, size_t sizeBytes)
@@ -810,7 +811,8 @@ uint32_t GsRenderer::gaussianCount() const { return numGaussians_; }
 // ═════════════════════════════════════════════════════════════════════════
 
 void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
-                                uint32_t vpWidth, uint32_t vpHeight)
+                                uint32_t vpWidth, uint32_t vpHeight,
+                                float clipFar)
 {
     GsUniformBuffer ub;
 
@@ -880,6 +882,9 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
     ub.tan_fovx = (std::abs(p00) > 1e-6f) ? (1.0f / std::abs(p00)) : 1.0f;
     ub.tan_fovy = (std::abs(p11) > 1e-6f) ? (1.0f / std::abs(p11)) : 1.0f;
 
+    // Foreground-only far cull (view-space forward distance). 0 = disabled.
+    ub.clip_far = clipFar;
+
     // Map and write
     void* mapped = nullptr;
     vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(GsUniformBuffer), 0, &mapped);
@@ -901,12 +906,14 @@ void GsRenderer::renderEye(VkImage swapchainImage,
                            uint32_t viewportHeight,
                            const float viewMatrix[16],
                            const float projMatrix[16],
-                           bool transparentBg)
+                           bool transparentBg,
+                           float clipFarViewSpace)
 {
     if (!hasScene()) return;
 
     // Update uniform buffer with this eye's matrices
-    updateUniforms(viewMatrix, projMatrix, viewportWidth, viewportHeight);
+    updateUniforms(viewMatrix, projMatrix, viewportWidth, viewportHeight,
+                   clipFarViewSpace);
 
     uint32_t N = numGaussians_;
     uint32_t groups256 = (N + 255) / 256;
