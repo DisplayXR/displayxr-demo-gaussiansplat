@@ -62,6 +62,10 @@ Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` und
 
 The runtime's VK native compositor handles the rest (atlas → display processor → present). The demo doesn't need to know the chroma-key / weave / DComp internals — those happen runtime-side based on the `XR_EXT_win32_window_binding` flags the demo sets at session create.
 
+## Projection / clip planes
+
+Near/far are **ZDP-relative and per-eye**, not absolute. `display3d_compute_view`/`_views` in `common/display3d_view.c` take `(clip_front, clip_back)` — fractions of each eye's perpendicular distance to the convergence plane (the virtual display / zero-disparity plane), where `eye_scaled.z` is that distance. Internally `near = ez·(1 − clip_front)` and `far = ez·(1 + clip_back)` (`display3d_compute_projection` still does the low-level Kooima matrix math from absolute near/far — unchanged). Defaults are `clip_front = 0.5`, `clip_back = 2.0`; **transparent mode passes `clip_back = 0`** so the far plane sits exactly at the ZDP (foreground-only — content behind the display is clipped to avoid see-through artifacts). This scales with zoom and keeps depth precision tight. The sibling model-viewer demo uses the identical convention. Do NOT reintroduce fixed absolute near/far (e.g. `0.01 / 100.0`) at the call sites.
+
 ## Transparency support
 
 The DisplayXR runtime since **v1.3.0** (the [v1.3.0 release](https://github.com/DisplayXR/displayxr-runtime/releases/tag/v1.3.0) added it; any current runtime supports it) provides Vulkan transparent-window support via a VK→D3D11 KMT-shared-texture → DComp + flip-model swapchain bridge. App-side contract:
@@ -92,6 +96,8 @@ Each demo cuts its own release tag (`vX.Y.Z`) on its own cadence. The
 preferred path is the user-level `/dxr-release` skill — it detects
 this repo, tags HEAD, watches CI, and reports the dispatched bump +
 installer mirror outcome. Manual fallback: `git tag -a vX.Y.Z -m ... && git push origin vX.Y.Z`.
+
+**CI runs on every PR + push to main, not just tags.** `build-windows.yml` and `build-macos.yml` trigger on `pull_request` + `push:main` (build-validation — they compile the app + installer on both platforms with a placeholder version, and publish nothing) as well as on `v*` tags (release: build + attach installers + dispatch the bump). So every PR is build-checked on both platforms before merge — keep both workflows green. The release-attach + `DispatchVersionsBump` steps stay gated on a `v*` ref.
 
 **Automatic versions.json bump on tag push.** As of 2026-05, this
 repo's `build-windows.yml` ends with a `DispatchVersionsBump` job
