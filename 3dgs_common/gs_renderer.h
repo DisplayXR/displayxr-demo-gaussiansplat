@@ -111,6 +111,8 @@ struct GsRenderer {
     // transparentBg=true makes the render shader output premultiplied alpha
     // (1 - T) so background-uncovered pixels are 0 — the runtime then strips
     // them on the chroma-key pass for desktop see-through.
+    // clipFarViewSpace>0 culls splats whose view-space forward distance exceeds
+    // it (foreground-only mode: hide content behind the display plane). 0=off.
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -121,7 +123,8 @@ struct GsRenderer {
                    uint32_t viewportHeight,
                    const float viewMatrix[16],
                    const float projMatrix[16],
-                   bool transparentBg = false);
+                   bool transparentBg = false,
+                   float clipFarViewSpace = 0.0f);
 
     // Clean up all resources.
     void cleanup();
@@ -153,7 +156,7 @@ private:
     // ── GPU Buffers (14 total) ───────────────────────────────────────────
     GsBuffer vertexBuffer_;         // N * 240 bytes
     GsBuffer cov3DBuffer_;          // N * 24 bytes
-    GsBuffer uniformBuffer_;        // 160 bytes (host-visible)
+    GsBuffer uniformBuffer_;        // 176 bytes (host-visible)
     GsBuffer vertexAttrBuffer_;     // N * 64 bytes
     GsBuffer tileOverlapBuffer_;    // N * 4 bytes
     GsBuffer prefixSumPingBuffer_;  // N * 4 bytes
@@ -234,6 +237,7 @@ private:
     void growSortBuffers(uint32_t requiredCapacity);
     void dispatchPrecompCov3d();
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
-                        uint32_t vpWidth, uint32_t vpHeight);
+                        uint32_t vpWidth, uint32_t vpHeight,
+                        float clipFar = 0.0f);
     void cleanupScene();
 };
