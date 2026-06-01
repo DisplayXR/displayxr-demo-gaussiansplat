@@ -105,17 +105,20 @@ if(MSVC)
     )
 endif()
 
-# Copy OpenXR loader DLL next to exe.
+# Copy OpenXR loader DLL next to exe. Use $<TARGET_FILE:...> rather than the
+# IMPORTED_LOCATION property: the Khronos OpenXR CONFIG package only sets the
+# *config-specific* IMPORTED_LOCATION_<CONFIG> (e.g. IMPORTED_LOCATION_RELWITHDEBINFO),
+# leaving the generic IMPORTED_LOCATION unset. get_target_property(... IMPORTED_LOCATION)
+# would return NOTFOUND, silently skipping the copy and shipping an exe with no
+# loader next to it (the installer's `File openxr_loader.dll` then fails). The
+# generator expression resolves the correct per-config DLL path.
 if(TARGET OpenXR::openxr_loader)
-    get_target_property(_loader_location OpenXR::openxr_loader IMPORTED_LOCATION)
-    if(_loader_location)
-        add_custom_command(TARGET gaussian_splatting_handle_vk_win POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_loader_location}"
-                $<TARGET_FILE_DIR:gaussian_splatting_handle_vk_win>
-            COMMENT "Copying OpenXR loader DLL"
-        )
-    endif()
+    add_custom_command(TARGET gaussian_splatting_handle_vk_win POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE:OpenXR::openxr_loader>"
+            "$<TARGET_FILE_DIR:gaussian_splatting_handle_vk_win>"
+        COMMENT "Copying OpenXR loader DLL"
+    )
 endif()
 
 # SimulatedRealityVulkanBeta.dll (the Leia SR Vulkan weaver) is intentionally
