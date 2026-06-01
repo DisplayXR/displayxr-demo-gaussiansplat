@@ -929,6 +929,15 @@ static void RenderThreadFunc(
                             tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
 
+                            // ZDP-relative clip: near/far placed a fixed fraction of the
+                            // per-eye eye->display distance in front of / behind the
+                            // convergence plane (ZDP). display3d_compute_view computes them
+                            // per-eye from eye.z, so they scale with the virtual display
+                            // (zoom) regardless of scene scale. Transparent mode clips at the
+                            // ZDP (clip_back = 0), matching the foreground-only behavior.
+                            const float clip_front = 0.5f;
+                            const float clip_back  = g_transparentBg.load() ? 0.0f : 2.0f;
+
                             XrPosef displayPose;
                             XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
                                 renderPitch, inputSnapshot.yaw, 0);
@@ -949,7 +958,7 @@ static void RenderThreadFunc(
                             display3d_compute_views(
                                 rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
-                                0.01f, 100.0f, stereoViews);
+                                clip_front, clip_back, stereoViews);
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
@@ -992,8 +1001,10 @@ static void RenderThreadFunc(
                             displayPoseLocal.orientation = {q.x, q.y, q.z, q.w};
                             displayPoseLocal.position = {inputSnapshot.cameraPosX, inputSnapshot.cameraPosY, inputSnapshot.cameraPosZ};
                             Display3DView centerView;
+                            const float pick_clip_front = 0.5f;
+                            const float pick_clip_back  = g_transparentBg.load() ? 0.0f : 2.0f;
                             display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &displayPoseLocal, 0.01f, 100.0f, &centerView);
+                                                   &displayPoseLocal, pick_clip_front, pick_clip_back, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
