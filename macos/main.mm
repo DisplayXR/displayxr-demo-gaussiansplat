@@ -1559,6 +1559,12 @@ int main() {
     g_input.viewParams.virtualDisplayHeight = kDefaultVirtualDisplayHeightM;
     g_input.nominalViewerZ = xr.nominalViewerZ;
     g_input.renderingModeCount = xr.renderingModeCount;
+    // Align the runtime's active rendering mode with the app's default
+    // (currentRenderingMode = 1, the first 3D mode) at startup. The sim display
+    // boots in 2D (mode 0); without this the display stays 2D until the user
+    // toggles. The main-loop dispatch holds this request until the session is
+    // running, so it isn't issued to a not-yet-begun session and lost.
+    g_input.renderingModeChangeRequested = true;
     g_input.lastInputTimeSec = NowSec();
 
     // Reflect initial state in top-bar buttons.
@@ -1612,8 +1618,11 @@ int main() {
 
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
 
-        // Handle rendering mode change (V=cycle, 0-3=direct, or Mode button)
-        if (g_input.renderingModeChangeRequested) {
+        // Handle rendering mode change (V=cycle, 0-3=direct, Mode button, or the
+        // startup default-mode request). Held until the session is running so the
+        // request reaches a begun session rather than being dropped (this handler
+        // runs before PollEvents, which is what begins the session).
+        if (g_input.renderingModeChangeRequested && xr.sessionRunning) {
             g_input.renderingModeChangeRequested = false;
             if (xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE) {
                 xr.pfnRequestDisplayRenderingModeEXT(xr.session, g_input.currentRenderingMode);
