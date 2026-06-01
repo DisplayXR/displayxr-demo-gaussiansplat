@@ -1,18 +1,21 @@
 name: Build Windows
 
-# Tag-triggered Windows installer build. Mirrors build-macos.yml (and the
-# BuildInstaller job in displayxr-runtime's build-windows.yml). The demo's
-# release cadence is manual — devs push a v* tag when ready; this workflow
-# builds DisplayXRGaussianSplatSetup-<version>.exe and attaches it to the
-# GitHub Release. workflow_dispatch is provided so the build can be exercised
-# without cutting a tag (a dispatch run uploads an artifact but does NOT
-# publish a release — the attach step is gated on a v* ref).
+# Windows installer build. Mirrors build-macos.yml (and the BuildInstaller
+# job in displayxr-runtime's build-windows.yml). The demo's release cadence
+# is manual — devs push a v* tag when ready; on a v* tag this workflow builds
+# DisplayXRGaussianSplatSetup-<version>.exe and attaches it to the GitHub
+# Release. workflow_dispatch lets the build be exercised without cutting a tag.
 #
-# Scope is intentionally narrow: no PR-time runs, no push-to-main runs.
-# Daily iteration is local-build (per the runtime org's convention).
+# PR + push-to-main runs are validation only: they compile the app + installer
+# to catch breakage before a release, but the release-attach step and the
+# versions.json DispatchVersionsBump job stay gated on a v* ref, so they only
+# fire on tags.
 
 on:
+  pull_request: {}
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch: {}

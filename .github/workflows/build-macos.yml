@@ -1,19 +1,22 @@
 name: Build macOS
 
-# Tag-triggered macOS .pkg build. Mirrors the BuildInstaller job in
-# displayxr-runtime's build-macos.yml. The demo's release cadence is
-# manual — devs build locally and push a v* tag when ready; this workflow
-# produces `DisplayXRGaussianSplat-<version>.pkg` and attaches it to the
-# GitHub Release.
+# macOS .pkg build. Mirrors the BuildInstaller job in displayxr-runtime's
+# build-macos.yml. The demo's release cadence is manual — devs build locally
+# and push a v* tag when ready; on a v* tag this workflow produces
+# `DisplayXRGaussianSplat-<version>.pkg` and attaches it to the GitHub Release.
 #
-# Scope is intentionally narrow: no PR-time runs, no push-to-main runs.
-# Daily iteration is local-build (per the runtime org's "local builds
-# preferred" convention).
+# PR + push-to-main runs are validation only: they build the app + .pkg and
+# assert its payload to catch breakage before a release. The release-attach
+# step stays gated on a v* ref, so it only fires on tags.
 
 on:
+  pull_request: {}
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch: {}
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
