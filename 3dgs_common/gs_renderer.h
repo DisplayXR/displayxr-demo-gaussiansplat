@@ -126,9 +126,10 @@ struct GsRenderer {
     // NOTE: this splat rasterizer does NOT clip against the projection matrix's
     // near/far planes (only ndc.xy + p_view.z are used downstream), so geometric
     // near/far clipping MUST come through these explicit view-space culls.
-    // clipFadeFrac>0 softens the far cut into an opacity rolloff over the band
-    // [clipFarViewSpace*(1-frac), clipFarViewSpace] instead of a hard discard,
-    // removing the pop as a splat center crosses the ZDP. 0=hard cut (legacy).
+    // clipFadeFrac>0 softens the NEAR cut into an opacity rolloff over the band
+    // [clipNearViewSpace, clipNearViewSpace*(1+frac)] instead of a hard discard,
+    // removing the pop as a splat center crosses the near plane. 0=hard near cut.
+    // The FAR cut is always hard (no fade) regardless of clipFadeFrac.
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,

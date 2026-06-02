@@ -39,7 +39,7 @@ struct alignas(16) GsUniformBuffer {
     float tan_fovx;            // offset 152
     float tan_fovy;            // offset 156
     float clip_far;            // offset 160 — view-space far cull (0 = disabled)
-    float clip_fade_frac;      // offset 164 — soft-clip band as fraction of clip_far (0 = hard cut)
+    float clip_fade_frac;      // offset 164 — soft NEAR-clip band as fraction of clip_near (0 = hard cut; far is always hard)
     float clip_near;           // offset 168 — view-space near cull (0 = disabled)
 };
 static_assert(sizeof(GsUniformBuffer) == 176, "GsUniformBuffer must be 176 bytes");
@@ -936,7 +936,8 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
 
     // Foreground-only far cull (view-space forward distance). 0 = disabled.
     ub.clip_far = clipFar;
-    // Soft-clip fade band as a fraction of clip_far. 0 = hard cut (legacy).
+    // Soft NEAR-clip fade band as a fraction of clip_near. 0 = hard near cut.
+    // The far cut is always hard (the shader ignores this for the far plane).
     ub.clip_fade_frac = clipFadeFrac;
     // Near cull (view-space forward distance). 0 = disabled.
     ub.clip_near = clipNear;
