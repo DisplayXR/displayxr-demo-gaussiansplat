@@ -1510,6 +1510,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== SR 3DGS OpenXR Ext Vulkan Application ===");
 
+    // Drift guard: assert the view/unproject/orientation conventions are
+    // self-consistent (round-trip + +NDC->+world). A non-zero result means the
+    // render-vs-pick frame math has drifted — fail loud rather than ship a
+    // silently-inverted picker (the head->feet bug class). Mirrors macOS.
+    {
+        int stFails = display3d_selftest();
+        if (stFails == 0)
+            LOG_INFO("display3d self-test passed (view/unproject/orientation consistent)");
+        else
+            LOG_ERROR("display3d self-test FAILED with %d check(s) — pick ray math has drifted", stFails);
+    }
+
     HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
