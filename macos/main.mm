@@ -1432,16 +1432,31 @@ static void ApplyAutoFitForLoadedScene() {
     // +Y-up convention. No runtime view-stage flips needed.
 }
 
+// Optional scene path from the command line (argv[1]); overrides the bundled
+// butterfly auto-load. Lets us launch straight into a specific asset:
+//   gaussian_splatting_handle_vk_macos "/path/to/KAWS FAMILY.spz"
+static std::string g_cliScenePath;
+
 static void TryAutoLoadBundledScene() {
-    std::string dir = ExeDir();
-    if (dir.empty()) return;
-    std::string path = dir + "/butterfly.spz";
+    std::string path;
+    if (!g_cliScenePath.empty()) {
+        path = g_cliScenePath;
+        if (!FileExists(path)) {
+            LOG_WARN("CLI scene not found: %s — falling back to bundled scene", path.c_str());
+            path.clear();
+        }
+    }
+    if (path.empty()) {
+        std::string dir = ExeDir();
+        if (dir.empty()) return;
+        path = dir + "/butterfly.spz";
+    }
     if (!FileExists(path)) {
-        LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
+        LOG_INFO("No scene at %s (skipping auto-load)", path.c_str());
         return;
     }
     if (!ValidateSceneFile(path)) return;
-    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
+    LOG_INFO("Auto-loading scene: %s", path.c_str());
     if (g_gsRenderer.loadScene(path.c_str())) {
         g_loadedFileName = GetPlyFilename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
@@ -1455,14 +1470,30 @@ static void TryAutoLoadBundledScene() {
 // Main
 // ============================================================================
 
-int main() {
+int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+
+    if (argc > 1 && argv[1] && argv[1][0] != '\0') {
+        g_cliScenePath = argv[1];
+    }
 
     signal(SIGINT, SignalHandler);
     signal(SIGTERM, SignalHandler);
 
     LOG_INFO("=== SR 3DGS OpenXR + External macOS Window ===");
+
+    // Drift guard: assert the view/unproject/orientation conventions are
+    // self-consistent (round-trip + +NDC→+world). A non-zero result means the
+    // render-vs-pick frame math has drifted — fail loud rather than ship a
+    // silently-inverted picker (the head→feet bug class).
+    {
+        int stFails = display3d_selftest();
+        if (stFails == 0)
+            LOG_INFO("display3d self-test passed (view/unproject/orientation consistent)");
+        else
+            LOG_ERROR("display3d self-test FAILED with %d check(s) — pick ray math has drifted", stFails);
+    }
 
     // Initialize rendering mode from env var (legacy fallback)
     {
@@ -1712,17 +1743,17 @@ int main() {
                             rawEyePos.assign(1, c);
                         }
 
+                        // Clean +Y-up world frame. The Vulkan render Y-mirror is owned
+                        // entirely by display3d_compute_views(..., vulkan_flip_y=1) (which
+                        // pairs with updateUniforms' NDC view-row flip). App code never
+                        // negates Y itself — the pick reuses these same clean values with
+                        // vulkan_flip_y=0, so render and pick can't drift.
                         XrPosef cameraPose;
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                        // GsRenderer Y-mirrors the world inside updateUniforms (see comment
-                        // in gs_renderer.cpp). The off-axis Kooima projection assumes the
-                        // mirror is reflected in the displayPose passed to display3d_compute_view,
-                        // so negate Y here to keep the eye-vs-display geometry consistent.
-                        cameraPose.position = {g_input.cameraPosX, -g_input.cameraPosY, g_input.cameraPosZ};
+                        cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
 
-                        // nominalViewer in render frame (Y mirrored) — used for
-                        // parallax-factor lerp, must match the eye/cameraPose frame.
-                        XrVector3f nominalViewer = {xr.nominalViewerX, -xr.nominalViewerY, xr.nominalViewerZ};
+                        // nominalViewer in the clean world frame — used for parallax lerp.
+                        XrVector3f nominalViewer = {xr.nominalViewerX, xr.nominalViewerY, xr.nominalViewerZ};
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -1767,13 +1798,12 @@ int main() {
                                 eyeOffsetX = (winCenterX - dispCenterX) * pxSizeXBacking;
                                 eyeOffsetY = (winCenterY - dispCenterY) * pxSizeYBacking;
                             }
+                            // Window-relative Kooima offset (real geometric correction,
+                            // applied in the clean +Y-up frame). The Vulkan render Y-mirror
+                            // is NOT applied here — display3d_compute_views(vulkan_flip_y=1)
+                            // owns it, so rawEyePos stays clean and the pick path can reuse
+                            // these exact eyes with vulkan_flip_y=0.
                             for (auto& e : rawEyePos) { e.x -= eyeOffsetX; e.y -= eyeOffsetY; }
-                            // GsRenderer Y-mirrors the world; cameraPose Y is negated
-                            // below at the display3d_compute_views boundary. Eyes must
-                            // live in the same render frame so the asymmetric Kooima
-                            // projection's eye-vs-display geometry stays consistent —
-                            // otherwise vertical eye parallax comes out inverted.
-                            for (auto& e : rawEyePos) { e.y = -e.y; }
 
                             Display3DScreen screen = {winW_m, winH_m};
                             Display3DTunables tunables;
@@ -1793,7 +1823,7 @@ int main() {
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                clip_front, clip_back, eyeViews.data());
+                                clip_front, clip_back, /*vulkan_flip_y=*/1, eyeViews.data());
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1810,9 +1840,13 @@ int main() {
                             // Win32 mouse y=0 is at the TOP.)
                             float ndcY = 2.0f * g_input.teleportMouseY / (float)viewSize.height - 1.0f;
 
-                            // Build a center-eye Display3DView from the averaged processed
-                            // display-space eye so unprojection is truly from the viewpoint
-                            // midpoint (not from the left eye, which is off by ~IPD/2).
+                            // Center-eye view for picking. Same eye-factor + Kooima pipeline
+                            // as the render (display3d_compute_center_view), reusing the exact
+                            // clean rawEyePos / nominalViewer / cameraPose the render consumed
+                            // — but with vulkan_flip_y=0, so the ray lives in the clean +Y-up
+                            // world frame the splats are in. No hand-rolled inverse of
+                            // eye_display = processed·es, no manual Y mirror: the pick ray
+                            // shares the render's math and can't drift from it.
                             float dispPxW2 = xr.displayPixelWidth > 0 ? (float)xr.displayPixelWidth : (float)xr.swapchain.width;
                             float dispPxH2 = xr.displayPixelHeight > 0 ? (float)xr.displayPixelHeight : (float)xr.swapchain.height;
                             float winW_m2 = (float)g_windowW * (xr.displayWidthM / dispPxW2);
@@ -1824,34 +1858,11 @@ int main() {
                             tunables2.perspective_factor = g_input.viewParams.perspectiveFactor;
                             tunables2.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                            XrVector3f centerEyeDisp = {0, 0, 0};
-                            for (const auto& sv : eyeViews) {
-                                centerEyeDisp.x += sv.eye_display.x;
-                                centerEyeDisp.y += sv.eye_display.y;
-                                centerEyeDisp.z += sv.eye_display.z;
-                            }
-                            float invN = 1.0f / (float)eyeViews.size();
-                            centerEyeDisp.x *= invN;
-                            centerEyeDisp.y *= invN;
-                            centerEyeDisp.z *= invN;
-                            // eye_display is processed_eye * (perspective_factor * virtual_display_height / winH_m);
-                            // invert so display3d_compute_view can re-apply it consistently.
-                            float m2v_post = tunables2.virtual_display_height / winH_m2;
-                            float es = tunables2.perspective_factor * m2v_post;
-                            XrVector3f centerEyeProcessed = (es != 0.0f)
-                                ? (XrVector3f){centerEyeDisp.x / es, centerEyeDisp.y / es, centerEyeDisp.z / es}
-                                : centerEyeDisp;
-                            // Use a real-world-frame displayPose for picking — the unproject
-                            // ray needs to be in the same frame as the splats (un-Y-flipped
-                            // world). cameraPose has its Y negated for the renderer's view-
-                            // stage Y mirror; using it here would put rayOrigin in a mirror
-                            // frame and pickGaussian would intersect against splats in the
-                            // wrong frame.
-                            XrPosef cameraPoseWorld = cameraPose;
-                            cameraPoseWorld.position.y = g_input.cameraPosY;
                             Display3DView centerView;
-                            display3d_compute_view(&centerEyeProcessed, &screen2, &tunables2,
-                                                   &cameraPoseWorld, 0.5f, 2.0f, &centerView);
+                            display3d_compute_center_view(
+                                rawEyePos.data(), (uint32_t)rawEyePos.size(), &nominalViewer,
+                                &screen2, &tunables2, &cameraPose,
+                                0.5f, 2.0f, /*vulkan_flip_y=*/0, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
@@ -1862,12 +1873,9 @@ int main() {
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
-                                // Both endpoints stored in WORLD frame (the same frame as
-                                // g_input.cameraPosX/Y/Z) so the slerp interpolates
-                                // consistently. cameraPose has its Y negated for the
-                                // display3d_compute_view boundary; we mustn't store that
-                                // negated copy as the slerp's "from" pose, otherwise the
-                                // mid-transition lerp drifts vertically toward 2·cy − y.
+                                // Both endpoints stored in the clean +Y-up WORLD frame (the
+                                // same frame as g_input.cameraPosX/Y/Z and the splats) so the
+                                // slerp interpolates consistently.
                                 XrPosef fromWorld;
                                 fromWorld.orientation = cameraPose.orientation;
                                 fromWorld.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};

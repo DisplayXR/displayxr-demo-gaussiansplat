@@ -73,6 +73,15 @@ typedef struct Display3DView {
  *                       (ZDP) distance: near = ez * (1 - clip_front).
  * @param clip_back      Recede clip as a fraction: far = ez * (1 + clip_back).
  *                       clip_back = 0 => far at the ZDP (foreground only).
+ * @param vulkan_flip_y  Single source of truth for the render-vs-pick frame.
+ *                       Pass 1 from the RENDER path: the eyes, nominal viewer,
+ *                       and display pose are Y-mirrored internally so the
+ *                       off-axis Kooima frustum matches the NDC view-row flip
+ *                       that GsRenderer::updateUniforms applies for Vulkan's
+ *                       Y-down clip space. Pass 0 to stay in the clean +Y-up
+ *                       world frame (used for picking). Callers ALWAYS pass
+ *                       clean +Y-up world-space inputs and never negate Y
+ *                       themselves — this flag owns the entire mirror.
  * @param out_views      Output array of N views
  */
 void
@@ -84,7 +93,51 @@ display3d_compute_views(const XrVector3f *raw_eyes,
                                const XrPosef *display_pose,
                                float clip_front,
                                float clip_back,
+                               int vulkan_flip_y,
                                Display3DView *out_views);
+
+/*!
+ * Compute a single cyclopean (center-eye) view from N raw eyes — the average
+ * eye position run through the same IPD/parallax/Kooima pipeline as
+ * display3d_compute_views. This is the canonical view for CPU picking: it
+ * shares the exact eye-factor math (no hand-rolled inverse of
+ * eye_display = processed * es), so the pick ray can never drift from the
+ * render rig. Pass vulkan_flip_y = 0 for a clean world-frame ray.
+ *
+ * @param raw_eyes       Array of N raw eye positions in DISPLAY space
+ * @param count          Number of views (must be >= 1)
+ * @param nominal_viewer Nominal viewer in DISPLAY space (or NULL for {0,0,0.5})
+ * @param screen         Physical screen dimensions
+ * @param tunables       View factors (or NULL for defaults)
+ * @param display_pose   Display pose in world space (or NULL for identity)
+ * @param clip_front     See display3d_compute_views.
+ * @param clip_back      See display3d_compute_views.
+ * @param vulkan_flip_y  See display3d_compute_views (pass 0 for picking).
+ * @param out_view       Output center view
+ */
+void
+display3d_compute_center_view(const XrVector3f *raw_eyes,
+                              uint32_t count,
+                              const XrVector3f *nominal_viewer,
+                              const Display3DScreen *screen,
+                              const Display3DTunables *tunables,
+                              const XrPosef *display_pose,
+                              float clip_front,
+                              float clip_back,
+                              int vulkan_flip_y,
+                              Display3DView *out_view);
+
+/*!
+ * Self-test of the view/unproject math (the render-vs-pick drift guard).
+ * Builds a synthetic rig and asserts, for the picking (clean) frame:
+ *   (a) round-trip: unproject(project(P)) yields a ray through P;
+ *   (b) orientation: +NDC.y maps to higher world Y, +NDC.x to higher world X.
+ * Returns the number of failed checks (0 = all pass). On failure it writes a
+ * diagnostic to stderr. Call once at startup; a non-zero return means the
+ * projection/unproject/orientation conventions have drifted.
+ */
+int
+display3d_selftest(void);
 
 /*!
  * Compute Kooima FOV angles only (no matrices). Useful for runtime-side
