@@ -78,6 +78,30 @@ if [ ! -x "$BIN" ]; then
     exit 1
 fi
 
+# --- 1b. Share the DisplayXR runtime's Vulkan loader ----------------------
+# The DisplayXR runtime ships its OWN libvulkan.1.dylib (+ MoltenVK). If the
+# app links a *different* loader (e.g. Homebrew's vulkan-loader), the process
+# ends up with two loader instances: the app creates its VkInstance with one,
+# but the runtime's xrGetVulkanGraphicsDeviceKHR enumerates that instance with
+# the other — which has no record of it, so the loader reports "0 valid GPUs"
+# and session create fails (XR_ERROR_RUNTIME_FAILURE, -3). Repoint the binary
+# at the runtime's loader so both sides share one. Guarded on the runtime being
+# installed (it must be, to run the app), so CI/installer builds on machines
+# without the runtime are unaffected and keep their bundled loader. Idempotent.
+RUNTIME_VK="/Library/Application Support/DisplayXR/lib/libvulkan.1.dylib"
+if [ -f "$RUNTIME_VK" ]; then
+    # Extract the full current install path (may contain spaces): strip the
+    # leading indent and the trailing " (compatibility version …)" suffix.
+    CURRENT_VK="$(otool -L "$BIN" | grep 'libvulkan\.1\.dylib' | head -1 \
+        | sed -E 's/^[[:space:]]*(.*) \(compatibility.*$/\1/')"
+    if [ -n "$CURRENT_VK" ] && [ "$CURRENT_VK" != "$RUNTIME_VK" ]; then
+        install_name_tool -change "$CURRENT_VK" "$RUNTIME_VK" "$BIN"
+        echo "==> Repointed libvulkan: $CURRENT_VK -> runtime loader (shared, avoids dual-loader)"
+    else
+        echo "==> libvulkan already shares the runtime loader"
+    fi
+fi
+
 if [ "$BUILD_INSTALLER" != "true" ]; then
     echo ""
     echo "Run: $BIN"
