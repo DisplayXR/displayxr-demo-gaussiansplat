@@ -629,6 +629,56 @@ bool GsRenderer::loadScene(const char* plyPath)
         pickData_[i].opacity = v.scale_opacity[3];
     }
 
+    // Reject far-flung "floater" outlier splats from the pick set. Training
+    // artifacts (e.g. KAWS FAMILY.spz carries ~3.4 % of its splats scattered
+    // out to ±240 while the model itself spans only ~±15) are culled in the
+    // render by the ZDP-relative far plane, so the user never sees them — but
+    // the CPU raycast in pickGaussian() would still hit them, letting a
+    // double-click focus land on an invisible splat far outside the model.
+    // Drop any splat lying beyond a generous margin around the robust
+    // [p2, p98] per-axis core. Clean scenes keep every splat because the
+    // margin comfortably exceeds their true extent. This also tightens the
+    // auto-fit bounds helpers, which share pickData_.
+    if (numGaussians_ >= 1024) {
+        const float kPickOutlierMargin = 3.0f;  // × half the p2–p98 range
+        float keepMin[3], keepMax[3];
+        std::vector<float> coord(numGaussians_);
+        for (int axis = 0; axis < 3; axis++) {
+            for (uint32_t i = 0; i < numGaussians_; i++) {
+                const auto& g = pickData_[i];
+                coord[i] = (axis == 0) ? g.px : (axis == 1) ? g.py : g.pz;
+            }
+            size_t loIdx = (size_t)(0.02f * (float)(numGaussians_ - 1));
+            size_t hiIdx = (size_t)(0.98f * (float)(numGaussians_ - 1));
+            if (hiIdx <= loIdx) hiIdx = loIdx + 1;
+            std::nth_element(coord.begin(), coord.begin() + loIdx, coord.end());
+            float lo = coord[loIdx];
+            std::nth_element(coord.begin() + loIdx + 1, coord.begin() + hiIdx, coord.end());
+            float hi = coord[hiIdx];
+            float center = 0.5f * (lo + hi);
+            float halfRange = 0.5f * (hi - lo);
+            keepMin[axis] = center - kPickOutlierMargin * halfRange;
+            keepMax[axis] = center + kPickOutlierMargin * halfRange;
+        }
+        size_t kept = 0;
+        for (uint32_t i = 0; i < numGaussians_; i++) {
+            const auto& g = pickData_[i];
+            if (g.px < keepMin[0] || g.px > keepMax[0] ||
+                g.py < keepMin[1] || g.py > keepMax[1] ||
+                g.pz < keepMin[2] || g.pz > keepMax[2]) continue;
+            pickData_[kept++] = g;
+        }
+        size_t dropped = (size_t)numGaussians_ - kept;
+        pickData_.resize(kept);
+        if (dropped > 0) {
+            printf("GsRenderer: pick-set outlier rejection dropped %zu/%u floaters "
+                   "(keep box [%.2f,%.2f]x[%.2f,%.2f]x[%.2f,%.2f])\n",
+                   dropped, numGaussians_,
+                   keepMin[0], keepMax[0], keepMin[1], keepMax[1],
+                   keepMin[2], keepMax[2]);
+        }
+    }
+
     // Create compute pipelines (first time only — they don't depend on scene size)
     if (pipePrecompCov3d_ == VK_NULL_HANDLE) {
         if (!createPipelines()) {
