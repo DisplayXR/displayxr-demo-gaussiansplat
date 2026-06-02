@@ -99,6 +99,15 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     PFN_xrReadbackCallback   readbackCallback;  //!< Called with composited RGBA pixels (offscreen mode)
     void*                    readbackUserdata;   //!< Passed to readbackCallback
     void*                    sharedIOSurface;   //!< IOSurfaceRef for zero-copy Metal texture sharing, or NULL
+    XrBool32                 transparentBackgroundEnabled; //!< When XR_TRUE, NSWindow + CAMetalLayer
+                                                           //!< are configured with isOpaque=NO so the
+                                                           //!< desktop shows through transparent
+                                                           //!< (alpha < 1) regions of the composited
+                                                           //!< output. Per-pixel alpha is preserved
+                                                           //!< end-to-end via sim_display's alpha-native
+                                                           //!< output stage; no chroma-key trick needed
+                                                           //!< on macOS. (Sibling of
+                                                           //!< XrWin32WindowBindingCreateInfoEXT.transparentBackgroundEnabled.)
 } XrCocoaWindowBindingCreateInfoEXT;
 
 // ---- Canvas Sub-Rect (Shared Texture Output Rect) ----

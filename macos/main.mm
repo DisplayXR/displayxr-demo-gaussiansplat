@@ -163,6 +163,14 @@ static bool g_fullscreen = false;
 static NSRect g_savedWindowFrame = {};
 static NSUInteger g_savedWindowStyle = 0;
 
+// Transparent-background toggle (Ctrl+T). Flips the renderer between opaque
+// clear (alpha=1) and premultiplied alpha = 1 - T (desktop see-through), and
+// in transparent mode clamps the far plane to the ZDP (foreground-only).
+// Render-side only: the session-level transparentBackgroundEnabled flag is set
+// permanently at session create and cannot be toggled at runtime. A plain bool
+// is fine — macOS pumps events and renders on the same main thread.
+static bool g_transparentBg = false;
+
 // 3DGS state
 static GsRenderer g_gsRenderer;
 static std::string g_loadedFileName;
@@ -526,6 +534,11 @@ static void OpenLoadDialog() {
 - (CALayer*)makeBackingLayer {
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    // Non-opaque so transparent-bg mode (Ctrl+T) lets the desktop show
+    // through alpha < 1 regions. The runtime's Metal compositor also sets
+    // this when transparentBackgroundEnabled = XR_TRUE, but the demo owns
+    // layer creation, so set it here too. Harmless when opaque (alpha = 1).
+    layer.opaque = NO;
     return layer;
 }
 - (BOOL)wantsLayer { return YES; }
@@ -593,7 +606,14 @@ static void OpenLoadDialog() {
             g_input.captureAtlasRequested = true;
             break;
         case 't': case 'T':
-            g_input.eyeTrackingModeToggleRequested = true;
+            // Ctrl+T: transparent-background toggle (mirrors the Windows
+            // demo). Plain T stays the eye-tracking-mode toggle.
+            if ([event modifierFlags] & NSEventModifierFlagControl) {
+                g_transparentBg = !g_transparentBg;
+                LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+            } else {
+                g_input.eyeTrackingModeToggleRequested = true;
+            }
             break;
         case 'l': case 'L':
             g_input.loadRequested = true;
@@ -705,12 +725,29 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height) {
         styleMask:style backing:NSBackingStoreBuffered defer:NO];
     [g_window setTitle:@"DisplayXR Gaussian Splat Viewer Demo"];
     [g_window setDelegate:delegate];
+    // Non-opaque window + clear background brush are required for the
+    // transparent-bg path (Ctrl+T): the runtime's Metal compositor sets the
+    // CAMetalLayer non-opaque but does NOT touch the app-owned NSWindow, so
+    // the demo must. Harmless when opaque (renderer outputs alpha = 1).
+    [g_window setOpaque:NO];
+    [g_window setBackgroundColor:[NSColor clearColor]];
     [g_window center];
 
     g_metalView = [[MetalView alloc] initWithFrame:frame];
     [g_window setContentView:g_metalView];
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_metalView];
+
+    // Re-assert layer transparency AFTER the view is realized in the window.
+    // A layer-backed NSView lets AppKit sync the backing layer's `opaque` to
+    // the view's state, which can revert the opaque=NO set in makeBackingLayer
+    // before the layer is attached. The runtime reads THIS layer's opaque flag
+    // when it creates the VkSurface (MoltenVK compositeAlpha=INHERIT defers
+    // transparency to it), so it must be NO by then for the desktop to show
+    // through transparent (alpha<1) regions.
+    if ([g_metalView.layer isKindOfClass:[CAMetalLayer class]]) {
+        ((CAMetalLayer *)g_metalView.layer).opaque = NO;
+    }
 
     // Accept drag-and-drop of .ply / .spz files
     [g_metalView registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
@@ -1124,9 +1161,16 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     XrCocoaWindowBindingCreateInfoEXT macBinding = {(XrStructureType)XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT};
     macBinding.viewHandle = (__bridge void*)g_metalView;
+    // Always-on transparent-window support (mirrors windows/xr_session.cpp).
+    // macOS is alpha-native — no chroma key. The runtime configures the
+    // CAMetalLayer non-opaque + clears the atlas to (0,0,0,0) based on this
+    // flag at session create; it cannot be flipped at runtime. The Ctrl+T
+    // toggle only changes the renderer's output alpha (opaque mode emits
+    // alpha = 1 throughout, so it composites fully opaque despite this flag).
+    macBinding.transparentBackgroundEnabled = XR_TRUE;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_EXT_cocoa_window_binding");
+        LOG_INFO("Using XR_EXT_cocoa_window_binding (transparent-bg ENABLED)");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
@@ -1305,6 +1349,11 @@ static void EndFrame(AppXrSession& xr, XrTime displayTime,
     layer.space = xr.localSpace;
     layer.viewCount = viewCount;
     layer.views = projViews;
+    // Blend with source alpha so transparent-bg regions (alpha < 1) composite
+    // over the desktop. Mirrors the Windows demo; a no-op on the macOS Metal
+    // compositor (which keys off the binding flag, not layerFlags) and
+    // harmless when opaque (alpha = 1), but correct per the OpenXR contract.
+    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     const XrCompositionLayerBaseHeader* layers[] = {(const XrCompositionLayerBaseHeader*)&layer};
     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
     ei.displayTime = displayTime;
@@ -1815,12 +1864,13 @@ int main(int argc, char** argv) {
                             // ZDP-relative clip planes (anchored per-eye from eye.z inside
                             // display3d_compute_view): near = ez - near_offset, far =
                             // ez + far_offset, with the offsets given as ABSOLUTE distances
-                            // in virtual-display-height (vH) units. macOS has no transparent-
-                            // bg mode, so the far plane is pushed effectively to infinity
-                            // (1000*vH) — no foreground-only ZDP clamp here.
+                            // in virtual-display-height (vH) units. Transparent-bg mode
+                            // (Ctrl+T) clamps the far plane to the ZDP (far_offset = 0,
+                            // foreground-only); opaque mode pushes it effectively to
+                            // infinity (1000*vH).
                             const float vH = tunables.virtual_display_height;
                             const float near_offset = vH;
-                            const float far_offset  = 1000.0f * vH;
+                            const float far_offset  = g_transparentBg ? 0.0f : 1000.0f * vH;
 
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
@@ -1878,11 +1928,14 @@ int main(int argc, char** argv) {
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             // Only recenter on visible splats: reject any in front of the
-                            // near plane (centerView near_z). macOS is always opaque, so no
-                            // far reject. A full miss returns false -> no recenter.
+                            // near plane (centerView near_z), and — in transparent/
+                            // foreground mode — behind the ZDP (eye_display.z). Opaque mode
+                            // shows everything behind the display, so no far reject there.
+                            // A full miss returns false -> no recenter.
+                            float pickClipFar = g_transparentBg ? centerView.eye_display.z : 0.0f;
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos, 100.0f,
                                                           centerView.view_matrix,
-                                                          centerView.near_z, /*clipFar=*/0.0f)) {
+                                                          centerView.near_z, pickClipFar)) {
                                 // Both endpoints stored in the clean +Y-up WORLD frame (the
                                 // same frame as g_input.cameraPosX/Y/Z and the splats) so the
                                 // slerp interpolates consistently.
@@ -1948,9 +2001,10 @@ int main(int argc, char** argv) {
                                     // Geometric near/far culls come from the resolved
                                     // per-eye view-space planes (this splat rasterizer
                                     // does not clip against the projection matrix planes).
-                                    // macOS is always opaque, so far_z = ez + 1000*vH is
-                                    // effectively infinite (no far cull); near_z = ez -
-                                    // near_offset does the near clipping.
+                                    // In transparent mode far_z = ez (the ZDP), so the far
+                                    // cull keeps only foreground; in opaque mode far_z =
+                                    // ez + 1000*vH is effectively infinite (no far cull).
+                                    // near_z = ez - near_offset does the near clipping.
                                     float clipNear = hasKooima ? eyeViews[eye].near_z : 0.0f;
                                     float clipFar  = hasKooima ? eyeViews[eye].far_z  : 0.0f;
                                     g_gsRenderer.renderEye(
@@ -1959,7 +2013,7 @@ int main(int argc, char** argv) {
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
                                         viewMat[eye].data(), projMat[eye].data(),
-                                        /*transparentBg=*/false,
+                                        /*transparentBg=*/g_transparentBg,
                                         clipNear, clipFar, /*clipFadeFrac=*/0.15f);
                                 }
                             } else {
@@ -2062,6 +2116,7 @@ int main(int argc, char** argv) {
                         "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
                         "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
+                        "Transparent: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
                         "Render: %ux%u  Window: %ux%u\n"
                         "Display: %.3f x %.3f m\n"
@@ -2069,13 +2124,14 @@ int main(int argc, char** argv) {
                         "Vdisplay: (%.2f, %.2f, %.2f)\n"
                         "\nWASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom\n"
                         "DblClick=Focus splat  -/= Depth  Space=Reset\n"
-                        "M=Auto-Orbit  V=Mode  L=Load  Tab=HUD  ESC=Quit",
+                        "M=Auto-Orbit  V=Mode  L=Load  Ctrl+T=Transparent  Tab=HUD  ESC=Quit",
                         xr.systemName, (int)xr.sessionState,
                         (xr.renderingModeCount > 0 && xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0') ? xr.renderingModeNames[g_input.currentRenderingMode] : "Unknown",
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
                         activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
                         depthPct, g_input.viewParams.scaleFactor, orbitLabel,
+                        g_transparentBg ? "ON" : "OFF",
                         fps, g_avgFrameTime * 1000.0,
                         g_renderW, g_renderH, g_windowW, g_windowH,
                         xr.displayWidthM, xr.displayHeightM,
