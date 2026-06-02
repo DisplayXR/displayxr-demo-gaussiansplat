@@ -23,7 +23,9 @@ layout (std140, set = 1, binding = 0) uniform Params {
     uint height;
     float tan_fovx;
     float tan_fovy;
-    float clip_far;   // view-space far cull distance; 0 = disabled
+    float clip_far;        // view-space far cull distance; 0 = disabled
+    float clip_fade_frac;  // soft-clip band as a fraction of clip_far; 0 = hard cut
+    float clip_near;       // view-space near cull distance; 0 = disabled
 };
 
 layout (std430, set = 1, binding = 1) writeonly buffer VertexAttributes {
@@ -132,10 +134,36 @@ void main() {
         return;
     }
 
-    // Foreground-only clip (transparent mode): cull splats past the display
-    // plane. clip_far is the eye->plane forward distance; p_view.z is the
-    // splat's forward distance (view_mat has +Z = forward). 0 = disabled.
-    if (clip_far > 0.0f && p_view.z > clip_far) {
+    // Soft view-space near/far clip. This splat rasterizer does NOT test against
+    // the projection-matrix near/far planes (only ndc.xy + p_view.z are used
+    // downstream), so geometric clipping is done here as explicit p_view.z culls.
+    // clip_near/clip_far are the per-eye view-space planes (ez - near_offset /
+    // ez + far_offset). clip_fade_frac > 0 turns each hard cut into a symmetric
+    // opacity rolloff over a band of width frac*plane, so splat centers crossing
+    // a plane fade rather than pop:
+    //   near: opacity ramps 0->1 over [clip_near, clip_near*(1+frac)]
+    //   far:  opacity ramps 1->0 over [clip_far*(1-frac), clip_far]
+    // frac = 0 restores hard cuts. Either plane = 0 disables that side.
+    float opacity_scale = 1.0f;
+    if (clip_near > 0.0f) {
+        if (p_view.z < clip_near) {
+            return;
+        }
+        if (clip_fade_frac > 0.0f) {
+            float near_fade_end = clip_near * (1.0f + clip_fade_frac);
+            opacity_scale *= smoothstep(clip_near, near_fade_end, p_view.z);
+        }
+    }
+    if (clip_far > 0.0f) {
+        if (p_view.z > clip_far) {
+            return;
+        }
+        if (clip_fade_frac > 0.0f) {
+            float far_fade_start = clip_far * (1.0f - clip_fade_frac);
+            opacity_scale *= 1.0f - smoothstep(far_fade_start, clip_far, p_view.z);
+        }
+    }
+    if (opacity_scale <= 1.0f / 255.0f) {
         return;
     }
 
@@ -146,7 +174,7 @@ void main() {
     }
     mat2 conic = inverse(cov2d);
     attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
-    attr[index].conic_opacity.w = vertices[index].scale_opacity.w;
+    attr[index].conic_opacity.w = vertices[index].scale_opacity.w * opacity_scale;
 
     float mid = 0.5 * (cov2d[0][0] + cov2d[1][1]);
     float lambda1 = mid + sqrt(max(0.1, mid * mid - det));

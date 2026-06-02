@@ -1812,18 +1812,20 @@ int main(int argc, char** argv) {
                             tunables.perspective_factor = g_input.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
-                            // ZDP-relative clip planes (computed per-eye from eye.z inside
-                            // display3d_compute_view): near = ez*(1-clip_front), far =
-                            // ez*(1+clip_back). Scales with the virtual display (zoom) so
-                            // large scenes don't clip. macOS has no transparent-bg mode, so
-                            // clip_back stays 2.0 (no foreground-only ZDP clamp here).
-                            const float clip_front = 0.5f;
-                            const float clip_back  = 2.0f;
+                            // ZDP-relative clip planes (anchored per-eye from eye.z inside
+                            // display3d_compute_view): near = ez - near_offset, far =
+                            // ez + far_offset, with the offsets given as ABSOLUTE distances
+                            // in virtual-display-height (vH) units. macOS has no transparent-
+                            // bg mode, so the far plane is pushed effectively to infinity
+                            // (1000*vH) — no foreground-only ZDP clamp here.
+                            const float vH = tunables.virtual_display_height;
+                            const float near_offset = vH;
+                            const float far_offset  = 1000.0f * vH;
 
                             display3d_compute_views(
                                 rawEyePos.data(), (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &cameraPose,
-                                clip_front, clip_back, /*vulkan_flip_y=*/1, eyeViews.data());
+                                near_offset, far_offset, /*vulkan_flip_y=*/1, eyeViews.data());
                         }
 
                         // Double-click focus: ray from CENTER physical eyes through the
@@ -1858,11 +1860,14 @@ int main(int argc, char** argv) {
                             tunables2.perspective_factor = g_input.viewParams.perspectiveFactor;
                             tunables2.virtual_display_height = g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
 
+                            // Well-conditioned frustum for the pick ray (a full line, so
+                            // the near/far choice doesn't truncate it); offsets in vH units.
+                            const float vH2 = tunables2.virtual_display_height;
                             Display3DView centerView;
                             display3d_compute_center_view(
                                 rawEyePos.data(), (uint32_t)rawEyePos.size(), &nominalViewer,
                                 &screen2, &tunables2, &cameraPose,
-                                0.5f, 2.0f, /*vulkan_flip_y=*/0, &centerView);
+                                vH2, 1000.0f * vH2, /*vulkan_flip_y=*/0, &centerView);
 
                             XrVector3f rayOriginV, rayDirV;
                             display3d_unproject_ndc_to_ray(ndcX, ndcY,
@@ -1872,7 +1877,12 @@ int main(int argc, char** argv) {
                             float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
-                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                            // Only recenter on visible splats: reject any in front of the
+                            // near plane (centerView near_z). macOS is always opaque, so no
+                            // far reject. A full miss returns false -> no recenter.
+                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos, 100.0f,
+                                                          centerView.view_matrix,
+                                                          centerView.near_z, /*clipFar=*/0.0f)) {
                                 // Both endpoints stored in the clean +Y-up WORLD frame (the
                                 // same frame as g_input.cameraPosX/Y/Z and the splats) so the
                                 // slerp interpolates consistently.
@@ -1935,12 +1945,22 @@ int main(int argc, char** argv) {
 
                             if (g_gsRenderer.hasScene()) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
+                                    // Geometric near/far culls come from the resolved
+                                    // per-eye view-space planes (this splat rasterizer
+                                    // does not clip against the projection matrix planes).
+                                    // macOS is always opaque, so far_z = ez + 1000*vH is
+                                    // effectively infinite (no far cull); near_z = ez -
+                                    // near_offset does the near clipping.
+                                    float clipNear = hasKooima ? eyeViews[eye].near_z : 0.0f;
+                                    float clipFar  = hasKooima ? eyeViews[eye].far_z  : 0.0f;
                                     g_gsRenderer.renderEye(
                                         targetImage, swapFormat,
                                         xr.swapchain.width, xr.swapchain.height,
                                         tileOffsets[eye].first, tileOffsets[eye].second,
                                         renderW, renderH,
-                                        viewMat[eye].data(), projMat[eye].data());
+                                        viewMat[eye].data(), projMat[eye].data(),
+                                        /*transparentBg=*/false,
+                                        clipNear, clipFar, /*clipFadeFrac=*/0.15f);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,

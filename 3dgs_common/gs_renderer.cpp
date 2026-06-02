@@ -39,6 +39,8 @@ struct alignas(16) GsUniformBuffer {
     float tan_fovx;            // offset 152
     float tan_fovy;            // offset 156
     float clip_far;            // offset 160 — view-space far cull (0 = disabled)
+    float clip_fade_frac;      // offset 164 — soft-clip band as fraction of clip_far (0 = hard cut)
+    float clip_near;           // offset 168 — view-space near cull (0 = disabled)
 };
 static_assert(sizeof(GsUniformBuffer) == 176, "GsUniformBuffer must be 176 bytes");
 
@@ -862,7 +864,7 @@ uint32_t GsRenderer::gaussianCount() const { return numGaussians_; }
 
 void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                                 uint32_t vpWidth, uint32_t vpHeight,
-                                float clipFar)
+                                float clipNear, float clipFar, float clipFadeFrac)
 {
     GsUniformBuffer ub;
 
@@ -934,6 +936,10 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
 
     // Foreground-only far cull (view-space forward distance). 0 = disabled.
     ub.clip_far = clipFar;
+    // Soft-clip fade band as a fraction of clip_far. 0 = hard cut (legacy).
+    ub.clip_fade_frac = clipFadeFrac;
+    // Near cull (view-space forward distance). 0 = disabled.
+    ub.clip_near = clipNear;
 
     // Map and write
     void* mapped = nullptr;
@@ -957,13 +963,15 @@ void GsRenderer::renderEye(VkImage swapchainImage,
                            const float viewMatrix[16],
                            const float projMatrix[16],
                            bool transparentBg,
-                           float clipFarViewSpace)
+                           float clipNearViewSpace,
+                           float clipFarViewSpace,
+                           float clipFadeFrac)
 {
     if (!hasScene()) return;
 
     // Update uniform buffer with this eye's matrices
     updateUniforms(viewMatrix, projMatrix, viewportWidth, viewportHeight,
-                   clipFarViewSpace);
+                   clipNearViewSpace, clipFarViewSpace, clipFadeFrac);
 
     uint32_t N = numGaussians_;
     uint32_t groups256 = (N + 255) / 256;
@@ -1270,9 +1278,27 @@ void GsRenderer::renderEye(VkImage swapchainImage,
 // ═════════════════════════════════════════════════════════════════════════
 
 bool GsRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
-                               float hitPos[3], float maxDistance) const
+                               float hitPos[3], float maxDistance,
+                               const float viewMatrix[16],
+                               float clipNear, float clipFar) const
 {
     if (pickData_.empty()) return false;
+
+    // View-space forward axis (world) = R^T * (0,0,-1) = -(V[2], V[6], V[10]),
+    // where V is the column-major world->view matrix. Forward depth of a splat
+    // is dot(center - eye, fwd), directly comparable to the renderer's
+    // clipNear/clipFar (same units as the shader's p_view.z). Only used when a
+    // view matrix and a non-zero plane are supplied.
+    bool clipDepth = (viewMatrix != nullptr) && (clipNear > 0.0f || clipFar > 0.0f);
+    float fwd[3] = {0, 0, 0};
+    if (clipDepth) {
+        fwd[0] = -viewMatrix[2];
+        fwd[1] = -viewMatrix[6];
+        fwd[2] = -viewMatrix[10];
+        float fl = std::sqrt(fwd[0]*fwd[0] + fwd[1]*fwd[1] + fwd[2]*fwd[2]);
+        if (fl > 1e-6f) { fwd[0] /= fl; fwd[1] /= fl; fwd[2] /= fl; }
+        else clipDepth = false;
+    }
 
     // Front-to-back alpha accumulation pick: mimics how the renderer itself
     // composites splats, so the returned gaussian is the one at the "first
@@ -1291,6 +1317,17 @@ bool GsRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
         float dx = g.px - rayOrigin[0];
         float dy = g.py - rayOrigin[1];
         float dz = g.pz - rayOrigin[2];
+
+        // Visibility window: reject splats outside the rendered view-space depth
+        // range. Forward depth (along the view axis), not ray-parameter t, so the
+        // test matches the shader's geometric near/far culls exactly even for
+        // off-axis pick rays. Clipped (invisible) splats can't be recentered.
+        if (clipDepth) {
+            float fwdDepth = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
+            if (clipNear > 0.0f && fwdDepth < clipNear) continue;
+            if (clipFar  > 0.0f && fwdDepth > clipFar)  continue;
+        }
+
         float t = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
         if (t < 0.05f || t > maxDistance) continue;
 
