@@ -46,6 +46,8 @@ typedef struct Display3DView {
 	XrVector3f eye_display;      //!< Modified eye position in display space (after all factors)
 	XrVector3f eye_world;        //!< Eye position in world space (after display pose transform)
 	XrQuaternionf orientation;   //!< Display/camera orientation (same for both eyes)
+	float near_z;                //!< Resolved view-space near plane = ez - near_offset (clamped)
+	float far_z;                 //!< Resolved view-space far plane  = ez + far_offset (clamped)
 } Display3DView;
 
 // --- Functions ---
@@ -69,10 +71,12 @@ typedef struct Display3DView {
  * @param screen         Physical screen dimensions
  * @param tunables       View factors (or NULL for defaults: all 1.0)
  * @param display_pose   Display pose in world space (or NULL for identity)
- * @param clip_front     Pop-out clip as a fraction of the per-eye eye->display
- *                       (ZDP) distance: near = ez * (1 - clip_front).
- * @param clip_back      Recede clip as a fraction: far = ez * (1 + clip_back).
- *                       clip_back = 0 => far at the ZDP (foreground only).
+ * @param near_offset    Pop-out clip as an ABSOLUTE offset (in virtual-display-
+ *                       height / kooima-scaled units) in front of the per-eye
+ *                       eye->display (ZDP) distance: near = ez - near_offset.
+ * @param far_offset     Recede clip as an absolute offset: far = ez + far_offset.
+ *                       far_offset = 0 => far at the ZDP (foreground only).
+ *                       Offsets are absolute (vH multiples), NOT fractions of ez.
  * @param vulkan_flip_y  Single source of truth for the render-vs-pick frame.
  *                       Pass 1 from the RENDER path: the eyes, nominal viewer,
  *                       and display pose are Y-mirrored internally so the
@@ -91,8 +95,8 @@ display3d_compute_views(const XrVector3f *raw_eyes,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
-                               float clip_front,
-                               float clip_back,
+                               float near_offset,
+                               float far_offset,
                                int vulkan_flip_y,
                                Display3DView *out_views);
 
@@ -110,8 +114,8 @@ display3d_compute_views(const XrVector3f *raw_eyes,
  * @param screen         Physical screen dimensions
  * @param tunables       View factors (or NULL for defaults)
  * @param display_pose   Display pose in world space (or NULL for identity)
- * @param clip_front     See display3d_compute_views.
- * @param clip_back      See display3d_compute_views.
+ * @param near_offset    See display3d_compute_views.
+ * @param far_offset     See display3d_compute_views.
  * @param vulkan_flip_y  See display3d_compute_views (pass 0 for picking).
  * @param out_view       Output center view
  */
@@ -122,8 +126,8 @@ display3d_compute_center_view(const XrVector3f *raw_eyes,
                               const Display3DScreen *screen,
                               const Display3DTunables *tunables,
                               const XrPosef *display_pose,
-                              float clip_front,
-                              float clip_back,
+                              float near_offset,
+                              float far_offset,
                               int vulkan_flip_y,
                               Display3DView *out_view);
 
@@ -219,8 +223,9 @@ display3d_apply_eye_factors_n(const XrVector3f *raw_eyes,
  * @param screen         Physical screen dimensions
  * @param tunables       View factors (perspective_factor, virtual_display_height)
  * @param display_pose   Display pose in world space (or NULL for identity)
- * @param clip_front     Pop-out clip fraction: near = ez * (1 - clip_front).
- * @param clip_back      Recede clip fraction: far = ez * (1 + clip_back);
+ * @param near_offset    Pop-out clip as an absolute offset (vH/kooima-scaled
+ *                       units): near = ez - near_offset.
+ * @param far_offset     Recede clip as an absolute offset: far = ez + far_offset;
  *                       0 => far at the ZDP (foreground only).
  * @param out            Output view for this eye
  */
@@ -229,8 +234,8 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const Display3DScreen *screen,
                        const Display3DTunables *tunables,
                        const XrPosef *display_pose,
-                       float clip_front,
-                       float clip_back,
+                       float near_offset,
+                       float far_offset,
                        Display3DView *out);
 
 /*!

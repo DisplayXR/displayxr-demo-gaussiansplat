@@ -930,14 +930,16 @@ static void RenderThreadFunc(
                             tunables.perspective_factor = inputSnapshot.viewParams.perspectiveFactor;
                             tunables.virtual_display_height = inputSnapshot.viewParams.virtualDisplayHeight / inputSnapshot.viewParams.scaleFactor;
 
-                            // ZDP-relative clip: near/far placed a fixed fraction of the
-                            // per-eye eye->display distance in front of / behind the
-                            // convergence plane (ZDP). display3d_compute_view computes them
-                            // per-eye from eye.z, so they scale with the virtual display
-                            // (zoom) regardless of scene scale. Transparent mode clips at the
-                            // ZDP (clip_back = 0), matching the foreground-only behavior.
-                            const float clip_front = 0.5f;
-                            const float clip_back  = g_transparentBg.load() ? 0.0f : 2.0f;
+                            // ZDP-relative clip: near/far placed at fixed *absolute*
+                            // offsets (in virtual-display-height units) in front of /
+                            // behind each eye's perpendicular distance to the convergence
+                            // plane (ZDP). display3d_compute_view anchors them per-eye from
+                            // eye.z (near = ez - near_offset, far = ez + far_offset).
+                            // Transparent mode clips at the ZDP (far_offset = 0); opaque
+                            // pushes the far plane effectively to infinity (1000*vH).
+                            const float vH = tunables.virtual_display_height;
+                            const float near_offset = vH;
+                            const float far_offset  = g_transparentBg.load() ? 0.0f : 1000.0f * vH;
 
                             XrPosef displayPose;
                             XMVECTOR pOri = XMQuaternionRotationRollPitchYaw(
@@ -957,16 +959,19 @@ static void RenderThreadFunc(
                             display3d_compute_views(
                                 rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
-                                clip_front, clip_back, /*vulkan_flip_y=*/1, stereoViews);
+                                near_offset, far_offset, /*vulkan_flip_y=*/1, stereoViews);
 
                             // Cyclopean view for picking: same eyes/pose/factors, but the
                             // clean +Y-up world frame (vulkan_flip_y=0). Built here where the
                             // clean inputs are in scope; the pick path below just unprojects
                             // through it — no hand-rolled inverse, no manual Y mirror.
+                            // Pick projection only needs a well-conditioned frustum (the
+                            // unprojected ray is a full line, unaffected by near/far), so
+                            // use transparency-independent offsets regardless of mode.
                             display3d_compute_center_view(
                                 rawEyes, (uint32_t)eyeCount, &nominalViewer,
                                 &screen, &tunables, &displayPose,
-                                0.5f, 2.0f, /*vulkan_flip_y=*/0, &pickCenterView);
+                                vH, 1000.0f * vH, /*vulkan_flip_y=*/0, &pickCenterView);
                         }
 
                         // Double-click focus: center-eye ray through mouse, pick splat,
@@ -990,8 +995,18 @@ static void RenderThreadFunc(
                             float rayOrigin[3] = {rayOriginV.x, rayOriginV.y, rayOriginV.z};
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
+                            // Only recenter on splats that are actually visible: reject any
+                            // outside the rendered view-space window. Near plane = centerView
+                            // near_z (always active); far plane = the ZDP (eye_display.z) only
+                            // in transparent/foreground mode, else no far reject (opaque shows
+                            // everything behind the display). A full miss returns false -> no
+                            // recenter, which is the existing behavior.
+                            float pickClipNear = centerView.near_z;
+                            float pickClipFar  = g_transparentBg.load() ? centerView.eye_display.z : 0.0f;
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
-                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos)) {
+                            if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos, 100.0f,
+                                                          centerView.view_matrix,
+                                                          pickClipNear, pickClipFar)) {
                                 // Both endpoints stored in WORLD frame (the same frame as
                                 // inputSnapshot.cameraPosX/Y/Z and inputSnapshot.pitch/yaw)
                                 // so the slerp's writeback decodes back into world-frame
@@ -1069,20 +1084,32 @@ static void RenderThreadFunc(
                              xr->renderingModeIsRequestable[xr->currentModeIndex]);
                         bool foregroundClip = g_transparentBg.load() && standalone;
 
+                        // Soft foreground clip: fade splat opacity over the last
+                        // clipFadeFrac of the eye->ZDP distance instead of a hard
+                        // discard at the plane, so splat centers crossing the ZDP
+                        // roll off rather than pop. 0 reverts to the legacy hard cut.
+                        const float clipFadeFrac = 0.15f;
+
                         // Build per-eye view/projection matrices (column-major float[16]).
                         // Sized to the runtime's max view count so Quad mode (4 views) fits.
                         float viewMat[8][16], projMat[8][16];
+                        float clipNear[8] = {0}; // per-eye view-space near cull (0 = off)
                         float clipFar[8] = {0};  // per-eye view-space far cull (0 = off)
                         for (int eye = 0; eye < eyeCount; eye++) {
                             if (useAppProjection) {
                                 int srcEye = monoMode ? 0 : eye;
                                 memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
                                 memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
-                                // eye_display.z = eye->display-plane forward distance,
-                                // same world units as the shader's p_view.z.
+                                // near_z/far_z are the resolved per-eye view-space planes
+                                // (ez - near_offset / ez + far_offset), in the same units as
+                                // the shader's p_view.z. They drive the explicit geometric
+                                // culls — the projection-matrix planes do NOT clip splats.
+                                clipNear[eye] = stereoViews[srcEye].near_z;
+                                // Far cull stays gated on foreground (transparent + standalone)
+                                // mode; in opaque mode far_z = ez + 1000*vH is effectively
+                                // infinite anyway, so this just keeps the shell path untouched.
                                 if (foregroundClip) {
-                                    float cf = stereoViews[srcEye].eye_display.z;
-                                    clipFar[eye] = (cf > 0.2f) ? cf : 0.0f;  // never cull at/behind near
+                                    clipFar[eye] = stereoViews[srcEye].far_z;
                                 }
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
@@ -1123,7 +1150,7 @@ static void RenderThreadFunc(
                                         xr->swapchain.width, xr->swapchain.height,
                                         vpX, vpY, renderW, renderH,
                                         viewMat[eye], projMat[eye],
-                                        g_transparentBg.load(), clipFar[eye]);
+                                        g_transparentBg.load(), clipNear[eye], clipFar[eye], clipFadeFrac);
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,

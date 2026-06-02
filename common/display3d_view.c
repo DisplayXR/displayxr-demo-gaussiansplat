@@ -264,8 +264,8 @@ display3d_compute_view(const XrVector3f *processed_eye,
                        const Display3DScreen *screen,
                        const Display3DTunables *tunables,
                        const XrPosef *display_pose,
-                       float clip_front,
-                       float clip_back,
+                       float near_offset,
+                       float far_offset,
                        Display3DView *out)
 {
 	Display3DTunables t = tunables ? *tunables : display3d_default_tunables();
@@ -298,19 +298,29 @@ display3d_compute_view(const XrVector3f *processed_eye,
 	eye_world.z += disp_pos.z;
 	out->eye_world = eye_world;
 
-	// ZDP-relative clip planes: a fixed fraction of this eye's perpendicular
-	// distance to the display/convergence plane (ZDP), in front of / behind it.
-	// eye_scaled.z is that per-eye distance (== out->eye_display.z), so the
-	// planes are automatically per-eye and scale with the virtual display
-	// (zoom). clip_back = 0 => far sits at the ZDP (foreground-only, e.g.
-	// transparent mode). See proposal in the demo's clip-plane discussion.
-	float ez_clip = eye_scaled.z;
-	if (ez_clip <= 0.001f)
-		ez_clip = 0.65f;
-	float near_z = ez_clip * (1.0f - clip_front);
-	float far_z = ez_clip * (1.0f + clip_back);
+	// ZDP-relative clip planes: near/far placed at fixed *absolute* offsets in
+	// front of / behind this eye's perpendicular distance to the display/
+	// convergence plane (ZDP). eye_scaled.z is that per-eye distance (==
+	// out->eye_display.z) in the same kooima-scaled units as the offsets, so
+	// the planes are per-eye and the offsets are expressed in virtual-display-
+	// height (vH) units by the caller. near = ez - near_offset, far = ez +
+	// far_offset. far_offset = 0 => far sits at the ZDP (foreground-only, e.g.
+	// transparent mode). Offsets are absolute (vH multiples), NOT fractions of
+	// ez — large scenes no longer scale the band with ez.
+	float ez = eye_scaled.z;
+	float near_z = ez - near_offset;
+	float far_z = ez + far_offset;
 	if (near_z < 1.0e-4f)
 		near_z = 1.0e-4f;
+	// Guarantee a valid frustum (far strictly past near) even when ez is tiny
+	// and far_offset is 0 (transparent mode at near-degenerate eye distance).
+	if (far_z < near_z + 1.0e-4f)
+		far_z = near_z + 1.0e-4f;
+	// Expose the resolved view-space planes so the caller can drive the
+	// renderer's explicit geometric near/far culls (this splat rasterizer does
+	// not clip against the projection matrix planes — see GsRenderer::renderEye).
+	out->near_z = near_z;
+	out->far_z = far_z;
 
 	// Build view matrix + projection + FOV
 	build_view_matrix(out->view_matrix, disp_ori, eye_world);
@@ -517,8 +527,8 @@ display3d_compute_views(const XrVector3f *raw_eyes,
                                const Display3DScreen *screen,
                                const Display3DTunables *tunables,
                                const XrPosef *display_pose,
-                               float clip_front,
-                               float clip_back,
+                               float near_offset,
+                               float far_offset,
                                int vulkan_flip_y,
                                Display3DView *out_views)
 {
@@ -551,7 +561,7 @@ display3d_compute_views(const XrVector3f *raw_eyes,
 	// Compute each view via single-eye primitive
 	for (uint32_t i = 0; i < count; i++) {
 		display3d_compute_view(&processed[i], screen, &t,
-		                       pose, clip_front, clip_back,
+		                       pose, near_offset, far_offset,
 		                       &out_views[i]);
 	}
 
@@ -568,8 +578,8 @@ display3d_compute_center_view(const XrVector3f *raw_eyes,
                               const Display3DScreen *screen,
                               const Display3DTunables *tunables,
                               const XrPosef *display_pose,
-                              float clip_front,
-                              float clip_back,
+                              float near_offset,
+                              float far_offset,
                               int vulkan_flip_y,
                               Display3DView *out_view)
 {
@@ -599,7 +609,7 @@ display3d_compute_center_view(const XrVector3f *raw_eyes,
 	// center — exactly the average of the per-eye processed positions.
 	XrVector3f processed;
 	display3d_apply_eye_factors_n(&c, 1, nom, t.ipd_factor, t.parallax_factor, &processed);
-	display3d_compute_view(&processed, screen, &t, pose, clip_front, clip_back, out_view);
+	display3d_compute_view(&processed, screen, &t, pose, near_offset, far_offset, out_view);
 }
 
 // Column-major 4x4 * vec4.
@@ -624,10 +634,13 @@ display3d_selftest(void)
 	pose.position = (XrVector3f){0, 0, 0};
 	XrVector3f eye = {0, 0, 0.6f};
 
-	// Picking (clean) frame view.
+	// Picking (clean) frame view. Offsets are absolute (vH units); the round-
+	// trip/orientation checks below only need a valid frustum.
 	Display3DView v;
 	display3d_compute_center_view(&eye, 1, NULL, &screen, &t, &pose,
-	                              0.5f, 2.0f, /*vulkan_flip_y=*/0, &v);
+	                              t.virtual_display_height,
+	                              1000.0f * t.virtual_display_height,
+	                              /*vulkan_flip_y=*/0, &v);
 
 	// (a) Round-trip: project a world point, then unproject its NDC; the ray
 	//     must pass through the original point.

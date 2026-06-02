@@ -56,8 +56,16 @@ struct GsRenderer {
 
     // Raycast pick: find the nearest visible gaussian along a ray.
     // Returns true if a hit was found, with the gaussian center written to hitPos.
+    // When viewMatrix != nullptr and clipNear/clipFar > 0, candidates whose
+    // view-space forward depth (dot(center - eye, viewForward)) falls outside
+    // [clipNear, clipFar] are rejected — the SAME visibility window the renderer
+    // clips to (see renderEye), so splats clipped in front of the near plane (or
+    // behind the far plane in foreground mode) can never be picked/recentered.
+    // viewMatrix is the column-major world->view matrix used to build the ray.
     bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
-                      float hitPos[3], float maxDistance = 100.0f) const;
+                      float hitPos[3], float maxDistance = 100.0f,
+                      const float viewMatrix[16] = nullptr,
+                      float clipNear = 0.0f, float clipFar = 0.0f) const;
 
     // World-space axis-aligned bounding box of loaded splat centers.
     // Returns false if no scene is loaded; otherwise writes min/max xyz.
@@ -111,8 +119,16 @@ struct GsRenderer {
     // transparentBg=true makes the render shader output premultiplied alpha
     // (1 - T) so background-uncovered pixels are 0 — the runtime then strips
     // them on the chroma-key pass for desktop see-through.
+    // clipNearViewSpace>0 culls splats whose view-space forward distance is LESS
+    // than it (near plane: hide content popping toward the viewer). 0=off.
     // clipFarViewSpace>0 culls splats whose view-space forward distance exceeds
     // it (foreground-only mode: hide content behind the display plane). 0=off.
+    // NOTE: this splat rasterizer does NOT clip against the projection matrix's
+    // near/far planes (only ndc.xy + p_view.z are used downstream), so geometric
+    // near/far clipping MUST come through these explicit view-space culls.
+    // clipFadeFrac>0 softens the far cut into an opacity rolloff over the band
+    // [clipFarViewSpace*(1-frac), clipFarViewSpace] instead of a hard discard,
+    // removing the pop as a splat center crosses the ZDP. 0=hard cut (legacy).
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,
@@ -124,7 +140,9 @@ struct GsRenderer {
                    const float viewMatrix[16],
                    const float projMatrix[16],
                    bool transparentBg = false,
-                   float clipFarViewSpace = 0.0f);
+                   float clipNearViewSpace = 0.0f,
+                   float clipFarViewSpace = 0.0f,
+                   float clipFadeFrac = 0.0f);
 
     // Clean up all resources.
     void cleanup();
@@ -238,6 +256,7 @@ private:
     void dispatchPrecompCov3d();
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
-                        float clipFar = 0.0f);
+                        float clipNear = 0.0f, float clipFar = 0.0f,
+                        float clipFadeFrac = 0.0f);
     void cleanupScene();
 };
