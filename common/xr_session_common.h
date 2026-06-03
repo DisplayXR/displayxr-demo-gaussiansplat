@@ -28,6 +28,7 @@
 #include <openxr/XR_EXT_win32_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_workspace_file_dialog.h>
+#include <openxr/XR_EXT_atlas_capture.h>
 #include <DirectXMath.h>
 #include <vector>
 #include <string>
@@ -123,6 +124,11 @@ struct XrSessionManager {
     // Display rendering mode control (XR_EXT_display_info v7)
     PFN_xrRequestDisplayRenderingModeEXT pfnRequestDisplayRenderingModeEXT = nullptr;
     PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+
+    // XR_EXT_atlas_capture (W6 of #396): the 'I' key routes through the runtime,
+    // which reads back its own atlas — no app-side GPU readback.
+    bool hasAtlasCaptureExt = false;
+    PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
     // Canvas sub-rect (XR_EXT_win32_window_binding / XR_EXT_cocoa_window_binding)
     PFN_xrSetSharedTextureOutputRectEXT pfnSetSharedTextureOutputRectEXT = nullptr;

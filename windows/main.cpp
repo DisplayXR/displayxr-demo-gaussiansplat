@@ -242,8 +242,10 @@ static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH
         MODE_BTN_WIDTH_FRACTION, MODE_BTN_HEIGHT_FRACTION);
 }
 
-// Atlas capture helpers live in test_apps/common/atlas_capture* — see
-// dxr_capture::CaptureAtlasRegionVk / TriggerCaptureFlash / MakeCapturePath.
+// Atlas capture is runtime-owned via xrCaptureAtlasEXT (XR_EXT_atlas_capture).
+// App-side helpers (filename numbering + flash overlay) live in
+// common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
+// TriggerCaptureFlash / PostFlashRequest.
 
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
@@ -1157,52 +1159,47 @@ static void RenderThreadFunc(
                                     (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
                             }
 
-                            // 'I' key: dump the rendered atlas (cols × rows × renderW × renderH)
-                            // to %USERPROFILE%\Pictures\DisplayXR\<scene>-<n>_<cols>x<rows>.png.
-                            // Atlas dims come from the current rendering mode's tile layout
-                            // and view scale — works for mono (1×1), SBS (2×1), and any other
-                            // layout the runtime advertises. Filename auto-increments.
+                            // 'I' key: snapshot the multi-view atlas the runtime
+                            // composes for this session via xrCaptureAtlasEXT
+                            // (XR_EXT_atlas_capture, W6 of #396). The runtime owns
+                            // the readback — no app-side staging texture. Works for
+                            // any multi-view layout the runtime advertises; skipped
+                            // for mono (1×1). Filename auto-increments. The prefix
+                            // has no ".png"; the runtime appends "_atlas.png".
                             if (g_captureAtlasRequested.exchange(false)) {
-                                if (hasGsScene) {
-                                    uint32_t atlasW = cols * renderW;
-                                    uint32_t atlasH = rows * renderH;
-                                    if (atlasW <= xr->swapchain.width &&
-                                        atlasH <= xr->swapchain.height) {
-                                        std::string sceneName;
-                                        {
-                                            std::lock_guard<std::mutex> lock(g_sceneMutex);
-                                            sceneName = g_loadedFileName;
-                                        }
-                                        // Strip extension from scene filename
-                                        // (e.g. "butterfly.spz" → "butterfly").
-                                        auto dot = sceneName.find_last_of('.');
-                                        std::string stem = (dot == std::string::npos)
-                                            ? sceneName : sceneName.substr(0, dot);
-                                        if (stem.empty()) stem = "scene";
-                                        std::string outPath = dxr_capture::MakeCapturePath(
-                                            stem, cols, rows);
-                                        // GS writes via compute imageStore — bytes are
-                                        // linear even on an sRGB swapchain; tell the helper
-                                        // to mirror the runtime's display-side decode.
-                                        bool ok = dxr_capture::CaptureAtlasRegionVk(
-                                            vkDevice, physDevice,
-                                            graphicsQueue, renderCmdPool,
-                                            (*swapchainVkImages)[imageIndex],
-                                            (int)colorFormat,
-                                            xr->swapchain.width, xr->swapchain.height,
-                                            0, 0, atlasW, atlasH, outPath,
-                                            /*linearBytesInSrgbImage=*/true);
-                                        if (ok) {
-                                            LOG_INFO("Captured %ux%u (%ux%u tiles) -> %s",
-                                                     atlasW, atlasH, cols, rows, outPath.c_str());
-                                            dxr_capture::PostFlashRequest(hwnd);
-                                        }
+                                if (!hasGsScene) {
+                                    LOG_WARN("Capture skipped: no scene loaded");
+                                } else if (cols <= 1 && rows <= 1) {
+                                    LOG_WARN("Capture skipped: mono (1×1) layout");
+                                } else if (xr->pfnCaptureAtlasEXT &&
+                                           xr->session != XR_NULL_HANDLE) {
+                                    std::string sceneName;
+                                    {
+                                        std::lock_guard<std::mutex> lock(g_sceneMutex);
+                                        sceneName = g_loadedFileName;
+                                    }
+                                    // Strip extension from scene filename
+                                    // (e.g. "butterfly.spz" → "butterfly").
+                                    auto dot = sceneName.find_last_of('.');
+                                    std::string stem = (dot == std::string::npos)
+                                        ? sceneName : sceneName.substr(0, dot);
+                                    if (stem.empty()) stem = "scene";
+                                    std::string prefix = dxr_capture::MakeCaptureAtlasPrefix(
+                                        stem, cols, rows);
+                                    XrAtlasCaptureInfoEXT info = {XR_TYPE_ATLAS_CAPTURE_INFO_EXT};
+                                    info.next = nullptr;
+                                    info.stage = XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT;
+                                    strncpy_s(info.pathPrefix, prefix.c_str(), _TRUNCATE);
+                                    XrResult cr = xr->pfnCaptureAtlasEXT(xr->session, &info, nullptr);
+                                    if (XR_SUCCEEDED(cr)) {
+                                        LOG_INFO("Atlas capture requested -> %s_atlas.png",
+                                                 prefix.c_str());
+                                        dxr_capture::PostFlashRequest(hwnd);
                                     } else {
-                                        LOG_WARN("Capture skipped: atlas %ux%u exceeds swapchain %ux%u",
-                                                 atlasW, atlasH, xr->swapchain.width, xr->swapchain.height);
+                                        LOG_WARN("xrCaptureAtlasEXT failed: 0x%x", (unsigned)cr);
                                     }
                                 } else {
-                                    LOG_WARN("Capture skipped: no scene loaded");
+                                    LOG_WARN("Capture skipped: XR_EXT_atlas_capture not available");
                                 }
                             }
 
