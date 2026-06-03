@@ -41,11 +41,6 @@ endif()
 
 add_executable(gaussian_splatting_handle_vk_macos
     main.mm
-    # Vulkan host-readback path for the 'I' key atlas capture. Lives in
-    # common/ but isn't part of sr_common_base (which intentionally doesn't
-    # pull in Vulkan headers); added directly to the executable, mirroring
-    # how windows/CMakeLists.txt does it.
-    ${CMAKE_SOURCE_DIR}/common/atlas_capture_vk.cpp
 )
 
 target_include_directories(gaussian_splatting_handle_vk_macos PRIVATE

@@ -53,12 +53,16 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME) == 0) {
             xr.hasFileDialogExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
+            xr.hasAtlasCaptureExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_win32_window_binding: %s", xr.hasWin32WindowBindingExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -75,6 +79,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasFileDialogExt) {
         enabledExtensions.push_back(XR_EXT_WORKSPACE_FILE_DIALOG_EXTENSION_NAME);
+    }
+    if (xr.hasAtlasCaptureExt) {
+        enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -157,6 +164,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             (PFN_xrVoidFunction*)&xr.pfnRequestFilePickerEXT);
         LOG_INFO("xrRequestFilePickerEXT: %s",
             xr.pfnRequestFilePickerEXT ? "resolved" : "NULL");
+    }
+
+    // XR_EXT_atlas_capture (W6 of #396): resolve the runtime-owned capture entry.
+    if (xr.hasAtlasCaptureExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT",
+            (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
+        LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;

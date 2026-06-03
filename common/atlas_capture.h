@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: BSL-1.0
 /*!
  * @file
- * @brief  In-app multi-view atlas capture (the 'I' key feature).
+ * @brief  App-side helpers for the runtime-owned atlas capture (the 'I' key).
  *
- * Reads back a sub-rect of an OpenXR swapchain image to host memory and
- * writes a PNG via stb_image_write. Captures land in the user's Pictures
- * folder and auto-increment as `<stem>-<N>_<cols>x<rows>.png`.
+ * The GPU→CPU readback now lives in the runtime: the app calls
+ * `xrCaptureAtlasEXT` (XR_EXT_atlas_capture) and the runtime writes the PNG
+ * from the compositor's own atlas image — no app-side staging texture. What
+ * remains app-side is purely UX: output-path / filename numbering and the
+ * platform white-flash overlay. These live in `atlas_capture.cpp` (Windows)
+ * and `atlas_capture_macos.mm` (macOS); apps link exactly one.
  *
- * Each backend (D3D11/D3D12/GL/Metal/Vulkan) lives in its own `.cpp`/`.mm`
- * and is only compiled in by apps that need it. Filename helpers and the
- * platform flash overlay live in `atlas_capture.cpp` (Windows) and
- * `atlas_capture_macos.mm` (macOS).
+ * Captures land in the user's Pictures folder and auto-increment as
+ * `<stem>-<N>_<cols>x<rows>_atlas.png` (the runtime appends "_atlas.png" to
+ * the prefix returned by MakeCaptureAtlasPrefix).
  */
 
 #pragma once
@@ -20,32 +22,7 @@
 #include <string>
 
 #ifdef _WIN32
-#include <windows.h>
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-struct ID3D11Texture2D;
-struct ID3D12Device;
-struct ID3D12CommandQueue;
-struct ID3D12Resource;
-// DXGI_FORMAT is intentionally NOT forward-declared — it's an enum in
-// dxgiformat.h and any redeclaration here would clash with includers
-// that already pulled in the real header. The D3D readback helpers
-// don't take format params; they query it from the texture itself.
-#endif
-
-// Vulkan handles — forward-declare so the header doesn't pull in vulkan.h.
-// VK_DEFINE_HANDLE expands to the same typedef shape, so these are
-// compatible whether or not the caller has also included vulkan.h.
-//
-// VkFormat is intentionally NOT forward-declared (it's an enum in vulkan.h
-// and a redeclaration as `int` would conflict). The Vulkan helper takes
-// the format as a plain `int` — cast `(int)VK_FORMAT_…` at the call site.
-#ifndef VULKAN_CORE_H_
-typedef struct VkDevice_T*         VkDevice;
-typedef struct VkPhysicalDevice_T* VkPhysicalDevice;
-typedef struct VkQueue_T*          VkQueue;
-typedef struct VkCommandPool_T*    VkCommandPool;
-typedef struct VkImage_T*          VkImage;
+#include <windows.h>  // HWND for the flash overlay
 #endif
 
 namespace dxr_capture {
@@ -71,6 +48,14 @@ int NextCaptureNum(const std::string& dir,
 std::string MakeCapturePath(const std::string& stem,
                             uint32_t cols,
                             uint32_t rows);
+
+// Path PREFIX (no extension) for xrCaptureAtlasEXT, which appends "_atlas.png".
+// Numbers against existing "<stem>-<N>_<cols>x<rows>_atlas.png" files (the
+// runtime-produced names) so repeat captures accumulate instead of overwriting.
+// Returns "<dir>/<stem>-<N>_<cols>x<rows>" (no "_atlas", no ".png").
+std::string MakeCaptureAtlasPrefix(const std::string& stem,
+                                   uint32_t cols,
+                                   uint32_t rows);
 
 // ---------------------------------------------------------------------------
 // Visual feedback — brief white flash overlay (~250 ms fade).
@@ -106,92 +91,6 @@ inline void PostFlashRequest(HWND hwnd) {
 // to call from any thread — internally dispatches to the main queue, where
 // AppKit / Core Animation must be touched.
 void TriggerCaptureFlash(void* nsviewBridged);
-#endif
-
-// ---------------------------------------------------------------------------
-// API-specific readback. Each function copies the (rectX, rectY, rectW, rectH)
-// sub-rect of `srcImage` into a host-visible buffer, swaps BGRA → RGBA if
-// needed, and writes a PNG via stb_image_write. Blocks on queue idle for
-// simplicity (one-shot user action; not a per-frame path).
-//
-// Coordinates are top-left origin in image space. `srcImage{Width,Height}`
-// describe the full image; the rect must fit within it.
-// ---------------------------------------------------------------------------
-
-// `linearBytesInSrgbImage`: set true when the image was written via compute
-// `imageStore` to an sRGB-format swapchain. Compute writes skip Vulkan's
-// automatic linear→sRGB encoding even on sRGB images, so the raw bytes are
-// linear; the runtime's display chain effectively applies `srgbToLinear` to
-// them, and we mirror that here so the captured PNG matches what's on
-// screen. For render-pass-based callers (cube_handle_vk_*) the bytes are
-// already sRGB-encoded on store — leave this `false` (the default).
-bool CaptureAtlasRegionVk(VkDevice device,
-                          VkPhysicalDevice physDev,
-                          VkQueue queue,
-                          VkCommandPool cmdPool,
-                          VkImage srcImage,
-                          int srcFormat,  // VkFormat — cast at call site
-                          uint32_t srcImageWidth,
-                          uint32_t srcImageHeight,
-                          uint32_t rectX,
-                          uint32_t rectY,
-                          uint32_t rectW,
-                          uint32_t rectH,
-                          const std::string& outPath,
-                          bool linearBytesInSrgbImage = false);
-
-#ifdef _WIN32
-bool CaptureAtlasRegionD3D11(ID3D11Device* device,
-                             ID3D11DeviceContext* context,
-                             ID3D11Texture2D* srcTex,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
-
-bool CaptureAtlasRegionD3D12(ID3D12Device* device,
-                             ID3D12CommandQueue* queue,
-                             ID3D12Resource* srcTex,
-                             uint32_t srcImageWidth,
-                             uint32_t srcImageHeight,
-                             // Resource state on entry; we transition back
-                             // to it before returning (caller's lifecycle).
-                             int /*D3D12_RESOURCE_STATES*/ entryState,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
-#endif
-
-// OpenGL helper. Available on both Windows and macOS — the caller must have
-// a current GL context bound. Loads its own FBO/blit function pointers
-// internally (wglGetProcAddress on Windows; CGL on macOS — desktop GL has
-// these as core symbols).
-//
-// `srcTex` is a 2D color texture (typically the runtime's swapchain image).
-// `srcInternalFormat` is informational; the helper always reads as RGBA8.
-bool CaptureAtlasRegionGL(uint32_t srcTex,
-                          uint32_t srcImageWidth,
-                          uint32_t srcImageHeight,
-                          uint32_t rectX,
-                          uint32_t rectY,
-                          uint32_t rectW,
-                          uint32_t rectH,
-                          const std::string& outPath);
-
-#ifdef __APPLE__
-// Metal readback. `srcTex` is `id<MTLTexture>` (passed as void* to keep the
-// header Objective-C-free). `device` and `queue` likewise.
-bool CaptureAtlasRegionMetal(void* device,
-                             void* queue,
-                             void* srcTex,
-                             uint32_t rectX,
-                             uint32_t rectY,
-                             uint32_t rectW,
-                             uint32_t rectH,
-                             const std::string& outPath);
 #endif
 
 }  // namespace dxr_capture
