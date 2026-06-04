@@ -18,13 +18,22 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Cross-platform math helpers — Kooima projection, camera pose, view params.
-# These are the only sources that cleanly build on both macOS and Windows.
+# Off-axis Kooima projection math now comes from displayxr::math, pinned by tag
+# instead of vendored here (epic #396 W3). displayxr::math reuses whatever
+# OpenXR target the consumer provides, else fetches the headers itself.
+include(FetchContent)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v0.1.1
+    GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(displayxr_common)
+
+# App-local cross-platform helpers (view params + the Windows-only leia_math
+# reference). The Kooima projection sources moved to displayxr::math above.
 set(SR_COMMON_BASE_SOURCES
-    display3d_view.c
-    display3d_view.h
-    camera3d_view.c
-    camera3d_view.h
     view_params.h
     leia_math.h
 )
@@ -60,6 +69,10 @@ elseif(APPLE)
 endif()
 
 add_library(sr_common_base STATIC ${SR_COMMON_BASE_SOURCES})
+
+# Shared off-axis Kooima math (display3d_view / camera3d_view) — PUBLIC so the
+# headers propagate to every consumer of sr_common_base.
+target_link_libraries(sr_common_base PUBLIC displayxr::math)
 
 target_include_directories(sr_common_base PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
