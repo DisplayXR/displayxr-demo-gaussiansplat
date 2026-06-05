@@ -73,3 +73,5 @@ The `common/` and `openxr_includes/` directories are also used by other DisplayX
 ## License
 
 BSL-1.0 — see `LICENSE`.
+
+<!-- automerge bypass probe (safe to revert) -->
