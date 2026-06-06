@@ -1,12 +1,12 @@
 # Copyright 2025, Leia Inc.
 # SPDX-License-Identifier: BSL-1.0
 #
-# Standalone build (displayxr-demo-* repo). Sibling layout places
-# openxr headers at ../openxr_includes. Windows-only parts (D3D11 HUD,
-# DirectWrite text overlay, Win32 window manager, xr_session_common)
-# are guarded with if(WIN32) so the same library target can link on
-# macOS for demos that only need the cross-platform helpers.
-# Synced by publish-demo-<name>.yml.
+# Standalone build (displayxr-demo-* repo). The shared C++ scaffolding
+# (logging / input / window / xr_session_common / HUD / D3D11 renderer /
+# atlas-capture helper / stb) AND the off-axis Kooima math now come from
+# displayxr-common, pinned by tag instead of vendored here (epic #396 W3
+# math, W4 scaffolding). Only leia_math.h (app-local reference math) stays
+# in this directory.
 
 cmake_minimum_required(VERSION 3.21)
 project(sr_common LANGUAGES C CXX)
@@ -18,84 +18,34 @@ if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
 
-# Off-axis Kooima projection math now comes from displayxr::math, pinned by tag
-# instead of vendored here (epic #396 W3). displayxr::math reuses whatever
-# OpenXR target the consumer provides, else fetches the headers itself.
+# displayxr-common reuses whatever OpenXR target the consumer provides, else
+# populates the headers itself; the DisplayXR extension headers come from this
+# repo's vendored openxr_includes (keep it refreshed from displayxr-extensions).
 include(FetchContent)
 set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+get_filename_component(_dxr_ext_includes
+    "${CMAKE_CURRENT_SOURCE_DIR}/../openxr_includes" ABSOLUTE)
+set(DISPLAYXR_EXTENSIONS_INCLUDE_DIR "${_dxr_ext_includes}" CACHE PATH
+    "DisplayXR OpenXR extension headers for displayxr::common")
 FetchContent_Declare(
     displayxr_common
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v0.1.2
+    GIT_TAG v0.3.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
 
-# App-local cross-platform helpers (view params + the Windows-only leia_math
-# reference). The Kooima projection sources moved to displayxr::math above.
-set(SR_COMMON_BASE_SOURCES
-    view_params.h
-    leia_math.h
-)
-# Everything else in this library is Windows-only — input_handler.{cpp,h}
-# pulls in <windows.h> unconditionally, logging.cpp uses shell32, etc. Gate
-# them behind if(WIN32) so macOS demos that only need the math helpers can
-# still link sr_common_base.
-if(WIN32)
-    list(APPEND SR_COMMON_BASE_SOURCES
-        input_handler.cpp
-        input_handler.h
-        logging.cpp
-        logging.h
-        window_manager.cpp
-        window_manager.h
-        xr_session_common.cpp
-        xr_session_common.h
-    )
-endif()
-
-# Atlas capture (multi-view 'I' key) — generic helper goes in
-# sr_common_base; per-API back-ends are added directly to the
-# executable (they need Vulkan / Cocoa headers the lib does not pull in).
-# atlas_capture.cpp pulls in <windows.h> + shlobj; atlas_capture_macos.mm
-# pulls in Cocoa. Apps link exactly one — pick the right one per platform.
-list(APPEND SR_COMMON_BASE_SOURCES
-    atlas_capture.h
-)
-if(WIN32)
-    list(APPEND SR_COMMON_BASE_SOURCES atlas_capture.cpp)
-elseif(APPLE)
-    list(APPEND SR_COMMON_BASE_SOURCES atlas_capture_macos.mm)
-endif()
-
-add_library(sr_common_base STATIC ${SR_COMMON_BASE_SOURCES})
-
-# Shared off-axis Kooima math (display3d_view / camera3d_view) — PUBLIC so the
-# headers propagate to every consumer of sr_common_base.
-target_link_libraries(sr_common_base PUBLIC displayxr::math)
-
-target_include_directories(sr_common_base PUBLIC
+# Thin compatibility shims: the apps keep linking sr_common (Windows D3D11/HUD
+# stack) and sr_common_base (API-agnostic) — both now map onto
+# displayxr::common, which carries the platform gating, the d3d11/d2d1/dwrite
+# link closure, the dGPU-hint /INCLUDE option, and the single STB
+# implementation TUs itself.
+add_library(sr_common_base INTERFACE)
+target_link_libraries(sr_common_base INTERFACE displayxr::common)
+target_include_directories(sr_common_base INTERFACE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../openxr_includes
 )
 
-# D3D11-specific library (Windows only): extends base with D3D11 renderer,
-# text overlay, and HUD. Macs build without this target.
-if(WIN32)
-    add_library(sr_common STATIC
-        d3d11_renderer.cpp
-        d3d11_renderer.h
-        text_overlay.cpp
-        text_overlay.h
-        hud_renderer.cpp
-        hud_renderer.h
-    )
-    target_link_libraries(sr_common PUBLIC
-        sr_common_base
-        d3d11
-        dxgi
-        d3dcompiler
-        d2d1
-        dwrite
-    )
-endif()
+add_library(sr_common INTERFACE)
+target_link_libraries(sr_common INTERFACE sr_common_base)

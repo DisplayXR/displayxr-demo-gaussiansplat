@@ -82,6 +82,13 @@ static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
 // Global state
 static InputState g_inputState;
+// Standalone demo: bare TAB toggles the HUD (displayxr::common defaults to
+// SHIFT+TAB so runtime test apps don't shadow the workspace shell's
+// focus-cycle binding).
+static const bool g_inputInit = [] {
+    g_inputState.hudToggleRequiresShift = false;
+    return true;
+}();
 static std::mutex g_inputMutex;
 static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
@@ -1450,10 +1457,19 @@ static void RenderThreadFunc(
                     // buttons keep their proportions on any tile aspect.
                     // Empty regions stay alpha=0 (compositor honors source
                     // alpha for window-space layers).
+                    //
+                    // SOURCE_ALPHA on the projection layer: displayxr::common's
+                    // EndFrame family defaults projectionLayerFlags to 0, so
+                    // this demo passes the bit explicitly (its vendored copy
+                    // used to hardcode it) — required for the Ctrl+T
+                    // transparent-background path; a no-op when opaque.
                     EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount);
+                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
+                        0, 0, -1, -1,
+                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
                 } else if (rendered) {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount);
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount,
+                        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
                 } else {
                     XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
                     endInfo.displayTime = frameState.predictedDisplayTime;
