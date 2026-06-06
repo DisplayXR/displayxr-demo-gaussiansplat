@@ -25,18 +25,23 @@ extern "C" {
 #endif
 
 #define XR_EXT_spatial_workspace 1
-#define XR_EXT_spatial_workspace_SPEC_VERSION 9
+#define XR_EXT_spatial_workspace_SPEC_VERSION 23
 #define XR_EXT_SPATIAL_WORKSPACE_EXTENSION_NAME "XR_EXT_spatial_workspace"
 
-// Provisional XrStructureType values. The 1000999100..105 range is reserved for
+// Provisional XrStructureType values. The 1000999100..110 range is reserved for
 // this extension; final values reconcile with the Khronos registry before spec
 // freeze.
-#define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                  ((XrStructureType)1000999100)
-#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT              ((XrStructureType)1000999101)
-#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT               ((XrStructureType)1000999102)
-#define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999103)
-#define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                ((XrStructureType)1000999104)
-#define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                 ((XrStructureType)1000999105)
+#define XR_TYPE_WORKSPACE_CLIENT_INFO_EXT                   ((XrStructureType)1000999100)
+#define XR_TYPE_WORKSPACE_CAPTURE_REQUEST_EXT               ((XrStructureType)1000999101)
+#define XR_TYPE_WORKSPACE_CAPTURE_RESULT_EXT                ((XrStructureType)1000999102)
+#define XR_TYPE_WORKSPACE_CHROME_SWAPCHAIN_CREATE_INFO_EXT  ((XrStructureType)1000999103)
+#define XR_TYPE_WORKSPACE_CHROME_LAYOUT_EXT                 ((XrStructureType)1000999104)
+#define XR_TYPE_WORKSPACE_CLIENT_STYLE_EXT                  ((XrStructureType)1000999105)
+#define XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT  ((XrStructureType)1000999106)  // spec_version 13
+#define XR_TYPE_WORKSPACE_CURSOR_INFO_EXT                   ((XrStructureType)1000999107)  // spec_version 13
+#define XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT ((XrStructureType)1000999108)  // spec_version 17
+#define XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT                  ((XrStructureType)1000999109)  // spec_version 17
+#define XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT                  ((XrStructureType)1000999110)  // spec_version 22
 
 /*!
  * @brief Workspace-local identifier for a client.
@@ -226,44 +231,47 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientVisibilityEXT)(
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
 
-// ---- Hit-test (spec_version 3, region out added in spec_version 4) ----
+// ---- Per-client frame-rate cap (spec_version 14) ----
 
 /*!
- * @brief Spatial raycast hit-test against workspace windows.
+ * @brief Cap a workspace client's xrWaitFrame return cadence.
  *
- * Translates a screen-space cursor (display pixels, origin top-left) to a
- * client window hit. The runtime intersects an eye→cursor ray with each
- * workspace client's window quad and reports both the hit clientId and a
- * region classification (XrWorkspaceHitRegionEXT). The runtime classifies
- * geometry; the controller decides what each region means (focus on
- * CONTENT, drag on TITLE_BAR, close on CLOSE_BUTTON, resize on the
- * EDGE_RESIZE_* values, etc.).
+ * Pure mechanism. The runtime stores @p maxFps per client and applies
+ * @c multiplier = max(1, round(refresh_rate_hz / maxFps)) to the
+ * out_wake_time_ns and out_predicted_display_period_ns returned by the
+ * IPC predict_frame path. The client sleeps client-side; no server
+ * thread is parked. Effective only for IPC-mode (workspace) clients —
+ * in-process compositor consumers (e.g. WebXR bridge) are not affected.
  *
- * @param session       A valid workspace session.
- * @param cursorX       Cursor X in display pixels (origin top-left).
- * @param cursorY       Cursor Y in display pixels.
- * @param outClientId   Output: clientId of the hit window, or
- *                      XR_NULL_WORKSPACE_CLIENT_ID on background miss.
- * @param outLocalUV    Output: U,V on the content quad in [0,1] range,
- *                      origin top-left. Meaningful only when
- *                      *outHitRegion == CONTENT_EXT; 0,0 otherwise.
- * @param outHitRegion  Output: classification of the hit. May be
- *                      BACKGROUND_EXT (miss), CONTENT_EXT, TITLE_BAR_EXT,
- *                      a button, an EDGE_RESIZE_* value, TASKBAR_EXT, or
- *                      LAUNCHER_TILE_EXT.
+ * Policy is the controller's. A typical workspace controller might call
+ *   xrSetWorkspaceClientFrameRateCapEXT(session, prev_focus, 30.0f);
+ *   xrSetWorkspaceClientFrameRateCapEXT(session, new_focus, 0.0f);
+ * on every focus change, and 1.0f for minimized clients. Different
+ * workspaces (picture-in-picture, live thumbnails, accessibility) can
+ * pick different cadences without runtime changes.
  *
- * NOTE — hardcoded MVP key policy (consumed by xrEnumerateWorkspaceInputEventsEXT
- * documentation): TAB and DELETE are consumed by the runtime; ESC is
- * consumed when any window is maximized; everything else is delivered via
- * input event AND forwarded to the focused HWND.
+ * @param session   A valid workspace session.
+ * @param clientId  The client to cap. XR_NULL_WORKSPACE_CLIENT_ID is invalid.
+ * @param maxFps    Maximum xrWaitFrame return rate in Hz. 0.0f means
+ *                  uncapped (native refresh). Negative values are
+ *                  rejected with XR_ERROR_VALIDATION_FAILURE.
+ *
+ * The cap auto-resets to 0.0f on client disconnect; controllers must
+ * re-apply on reconnect. The runtime never lowers the cap on its own.
  */
-typedef XrResult (XRAPI_PTR *PFN_xrWorkspaceHitTestEXT)(
-    XrSession                session,
-    int32_t                  cursorX,
-    int32_t                  cursorY,
-    XrWorkspaceClientId     *outClientId,
-    XrVector2f              *outLocalUV,
-    XrWorkspaceHitRegionEXT *outHitRegion);
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientFrameRateCapEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    float                maxFps);
+
+// ---- Hit-test (removed in spec_version 22) ----
+//
+// xrWorkspaceHitTestEXT and its per-frame raycast were removed in spec_version 22.
+// The workspace controller now owns hit-testing entirely (eye→cursor ray vs.
+// window quads, region classification) and feeds the runtime only the resulting
+// cursor depth via xrSetWorkspaceCursorDepthEXT (see below). XrWorkspaceHitRegionEXT
+// is retained because POINTER / POINTER_MOTION events still carry a hitRegion the
+// controller fills in.
 
 // ---- Focus control (spec_version 4) ----
 
@@ -305,6 +313,11 @@ typedef enum XrWorkspaceInputEventTypeEXT {
     XR_WORKSPACE_INPUT_EVENT_FRAME_TICK_EXT     = 5, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_FOCUS_CHANGED_EXT  = 6, // spec_version 6
     XR_WORKSPACE_INPUT_EVENT_WINDOW_POSE_CHANGED_EXT = 7, // spec_version 8: runtime-driven pose / size change (edge resize, etc.)
+    XR_WORKSPACE_INPUT_EVENT_MODAL_OPEN_EXT      = 8, // spec_version 10: client opened a Win32 modal popup (refcounted, fires on 0→1 only)
+    XR_WORKSPACE_INPUT_EVENT_MODAL_CLOSE_EXT     = 9, // spec_version 10: client's last Win32 modal popup closed (refcounted, fires on 1→0 only)
+    XR_WORKSPACE_INPUT_EVENT_FILE_PICKER_REQUEST_EXT = 10, // spec_version 11: a workspace client called xrRequestFilePickerEXT — fetch full info via xrGetFilePickerRequestEXT, deliver result via xrCompleteFilePickerEXT
+    XR_WORKSPACE_INPUT_EVENT_FULLSCREEN_TOGGLED_EXT  = 11, // spec_version 15: a workspace client's fullscreen/maximize state transitioned (runtime-driven, e.g. double-click title bar or F11)
+    XR_WORKSPACE_INPUT_EVENT_CLIENT_CONNECTED_EXT    = 12, // spec_version 16: a client connected (slot bound). The controller owns ALL per-client setup — initial pose (xrSetWorkspaceClientWindowPoseEXT), and over time chrome / style / focus / entry animation. The runtime does not draw the client until the controller has placed it (set_pose), so there is no flash regardless of controller latency.
     XR_WORKSPACE_INPUT_EVENT_TYPE_MAX_ENUM_EXT  = 0x7FFFFFFF
 } XrWorkspaceInputEventTypeEXT;
 
@@ -312,9 +325,10 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  * @brief One input event drained from the workspace input queue.
  *
  * Tagged C union — `eventType` selects the meaningful union member. Pointer
- * events carry the workspace hit-test result (clientId / region / UV) the
- * runtime computed at drain time, so the controller does not need to call
- * xrWorkspaceHitTestEXT in the common case.
+ * events carry the cursor position (cursorX / cursorY in display pixels); as of
+ * spec_version 22 the controller owns hit-testing and fills in the
+ * clientId / region / UV fields itself from its own eye→cursor raycast (the
+ * runtime no longer computes them at drain time).
  *
  * Hardcoded MVP key policy (see xrEnumerateWorkspaceInputEventsEXT):
  *   - TAB and DELETE are consumed by the runtime (never delivered to the
@@ -326,7 +340,7 @@ typedef enum XrWorkspaceInputEventTypeEXT {
  * Pointer motion events (spec_version 6) deliver per-frame WM_MOUSEMOVE while
  * pointer capture is enabled. Controllers wanting hover feedback without
  * holding a button can opt in via xrEnableWorkspacePointerCaptureEXT (any
- * button), or poll xrWorkspaceHitTestEXT directly when capture is unset.
+ * button) and run their own hit-test over the per-frame cursor positions.
  *
  * Frame-tick events (spec_version 6) fire once per compositor frame so a
  * controller can pace per-frame work (animation interpolation, hover effects)
@@ -390,6 +404,10 @@ typedef struct XrWorkspaceInputEventEXT {
         } pointerMotion;
         struct {  // spec_version 6: vsync-aligned compositor frame tick
             uint64_t                timestampNs;     // host monotonic ns at frame compose
+            XrVector3f              viewerPosInDisplaySpace; // spec_version 20: viewer eye-midpoint, display space (m)
+            XrBool32                viewerTracked;   // spec_version 20: 1 if viewerPos is populated this frame
+            int32_t                 cursorX;         // spec_version 22: OS cursor X, display pixels, top-left origin
+            int32_t                 cursorY;         // spec_version 22: OS cursor Y. Controller runs its own hit-test over this per frame.
         } frameTick;
         struct {  // spec_version 6: workspace focused-client transition
             XrWorkspaceClientId     prevClientId;
@@ -406,6 +424,46 @@ typedef struct XrWorkspaceInputEventEXT {
             float                   widthMeters;
             float                   heightMeters;
         } windowPoseChanged;
+        struct {  // spec_version 10: Win32 modal popup state. Refcounted
+            // runtime-side across nested popups, so the controller sees
+            // exactly one MODAL_OPEN on 0→1 and one MODAL_CLOSE on 1→0
+            // per logical modal session, regardless of nesting depth.
+            // Companion to ADR-017 (Tier 0 modal-dialog strategy).
+            XrWorkspaceClientId     clientId;
+        } modal;
+        struct {  // spec_version 11: a workspace client called
+            // xrRequestFilePickerEXT (XR_EXT_workspace_file_dialog).
+            // Payload is intentionally small so the event batch stays
+            // under IPC_BUF_SIZE; the controller calls
+            // xrGetFilePickerRequestEXT(requestId, …) to retrieve the
+            // full XrFilePickerInfoEXT-equivalent, spawns its picker
+            // implementation, and delivers the result via
+            // xrCompleteFilePickerEXT.
+            XrWorkspaceClientId     clientId;
+            uint64_t                requestId;
+        } filePickerRequest;
+        struct {  // spec_version 15: a client's fullscreen/maximize state
+            // transitioned. Runtime-driven (double-click title bar, F11,
+            // xrRequestWorkspaceClientFullscreenEXT). The workspace
+            // controller typically wants to focus the toggled client when
+            // it enters fullscreen — focus policy lives in the controller
+            // (ADR-018), so the runtime emits the event and the controller
+            // calls xrSetWorkspaceFocusedClientEXT in response.
+            XrWorkspaceClientId     clientId;
+            XrBool32                isFullscreen;  // XR_TRUE on enter, XR_FALSE on restore
+        } fullscreenToggled;
+        struct {  // spec_version 16: a client connected and its slot is
+            // bound. The runtime no longer owns per-client policy (ADR-018):
+            // the controller responds by placing the client
+            // (xrSetWorkspaceClientWindowPoseEXT) and, per its own design,
+            // creating chrome, pushing style, choosing focus, and driving the
+            // entry animation. The runtime will NOT composite the client
+            // until the controller has placed it (first set_pose) AND it has
+            // committed a frame — so the controller's latency never produces
+            // a flash, and set_pose on this event is race-free (the slot is
+            // already bound when the event fires).
+            XrWorkspaceClientId     clientId;
+        } clientConnected;
     };
 } XrWorkspaceInputEventEXT;
 
@@ -754,6 +812,327 @@ typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceClientChromeLayoutEXT)(
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
 
+/*!
+ * @brief Per-frame pose update for a client's chrome quad (spec_version 12).
+ *
+ * @c xrSetWorkspaceClientChromeLayoutEXT is the cached-layout fast path: call
+ * it once on connect and whenever the chrome's *size*, hit regions, depth bias,
+ * or anchor flags change. It is documented as "per-frame IPC is not needed."
+ *
+ * This call is the pose-only complement, intended for fast-moving chrome: a
+ * cursor sprite whose Z depth tracks the per-frame hit-test, a focus-ring
+ * animation, a tooltip that follows the user's gaze, etc. Carries only the
+ * 3-vec + quaternion (~32 bytes on the wire) and overwrites the @c poseInClient
+ * field of the previously-cached layout. All other fields stay as last set.
+ *
+ * If no layout has been set for @p clientId yet, the call still records the
+ * pose; once the controller pushes a layout, the recorded pose is used as the
+ * starting value.
+ *
+ * @return XR_SUCCESS on success,
+ *         XR_ERROR_HANDLE_INVALID if @p clientId is unknown,
+ *         XR_ERROR_FEATURE_UNSUPPORTED if @p session is not the active workspace.
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrUpdateWorkspaceClientChromeLayerPoseEXT)(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    const XrPosef       *poseInClient);
+
+// ---- Workspace cursor (spec_version 13) ----
+//
+// The runtime owns the per-tile per-eye cursor render path (hit-Z disparity,
+// over-window dimming, multi-view composition). The CONTROLLER owns the
+// sprite content (any cursor look the controller wants — animated, branded,
+// shape-by-state, etc.). The split: runtime is mechanism, controller is
+// content.
+//
+// Flow:
+//   1. Controller creates a session-global cursor swapchain via
+//      xrCreateWorkspaceCursorSwapchainEXT. This is a single-image color
+//      swapchain (acquire / wait / fill / release) like chrome swapchains
+//      but NOT bound to any specific client — it's owned by the session.
+//   2. Controller renders its sprite into the swapchain image once (or per
+//      frame for animation).
+//   3. Controller calls xrSetWorkspaceCursorEXT with the swapchain handle,
+//      hot spot (in sprite UV), physical size, and visibility flag. The
+//      runtime samples the swapchain texture in its existing per-tile
+//      cursor render pass.
+//   4. To hide the cursor without destroying the swapchain: call
+//      xrSetWorkspaceCursorEXT with visible=XR_FALSE (or swapchain=XR_NULL_HANDLE).
+//   5. To change cursor shape: render a new sprite into the swapchain
+//      (acquire/wait/UpdateSubresource/release). The runtime samples the
+//      latest released image automatically. Same swapchain — no re-set.
+//
+// Architectural memory: [[chrome-layers-not-for-globals]] — chrome layers
+// are per-client and tile-scissored in shell-mode atlases; not suitable
+// for cross-tile globals like cursor. This RPC pair is the right shape.
+
+/*!
+ * @brief Create-info for xrCreateWorkspaceCursorSwapchainEXT.
+ *
+ * Same shape as chrome swapchain create-info but the resulting swapchain is
+ * session-global, not bound to any workspace client.
+ */
+typedef struct XrWorkspaceCursorSwapchainCreateInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_SWAPCHAIN_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    int64_t          format;      // Graphics-API format (DXGI_FORMAT, VK_FORMAT, etc.)
+    uint32_t         width;
+    uint32_t         height;
+    uint32_t         sampleCount; // 1 if 0
+    uint32_t         mipCount;    // 1 if 0
+} XrWorkspaceCursorSwapchainCreateInfoEXT;
+
+/*!
+ * @brief Create a session-global swapchain to source the cursor sprite from.
+ *
+ * The returned swapchain behaves like any other OpenXR swapchain: caller
+ * acquires images, fills them (CPU upload or render-target draw), and
+ * releases. The runtime composes the latest-released image as the cursor
+ * sprite, scaled to @ref XrWorkspaceCursorInfoEXT::sizeMeters with the
+ * specified hot spot.
+ *
+ * Sample format choices: DXGI_FORMAT_R8G8B8A8_UNORM (linear alpha-blend),
+ * DXGI_FORMAT_R8G8B8A8_UNORM_SRGB (gamma alpha-blend). The runtime sample
+ * path uses linear blending; pre-multiplied alpha sprites blend correctly
+ * in either format.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad createInfo),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrCreateWorkspaceCursorSwapchainEXT)(
+    XrSession                                        session,
+    const XrWorkspaceCursorSwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                    *swapchain);
+
+/*!
+ * @brief Active cursor parameters.
+ *
+ * Pushed via xrSetWorkspaceCursorEXT. The runtime composes the sprite at the
+ * OS cursor position with per-eye disparity derived from the depth the
+ * controller pushes each frame via xrSetWorkspaceCursorDepthEXT.
+ */
+typedef struct XrWorkspaceCursorInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    XrSwapchain      swapchain;   // Source for cursor pixels; XR_NULL_HANDLE = hide
+    XrVector2f       hotSpot;     // Normalized UV [0,1] of the sprite's click point
+    float            sizeMeters;  // Physical size (width = height) in meters
+    XrBool32         visible;     // XR_FALSE hides without releasing the swapchain
+} XrWorkspaceCursorInfoEXT;
+
+/*!
+ * @brief Activate / update the workspace cursor.
+ *
+ * Call once on startup after creating the cursor swapchain and filling its
+ * first image. Call again whenever the controller wants to change hot spot,
+ * size, visibility, or swap to a different swapchain (e.g., for a different
+ * cursor shape). The runtime keeps the most recent info; per-frame rendering
+ * uses the cached state, so this is a low-frequency call (NOT per-frame).
+ *
+ * Setting @p info->visible to XR_FALSE OR @p info->swapchain to
+ * XR_NULL_HANDLE hides the cursor without tearing down anything; a
+ * subsequent call re-activates.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type / size),
+ *         XR_ERROR_HANDLE_INVALID (swapchain not a workspace-mode swapchain
+ *         or already destroyed), XR_ERROR_FEATURE_UNSUPPORTED (session not
+ *         in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorEXT)(
+    XrSession                       session,
+    const XrWorkspaceCursorInfoEXT *info);
+
+// ---- Cursor depth (spec_version 22; dimFactor added in spec_version 23) ----
+
+/*!
+ * @brief Per-frame cursor depth, supplied by the workspace controller.
+ *
+ * In spec_version 22 the runtime no longer raycasts to find the depth of the
+ * window under the cursor. The controller — which owns window placement and
+ * already runs its own eye→cursor hit-test — pushes the resulting depth here
+ * each frame. The runtime feeds @ref hitZMeters into its existing per-eye
+ * disparity math so the cursor sprite floats at the depth of what it points
+ * at, and uses @ref overWindow to dim the cursor over windows (crosstalk
+ * mitigation). When a modal grab pins the cursor to the zero-disparity plane,
+ * the controller pushes hitZMeters = 0.
+ *
+ * spec_version 23 adds @ref dimFactor: the controller — which owns cursor
+ * look-and-feel — pushes the over-window cursor body alpha rather than the
+ * runtime hardcoding it. Only applied when @ref overWindow is XR_TRUE; 1.0 =
+ * no dim, lower = more transparent (the previous runtime default was 0.30).
+ */
+typedef struct XrWorkspaceCursorDepthEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_CURSOR_DEPTH_EXT
+    const void* XR_MAY_ALIAS next;
+    float            hitZMeters;  // Ray-plane depth under cursor (meters); 0 = panel plane
+    XrBool32         overWindow;  // XR_TRUE when the cursor is over a window
+    float            dimFactor;   // (spec 23) over-window cursor body alpha [0,1]; 1 = no dim
+} XrWorkspaceCursorDepthEXT;
+
+/*!
+ * @brief Push the current cursor depth to the runtime.
+ *
+ * Call once per frame while the workspace cursor is visible (this IS a
+ * per-frame call, unlike xrSetWorkspaceCursorEXT). The runtime caches the
+ * most recent value and applies it to the next composited frame; cursor
+ * screen position itself is still owned by the runtime (OS cursor).
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceCursorDepthEXT)(
+    XrSession                        session,
+    const XrWorkspaceCursorDepthEXT *info);
+
+// ---- Workspace overlay (spec_version 17) ----
+//
+// A workspace overlay is a controller-pushed, non-client swapchain the runtime
+// composites at a controller-chosen docked position on the zero-disparity plane
+// (z = 0). It is the generic mechanism behind controller-owned display-spanning
+// UI such as a taskbar: the controller renders the UI into the swapchain and
+// tells the runtime where to dock it (normalized display anchor + sprite pivot)
+// and how big it is in physical meters. Unlike the cursor, the overlay has no
+// raycast depth and no per-eye disparity — at z = 0 the same sprite is drawn at
+// the same docked position in every atlas tile. Single global overlay slot per
+// session (mirrors the cursor); a subsequent set replaces the prior overlay.
+//
+// Architectural memory: [[chrome-layers-not-for-globals]] — chrome layers are
+// per-client and tile-scissored; not suitable for cross-tile globals. This RPC
+// pair (like the cursor's) is the right shape for display-spanning UI.
+
+/*!
+ * @brief Create-info for xrCreateWorkspaceOverlaySwapchainEXT.
+ *
+ * Same shape as the cursor swapchain create-info: the resulting swapchain is
+ * session-global, not bound to any workspace client.
+ */
+typedef struct XrWorkspaceOverlaySwapchainCreateInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_OVERLAY_SWAPCHAIN_CREATE_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    int64_t          format;      // Graphics-API format (DXGI_FORMAT, VK_FORMAT, etc.)
+    uint32_t         width;
+    uint32_t         height;
+    uint32_t         sampleCount; // 1 if 0
+    uint32_t         mipCount;    // 1 if 0
+} XrWorkspaceOverlaySwapchainCreateInfoEXT;
+
+/*!
+ * @brief Create a session-global swapchain to source overlay pixels from.
+ *
+ * Behaves like any other OpenXR swapchain: caller acquires images, fills them
+ * (CPU upload or render-target draw), and releases. The runtime composes the
+ * latest-released image as the overlay, scaled to @ref
+ * XrWorkspaceOverlayInfoEXT::sizeMeters and docked per its anchor/pivot.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad createInfo),
+ *         XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrCreateWorkspaceOverlaySwapchainEXT)(
+    XrSession                                         session,
+    const XrWorkspaceOverlaySwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                     *swapchain);
+
+/*!
+ * @brief Active overlay parameters.
+ *
+ * Pushed via xrSetWorkspaceOverlayEXT. The overlay is docked at z = 0 (zero
+ * disparity), so there is no per-eye disparity or raycast depth: @p anchor is a
+ * normalized position in display space ([0,1], origin top-left; e.g. {0.5,1.0}
+ * is bottom-center) and @p pivot is the normalized UV within the overlay sprite
+ * ([0,1]; e.g. {0.5,1.0} is the sprite's bottom-center) that lands on @p anchor.
+ * @p sizeMeters is the physical width/height of the overlay on the display.
+ */
+typedef struct XrWorkspaceOverlayInfoEXT {
+    XrStructureType  type;        // XR_TYPE_WORKSPACE_OVERLAY_INFO_EXT
+    const void* XR_MAY_ALIAS next;
+    XrSwapchain      swapchain;   // Source for overlay pixels; XR_NULL_HANDLE = hide
+    XrVector2f       anchor;      // Normalized display position [0,1] of the dock point
+    XrVector2f       pivot;       // Normalized sprite UV [0,1] mapped onto anchor
+    XrExtent2Df      sizeMeters;  // Physical width,height in meters
+    XrBool32         visible;     // XR_FALSE hides without releasing the swapchain
+    // spec_version 19: side-by-side stereo overlay. When XR_TRUE the swapchain
+    // image is treated as two halves — left half = left-eye content, right half
+    // = right-eye content — and the runtime samples the matching half per eye
+    // view (stretched to the full overlay footprint). The controller renders the
+    // SAME z=0 content into both halves except for elements it wants to appear
+    // stereoscopic (e.g. 3D app-icon SBS images), which differ between halves.
+    // XR_FALSE (default) = mono: the whole image is composited identically in
+    // every eye (zero disparity).
+    XrBool32         stereoSideBySide;
+    // spec_version 21: keyed multi-overlay support. The runtime keeps a small
+    // map of overlays keyed by overlayId and composites ALL live ids each frame
+    // in ascending-id z-order (lower id behind, higher id in front), so the
+    // taskbar, launcher, and a toast can show simultaneously. Each call targets
+    // exactly the slot named by overlayId: it creates the slot if new, replaces
+    // its parameters if it already exists, and — when visible is XR_FALSE OR
+    // swapchain is XR_NULL_HANDLE — removes that id from the map (the other
+    // overlays are untouched). overlayId 0 is the default slot: a controller
+    // that never sets the field sees exactly the pre-v21 single-overlay
+    // behavior (one slot, overwritten on every call).
+    uint32_t         overlayId;
+} XrWorkspaceOverlayInfoEXT;
+
+/*!
+ * @brief Activate / update a workspace overlay.
+ *
+ * Call once on startup after creating the overlay swapchain and filling its
+ * first image, then again whenever the controller wants to change anchor,
+ * pivot, size, visibility, or swap to a different swapchain. The runtime keeps
+ * the most recent info; per-frame rendering uses the cached state, so this is a
+ * low-frequency call (NOT per-frame).
+ *
+ * spec_version 21: each call targets the slot named by @p info->overlayId. The
+ * runtime keeps a small map of overlays keyed by id and composites all live ids
+ * each frame in ascending-id z-order, so multiple overlays (taskbar, launcher,
+ * toast, ...) coexist. Use distinct ids for overlays that must show at once;
+ * reuse an id to replace that overlay's parameters. overlayId 0 is the default
+ * slot, so a controller that never sets the field keeps the pre-v21 behavior of
+ * a single overlay overwritten on every call.
+ *
+ * Setting @p info->visible to XR_FALSE OR @p info->swapchain to XR_NULL_HANDLE
+ * removes the overlay named by @p info->overlayId without tearing down anything
+ * (other ids are untouched); a subsequent call re-activates that id.
+ *
+ * @return XR_SUCCESS, XR_ERROR_VALIDATION_FAILURE (bad info type / size),
+ *         XR_ERROR_HANDLE_INVALID (swapchain not a workspace-mode swapchain or
+ *         already destroyed), XR_ERROR_FEATURE_UNSUPPORTED (session not in
+ *         workspace IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceOverlayEXT)(
+    XrSession                        session,
+    const XrWorkspaceOverlayInfoEXT *info);
+
+// ---- Modal input grab (spec_version 18) ----
+
+/*!
+ * @brief Grab / release all user input for the workspace controller.
+ *
+ * While grabbed (@p grab == XR_TRUE) the runtime stops forwarding keyboard,
+ * mouse-button, and scroll-wheel input to the focused workspace client and
+ * routes every event to the controller through the public input-event ring
+ * (xrEnumerateWorkspaceInputEventsEXT): KEY, POINTER, and SCROLL events are
+ * delivered regardless of which client is focused or whether the cursor is
+ * over app content. This is the mechanism a controller uses to drive a modal
+ * UI it composites onto a workspace overlay (e.g. an app launcher band): the
+ * controller owns the input while its UI is up and releases the grab when the
+ * UI dismisses, restoring normal app forwarding.
+ *
+ * The grab is session-global (mirrors the cursor / overlay slots) and does NOT
+ * change focus — the previously focused client stays focused and simply stops
+ * receiving forwarded input until the grab is released. Idempotent: setting the
+ * same state twice is a no-op.
+ *
+ * @param session A valid workspace session (controller side).
+ * @param grab    XR_TRUE to grab input for the controller; XR_FALSE to release.
+ *
+ * @return XR_SUCCESS, XR_ERROR_FEATURE_UNSUPPORTED (session not in workspace
+ *         IPC mode).
+ */
+typedef XrResult (XRAPI_PTR *PFN_xrSetWorkspaceInputGrabEXT)(
+    XrSession session,
+    XrBool32  grab);
+
 // ---- Event-driven wakeup (spec_version 8) ----
 
 /*!
@@ -915,14 +1294,6 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientVisibilityEXT(
     XrWorkspaceClientId  clientId,
     XrBool32             visible);
 
-XRAPI_ATTR XrResult XRAPI_CALL xrWorkspaceHitTestEXT(
-    XrSession                session,
-    int32_t                  cursorX,
-    int32_t                  cursorY,
-    XrWorkspaceClientId     *outClientId,
-    XrVector2f              *outLocalUV,
-    XrWorkspaceHitRegionEXT *outHitRegion);
-
 XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceFocusedClientEXT(
     XrSession           session,
     XrWorkspaceClientId clientId);
@@ -983,6 +1354,33 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientChromeLayoutEXT(
     XrWorkspaceClientId                clientId,
     const XrWorkspaceChromeLayoutEXT  *layout);
 
+XRAPI_ATTR XrResult XRAPI_CALL xrUpdateWorkspaceClientChromeLayerPoseEXT(
+    XrSession            session,
+    XrWorkspaceClientId  clientId,
+    const XrPosef       *poseInClient);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceCursorSwapchainEXT(
+    XrSession                                        session,
+    const XrWorkspaceCursorSwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                    *swapchain);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorEXT(
+    XrSession                       session,
+    const XrWorkspaceCursorInfoEXT *info);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceCursorDepthEXT(
+    XrSession                        session,
+    const XrWorkspaceCursorDepthEXT *info);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrCreateWorkspaceOverlaySwapchainEXT(
+    XrSession                                         session,
+    const XrWorkspaceOverlaySwapchainCreateInfoEXT  *createInfo,
+    XrSwapchain                                     *swapchain);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceOverlayEXT(
+    XrSession                        session,
+    const XrWorkspaceOverlayInfoEXT *info);
+
 XRAPI_ATTR XrResult XRAPI_CALL xrAcquireWorkspaceWakeupEventEXT(
     XrSession  session,
     uint64_t  *outNativeHandle);
@@ -991,6 +1389,10 @@ XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceClientStyleEXT(
     XrSession                              session,
     XrWorkspaceClientId                    clientId,
     const XrWorkspaceClientStyleEXT       *style);
+
+XRAPI_ATTR XrResult XRAPI_CALL xrSetWorkspaceInputGrabEXT(
+    XrSession session,
+    XrBool32  grab);
 #endif
 
 #ifdef __cplusplus
