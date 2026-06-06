@@ -30,10 +30,13 @@
 #include <openxr/XR_EXT_cocoa_window_binding.h>
 #include <openxr/XR_EXT_display_info.h>
 #include <openxr/XR_EXT_atlas_capture.h>
+#include <openxr/XR_EXT_mcp_tools.h>
 
+#include <cctype>
 #include <cmath>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -927,6 +930,15 @@ struct AppXrSession {
     bool hasAtlasCaptureExt = false;
     PFN_xrCaptureAtlasEXT pfnCaptureAtlasEXT = nullptr;
 
+    // XR_EXT_mcp_tools (#32): viewer controls exposed as agent tools on the
+    // per-process MCP server the runtime hosts. Inert when the extension or
+    // the MCP capability gate (DISPLAYXR_MCP) is absent — never load-bearing.
+    bool hasMcpToolsExt = false;
+    PFN_xrSetMCPAppInfoEXT pfnSetMCPAppInfoEXT = nullptr;
+    PFN_xrRegisterMCPToolEXT pfnRegisterMCPToolEXT = nullptr;
+    PFN_xrGetMCPToolCallArgsEXT pfnGetMCPToolCallArgsEXT = nullptr;
+    PFN_xrSubmitMCPToolResultEXT pfnSubmitMCPToolResultEXT = nullptr;
+
     // Enumerated rendering mode info
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
@@ -956,6 +968,371 @@ static void UpdateTopBarButtonTitles(AppXrSession& xr) {
         }
         [g_modeButton setTitle:[NSString stringWithFormat:@"Mode: %s", name]];
     }
+}
+
+// ============================================================================
+// Agent tools (XR_EXT_mcp_tools, #32)
+// ============================================================================
+//
+// The viewer's controls are registered as MCP tools on the per-process MCP
+// server the runtime hosts; agents reach them via the displayxr-mcp adapter
+// (`--target pid:N`, or namespaced as `gaussiansplat__<tool>` through
+// `--target workspace`). Dispatch is event-based: a call arrives as
+// XrEventDataMCPToolCallEXT through PollEvents() — on the main loop, where
+// viewer state is consistent — and EVERY call is answered (the runtime fails
+// unanswered calls to the agent after ~5 s). The whole path is inert when the
+// extension or the MCP capability gate (DISPLAYXR_MCP) is absent.
+//
+// Tool arguments are flat JSON objects, scanned with the minimal helpers
+// below (mirrors the reference adopter cube_handle_metal_macos — no JSON
+// library; the schemas keep every argument top-level).
+
+static const char* kMcpAppId = "gaussiansplat"; // == manifest `id` (INV-10.1)
+
+static constexpr float kMcpRad2Deg = 57.2957795f;
+static constexpr float kMcpDeg2Rad = 0.0174532925f;
+static constexpr float kMcpMaxPitchRad = 1.5f;  // same clamp as mouse drag
+
+// Find the value position of `"key" :` in a flat JSON object. Returns NULL if
+// absent. Does not handle keys nested inside sub-objects or string values —
+// the registered schemas keep all arguments top-level.
+static const char* JsonFindValue(const char* json, const char* key) {
+    char quoted[96];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", key);
+    const char* p = json;
+    while ((p = strstr(p, quoted)) != nullptr) {
+        const char* q = p + strlen(quoted);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') {
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+            return q;
+        }
+        p = q;
+    }
+    return nullptr;
+}
+
+static bool JsonGetNumber(const char* json, const char* key, double* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v) return false;
+    char* end = nullptr;
+    double d = strtod(v, &end);
+    if (end == v) return false;
+    *out = d;
+    return true;
+}
+
+static bool JsonGetBool(const char* json, const char* key, bool* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v) return false;
+    if (strncmp(v, "true", 4) == 0)  { *out = true;  return true; }
+    if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+// Extract + unescape a JSON string value. Handles the standard escapes and
+// BMP \uXXXX (encoded back to UTF-8; surrogate halves degrade to '?').
+static bool JsonGetString(const char* json, const char* key, std::string* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v || *v != '"') return false;
+    out->clear();
+    for (const char* c = v + 1; *c; c++) {
+        if (*c == '"') return true;
+        if (*c != '\\') { out->push_back(*c); continue; }
+        c++;
+        switch (*c) {
+            case '"':  out->push_back('"');  break;
+            case '\\': out->push_back('\\'); break;
+            case '/':  out->push_back('/');  break;
+            case 'n':  out->push_back('\n'); break;
+            case 't':  out->push_back('\t'); break;
+            case 'r':  out->push_back('\r'); break;
+            case 'b':  out->push_back('\b'); break;
+            case 'f':  out->push_back('\f'); break;
+            case 'u': {
+                unsigned cp = 0;
+                for (int i = 1; i <= 4; i++) {
+                    char h = c[i];
+                    if (!isxdigit((unsigned char)h)) return false;
+                    cp = cp * 16 + (unsigned)(isdigit((unsigned char)h) ? h - '0'
+                                                                        : (tolower(h) - 'a' + 10));
+                }
+                c += 4;
+                if (cp < 0x80) {
+                    out->push_back((char)cp);
+                } else if (cp < 0x800) {
+                    out->push_back((char)(0xC0 | (cp >> 6)));
+                    out->push_back((char)(0x80 | (cp & 0x3F)));
+                } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                    out->push_back('?'); // unpaired surrogate
+                } else {
+                    out->push_back((char)(0xE0 | (cp >> 12)));
+                    out->push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                    out->push_back((char)(0x80 | (cp & 0x3F)));
+                }
+                break;
+            }
+            default: return false; // invalid escape
+        }
+    }
+    return false; // unterminated string
+}
+
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char b[8];
+                    snprintf(b, sizeof(b), "\\u%04x", c);
+                    out += b;
+                } else {
+                    out.push_back((char)c);
+                }
+        }
+    }
+    return out;
+}
+
+// Camera sub-object shared by get_status and set_camera responses.
+static std::string McpCameraJson() {
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"position\":[%.4f,%.4f,%.4f],\"yaw_deg\":%.2f,\"pitch_deg\":%.2f,\"zoom\":%.3f}",
+        g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ,
+        g_input.yaw * kMcpRad2Deg, g_input.pitch * kMcpRad2Deg,
+        g_input.viewParams.scaleFactor);
+    return buf;
+}
+
+// Declare app identity + register the viewer's tools. Called once after
+// session create. Descriptions are agent-facing API docs — state what the
+// tool does, the units, and the preconditions.
+static void RegisterAgentTools(AppXrSession& xr) {
+    if (!xr.hasMcpToolsExt || !xr.pfnSetMCPAppInfoEXT || !xr.pfnRegisterMCPToolEXT ||
+        !xr.pfnGetMCPToolCallArgsEXT || !xr.pfnSubmitMCPToolResultEXT)
+        return; // no agent surface — viewer runs identically
+
+    XrMCPAppInfoEXT appInfo = {XR_TYPE_MCP_APP_INFO_EXT};
+    strncpy(appInfo.appId, kMcpAppId, sizeof(appInfo.appId) - 1);
+    XrResult ar = xr.pfnSetMCPAppInfoEXT(xr.session, &appInfo);
+    if (XR_FAILED(ar)) {
+        // XR_ERROR_FEATURE_UNSUPPORTED = MCP capability gate off — expected.
+        LOG_INFO("xrSetMCPAppInfoEXT('%s'): %d — no agent surface", kMcpAppId, (int)ar);
+        return;
+    }
+
+    auto reg = [&](const char* name, const char* desc, const char* schema) {
+        XrMCPToolInfoEXT tool = {XR_TYPE_MCP_TOOL_INFO_EXT};
+        tool.name = name;
+        tool.description = desc;
+        tool.inputSchemaJson = schema;
+        XrResult tr = xr.pfnRegisterMCPToolEXT(xr.session, &tool);
+        if (XR_FAILED(tr)) LOG_WARN("xrRegisterMCPToolEXT('%s') failed: %d", name, (int)tr);
+    };
+
+    reg("load_splat",
+        "Load a Gaussian-splat scene from a file path (.ply or .spz), replacing the "
+        "currently loaded scene and auto-framing the camera on the main object. "
+        "Returns the loaded file and its splat count; an error result if the file "
+        "cannot be read or parsed.",
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"Path to the .ply or .spz scene file (absolute recommended).\"}},"
+        "\"required\":[\"path\"]}");
+
+    reg("get_status",
+        "Read the viewer's live state: loaded scene file and splat count, frames per "
+        "second, camera pose (world position in meters, yaw/pitch in degrees, zoom), "
+        "virtual display height in meters, active rendering mode, transparent-background "
+        "and auto-orbit flags, and whether the XR session is running. Requires no "
+        "arguments.",
+        "{\"type\":\"object\"}");
+
+    reg("set_camera",
+        "Set camera pose components absolutely; give any subset of the arguments and "
+        "the rest stay unchanged. position_x/y/z move the camera rig in world meters; "
+        "yaw_deg/pitch_deg aim it (pitch clamps to about +/-86 deg); zoom scales the "
+        "scene (1 = default, larger zooms in, minimum 0.1). Takes effect on the next "
+        "frame and is visually verifiable via capture_frame. Returns the applied "
+        "camera state.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"position_x\":{\"type\":\"number\"},"
+        "\"position_y\":{\"type\":\"number\"},"
+        "\"position_z\":{\"type\":\"number\"},"
+        "\"yaw_deg\":{\"type\":\"number\"},"
+        "\"pitch_deg\":{\"type\":\"number\"},"
+        "\"zoom\":{\"type\":\"number\",\"minimum\":0.1}}}");
+
+    reg("orbit",
+        "Rotate the camera by a relative amount: azimuth_deg yaws around the vertical "
+        "axis (positive matches the idle auto-orbit direction); elevation_deg tilts the "
+        "view up (positive) or down, clamped to about +/-86 deg. At least one argument "
+        "is required. Returns the new absolute yaw/pitch in degrees.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"azimuth_deg\":{\"type\":\"number\",\"description\":\"Relative yaw in degrees.\"},"
+        "\"elevation_deg\":{\"type\":\"number\",\"description\":\"Relative pitch in degrees.\"}}}");
+
+    reg("reset_camera",
+        "Reset the camera to the auto-framed pose of the loaded scene (or the world "
+        "origin if none is loaded): recenters position, levels pitch, restores default "
+        "zoom and depth. Applied on the next frame. Returns the pose being restored.",
+        "{\"type\":\"object\"}");
+
+    reg("set_auto_orbit",
+        "Enable or disable the idle auto-orbit turntable (when enabled, the view slowly "
+        "yaws after 10 seconds without input). Disable it before scripted camera moves "
+        "or captures that must hold still. Returns the new state.",
+        "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"}},"
+        "\"required\":[\"enabled\"]}");
+
+    LOG_INFO("Agent tools registered (appId=%s)", kMcpAppId);
+}
+
+// Execute one agent tool call and answer it. Runs on the main loop (from
+// PollEvents), so handlers touch viewer state directly with no locking.
+static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallEXT* call) {
+    if (!xr.pfnSubmitMCPToolResultEXT) return;
+
+    // Two-call idiom: the event's argsSize is the exact capacity needed
+    // (incl. NUL). A no-arg tool reports argsSize 0 — treat as "{}".
+    std::string args = "{}";
+    if (xr.pfnGetMCPToolCallArgsEXT && call->argsSize > 0) {
+        std::vector<char> buf(call->argsSize, '\0');
+        uint32_t needed = 0;
+        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId,
+                (uint32_t)buf.size(), &needed, buf.data())))
+            args.assign(buf.data());
+    }
+    const char* a = args.c_str();
+
+    XrBool32 ok = XR_TRUE;
+    std::string result;
+    char buf[768];
+
+    if (strcmp(call->toolName, "load_splat") == 0) {
+        std::string path;
+        if (!JsonGetString(a, "path", &path) || path.empty()) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"missing required string arg 'path'\"}";
+        } else if (!ValidateSceneFile(path)) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"not a readable .ply/.spz scene: '" + JsonEscape(path) + "'\"}";
+        } else if (!g_gsRenderer.loadScene(path.c_str())) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (corrupt or unsupported)\"}";
+        } else {
+            g_loadedFileName = GetPlyFilename(path);
+            ApplyAutoFitForLoadedScene();
+            snprintf(buf, sizeof(buf), "\",\"splat_count\":%u}", g_gsRenderer.gaussianCount());
+            result = "{\"file\":\"" + JsonEscape(path) + buf;
+            LOG_INFO("Agent loaded scene: %s (%u splats)",
+                     g_loadedFileName.c_str(), g_gsRenderer.gaussianCount());
+        }
+    } else if (strcmp(call->toolName, "get_status") == 0) {
+        const char* modeName = (xr.renderingModeCount > 0 &&
+            g_input.currentRenderingMode < xr.renderingModeCount &&
+            xr.renderingModeNames[g_input.currentRenderingMode][0] != '\0')
+            ? xr.renderingModeNames[g_input.currentRenderingMode] : "unknown";
+        double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0.0;
+        snprintf(buf, sizeof(buf),
+            "\",\"has_scene\":%s,\"splat_count\":%u,\"fps\":%.1f,\"camera\":%s,"
+            "\"virtual_display_height_m\":%.4f,"
+            "\"rendering_mode\":{\"index\":%u,\"name\":\"%s\"},"
+            "\"transparent_background\":%s,\"auto_orbit\":%s,\"orbiting_now\":%s,"
+            "\"session_running\":%s}",
+            g_gsRenderer.hasScene() ? "true" : "false",
+            g_gsRenderer.gaussianCount(), fps, McpCameraJson().c_str(),
+            g_input.viewParams.virtualDisplayHeight,
+            g_input.currentRenderingMode, modeName,
+            g_transparentBg ? "true" : "false",
+            g_input.animateEnabled ? "true" : "false",
+            g_input.animationActive ? "true" : "false",
+            xr.sessionRunning ? "true" : "false");
+        result = "{\"file\":\"" + JsonEscape(g_loadedFileName) + buf;
+    } else if (strcmp(call->toolName, "set_camera") == 0) {
+        double v;
+        bool any = false;
+        if (JsonGetNumber(a, "position_x", &v)) { g_input.cameraPosX = (float)v; any = true; }
+        if (JsonGetNumber(a, "position_y", &v)) { g_input.cameraPosY = (float)v; any = true; }
+        if (JsonGetNumber(a, "position_z", &v)) { g_input.cameraPosZ = (float)v; any = true; }
+        if (JsonGetNumber(a, "yaw_deg", &v))    { g_input.yaw = (float)(v * kMcpDeg2Rad); any = true; }
+        if (JsonGetNumber(a, "pitch_deg", &v)) {
+            float p = (float)(v * kMcpDeg2Rad);
+            if (p > kMcpMaxPitchRad) p = kMcpMaxPitchRad;
+            if (p < -kMcpMaxPitchRad) p = -kMcpMaxPitchRad;
+            g_input.pitch = p;
+            any = true;
+        }
+        if (JsonGetNumber(a, "zoom", &v)) {
+            float z = (float)v;
+            if (z < 0.1f) z = 0.1f;
+            g_input.viewParams.scaleFactor = z;
+            any = true;
+        }
+        if (!any) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"no recognized args (position_x/y/z, yaw_deg, pitch_deg, zoom)\"}";
+        } else {
+            g_input.transitioning = false;  // agent pose wins over a running focus transition
+            MarkUserInput(g_input);         // restart the auto-orbit idle countdown
+            result = "{\"camera\":" + McpCameraJson() + "}";
+        }
+    } else if (strcmp(call->toolName, "orbit") == 0) {
+        double az = 0.0, el = 0.0;
+        bool hasAz = JsonGetNumber(a, "azimuth_deg", &az);
+        bool hasEl = JsonGetNumber(a, "elevation_deg", &el);
+        if (!hasAz && !hasEl) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"need azimuth_deg and/or elevation_deg\"}";
+        } else {
+            g_input.yaw += (float)(az * kMcpDeg2Rad);
+            float p = g_input.pitch + (float)(el * kMcpDeg2Rad);
+            if (p > kMcpMaxPitchRad) p = kMcpMaxPitchRad;
+            if (p < -kMcpMaxPitchRad) p = -kMcpMaxPitchRad;
+            g_input.pitch = p;
+            g_input.transitioning = false;
+            MarkUserInput(g_input);
+            snprintf(buf, sizeof(buf), "{\"yaw_deg\":%.2f,\"pitch_deg\":%.2f}",
+                     g_input.yaw * kMcpRad2Deg, g_input.pitch * kMcpRad2Deg);
+            result = buf;
+        }
+    } else if (strcmp(call->toolName, "reset_camera") == 0) {
+        g_input.resetViewRequested = true;  // applied by UpdateCameraMovement next frame
+        snprintf(buf, sizeof(buf),
+            "{\"framed\":%s,\"position\":[%.4f,%.4f,%.4f],\"yaw_deg\":%.2f,"
+            "\"virtual_display_height_m\":%.4f}",
+            g_fitValid ? "true" : "false",
+            g_fitValid ? g_fitCenter[0] : 0.0f,
+            g_fitValid ? g_fitCenter[1] : 0.0f,
+            g_fitValid ? g_fitCenter[2] : 0.0f,
+            (g_fitValid ? g_fitYaw : 0.0f) * kMcpRad2Deg,
+            g_fitValid ? g_fitVHeight : kDefaultVirtualDisplayHeightM);
+        result = buf;
+    } else if (strcmp(call->toolName, "set_auto_orbit") == 0) {
+        bool enabled = false;
+        if (!JsonGetBool(a, "enabled", &enabled)) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"missing required boolean arg 'enabled'\"}";
+        } else {
+            g_input.animateEnabled = enabled;
+            g_input.animationActive = false;
+            g_input.lastInputTimeSec = NowSec(); // don't snap-start on enable
+            result = enabled ? "{\"auto_orbit\":true}" : "{\"auto_orbit\":false}";
+        }
+    } else {
+        ok = XR_FALSE;
+        result = std::string("{\"error\":\"unhandled tool '") + call->toolName + "'\"}";
+    }
+
+    xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result.c_str());
 }
 
 // Forward declarations for OpenXR functions (same as cube_handle_vk_macos)
@@ -996,6 +1373,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasCocoaWindowBinding = true;
         if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
+        if (strcmp(ext.extensionName, XR_EXT_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1005,6 +1383,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasCocoaWindowBinding) enabled.push_back(XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasAtlasCaptureExt) enabled.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    if (xr.hasMcpToolsExt) enabled.push_back(XR_EXT_MCP_TOOLS_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -1053,6 +1432,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasAtlasCaptureExt) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasEXT", (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasEXT: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // XR_EXT_mcp_tools (#32): resolve the agent-tool entry points.
+    if (xr.hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoEXT", (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfoEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolEXT", (PFN_xrVoidFunction*)&xr.pfnRegisterMCPToolEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsEXT", (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgsEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultEXT", (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResultEXT);
+        LOG_INFO("XR_EXT_mcp_tools entry points: %s",
+            (xr.pfnSetMCPAppInfoEXT && xr.pfnRegisterMCPToolEXT &&
+             xr.pfnGetMCPToolCallArgsEXT && xr.pfnSubmitMCPToolResultEXT) ? "resolved" : "NULL");
     }
 
     LOG_INFO("OpenXR initialized: %s", xr.systemName);
@@ -1223,6 +1613,10 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         }
     }
 
+    // XR_EXT_mcp_tools (#32): declare identity + register the agent tools.
+    // Inert (logs and returns) when the extension or MCP gate is absent.
+    RegisterAgentTools(xr);
+
     return true;
 }
 
@@ -1331,6 +1725,11 @@ static void PollEvents(AppXrSession& xr) {
                     rmc->previousModeIndex, rmc->currentModeIndex,
                     xr.renderingModeNames[rmc->currentModeIndex]);
             }
+        } else if (event.type == (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_EXT) {
+            // Agent invoked one of our registered tools (XR_EXT_mcp_tools).
+            // Execute + answer here on the main loop where viewer state is
+            // consistent; every call is answered (~5 s runtime timeout).
+            HandleMcpToolCall(xr, (const XrEventDataMCPToolCallEXT*)&event);
         }
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
     }
