@@ -69,6 +69,13 @@ mat2 compute_cov2d(vec3 cam) {
     mat3 cov2d = transpose(T) * Sigma * T;
     cov2d[0][0] += 0.3f;
     cov2d[1][1] += 0.3f;
+    // Vulkan Y-down raster flip (W7, #396): the splat center is written with
+    // pixel.y = ndc2Pix(-ndc.y) below, so the 2D ellipse must be reflected
+    // vertically to match — negate the xy off-diagonal. det (hence radius) and
+    // eigenvalues are unchanged; only the ellipse orientation reflects. Doing
+    // it here (not via a view-matrix reflection) keeps mouse pitch correct.
+    cov2d[0][1] = -cov2d[0][1];
+    cov2d[1][0] = -cov2d[1][0];
     return mat2(cov2d);
 }
 
@@ -188,7 +195,11 @@ void main() {
         return;
     }
 
-    vec2 uv = vec2(ndc2Pix(ndc.x, int(width)), ndc2Pix(ndc.y, int(height)));
+    // Vulkan Y-down raster flip (W7, #396): negate ndc.y when mapping to the
+    // pixel center so a +Y-up world renders upright without reflecting the view
+    // matrix (which would invert mouse pitch). Paired with the cov2d off-diagonal
+    // negation in compute_cov2d so the ellipse reflects with the center.
+    vec2 uv = vec2(ndc2Pix(ndc.x, int(width)), ndc2Pix(-ndc.y, int(height)));
 
     uvec4 bounding_box = uvec4(
         uint(clamp(int((uv.x - radii) / TILE_WIDTH), 0, tile_shape.x)),
