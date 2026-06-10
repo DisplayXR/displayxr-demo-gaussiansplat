@@ -15,6 +15,10 @@
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 
+// XR_EXT_view_rig (W7 of #396) detected + enabled by InitializeOpenXR. Demo-side
+// because displayxr::common's XrSessionManager doesn't carry view-rig state yet.
+bool XrViewRigExtAvailable();
+
 // Get Vulkan graphics requirements and set up Vulkan instance/device per OpenXR spec
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr);
 
