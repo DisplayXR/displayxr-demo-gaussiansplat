@@ -7,7 +7,17 @@
 
 #include "xr_session.h"
 #include "logging.h"
+#include <openxr/XR_EXT_view_rig.h>
 #include <cstring>
+
+// XR_EXT_view_rig (W7 of #396): the runtime owns the off-axis Kooima math and
+// returns render-ready XrView{pose, fov}; the app deletes its own. The flag
+// lives demo-side (file-static + accessor) because XrSessionManager comes from
+// displayxr::common, which doesn't carry view-rig state yet — upstream it there
+// and re-pin when the package adopts the extension.
+static bool s_hasViewRigExt = false;
+
+bool XrViewRigExtAvailable() { return s_hasViewRigExt; }
 
 #define XR_CHECK(call) \
     do { \
@@ -56,6 +66,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0) {
             xr.hasAtlasCaptureExt = true;
         }
+        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+            s_hasViewRigExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -63,6 +76,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_EXT_display_info: %s", xr.hasDisplayInfoExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_EXT_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_EXT_view_rig: %s", s_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -82,6 +96,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasAtlasCaptureExt) {
         enabledExtensions.push_back(XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME);
+    }
+    if (s_hasViewRigExt) {
+        enabledExtensions.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
