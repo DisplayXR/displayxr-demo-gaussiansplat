@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: BSL-1.0
 // Ported from 3DGS.cpp (https://github.com/shg8/3DGS.cpp)
 // Per-pixel tile-based alpha blending, writes to storage image.
+//
+// Cooperative shared-memory tiling (the Kerbl et al. / gsplat pattern): the
+// 256 threads of a 16x16 tile co-load a batch of up to 256 sorted gaussians
+// into shared memory, barrier, then every pixel composites that batch from
+// shared mem. This turns the naive "every one of 256 pixels reads each
+// fragment's ~40-byte attribute from GLOBAL memory" into one coalesced global
+// read per fragment + cheap shared reads — the dominant cost on a bandwidth-
+// bound mobile tile GPU (Adreno).
 
 #version 450
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
-
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
 
 layout (std430, set = 0, binding = 0) readonly buffer Vertices {
     VertexAttribute attr[];
@@ -32,6 +38,15 @@ layout (push_constant) uniform Constants {
 
 layout (local_size_x = TILE_WIDTH, local_size_y = TILE_HEIGHT, local_size_z = 1) in;
 
+#define WG_SIZE (TILE_WIDTH * TILE_HEIGHT)
+
+// One batch of cooperatively-loaded gaussian attributes (only the fields the
+// compositing loop reads). color stored as vec4 to dodge vec3 shared-array
+// alignment quirks; .w unused. ~40 bytes * 256 = ~10 KB shared.
+shared vec2 s_uv[WG_SIZE];
+shared vec4 s_conic_opacity[WG_SIZE];
+shared vec4 s_color[WG_SIZE];
+
 float linearToSrgb(float c) {
     if (c <= 0.0031308)
         return c * 12.92;
@@ -42,45 +57,72 @@ float linearToSrgb(float c) {
 void main() {
     uint tileX = gl_WorkGroupID.x;
     uint tileY = gl_WorkGroupID.y;
-    uint localX = gl_LocalInvocationID.x;
-    uint localY = gl_LocalInvocationID.y;
 
-    uvec2 curr_uv = uvec2(tileX * TILE_WIDTH + localX, tileY * TILE_HEIGHT + localY);
-    if (curr_uv.x >= width || curr_uv.y >= height) {
-        return;
-    }
+    uvec2 curr_uv = uvec2(tileX * TILE_WIDTH + gl_LocalInvocationID.x,
+                          tileY * TILE_HEIGHT + gl_LocalInvocationID.y);
+    uint thread_rank = gl_LocalInvocationIndex;  // 0 .. WG_SIZE-1
 
     uint tiles_width = ((width + TILE_WIDTH - 1) / TILE_WIDTH);
-
     uint start = boundaries[(tileX + tileY * tiles_width) * 2];
-    uint end = boundaries[(tileX + tileY * tiles_width) * 2 + 1];
+    uint end   = boundaries[(tileX + tileY * tiles_width) * 2 + 1];
+    uint num_frags = end - start;
+    uint num_batches = (num_frags + WG_SIZE - 1) / WG_SIZE;
+
+    // Out-of-bounds pixels still participate in cooperative loads + barriers
+    // (uniform control flow), they just don't composite or store.
+    bool inside = (curr_uv.x < width) && (curr_uv.y < height);
+    bool done = !inside;
 
     float T = 1.0f;
     vec3 c = vec3(0.0f);
 
-    for (uint i = start; i < end; i++) {
-        uint vertex_key = sorted_vertices[i];
-        vec2 uv = attr[vertex_key].uv;
-        vec2 distance = uv - vec2(curr_uv);
-        vec4 co = attr[vertex_key].conic_opacity;
-        float power = -0.5f * (co.x * distance.x * distance.x + co.z * distance.y * distance.y) - co.y * distance.x * distance.y;
+    for (uint b = 0; b < num_batches; b++) {
+        // Cooperative load: thread_rank fetches the (b*WG_SIZE + rank)-th
+        // sorted fragment for this tile into shared memory.
+        uint fetch = start + b * WG_SIZE + thread_rank;
+        if (fetch < end) {
+            uint vertex_key = sorted_vertices[fetch];
+            s_uv[thread_rank] = attr[vertex_key].uv;
+            s_conic_opacity[thread_rank] = attr[vertex_key].conic_opacity;
+            s_color[thread_rank] = vec4(attr[vertex_key].color_radii.xyz, 0.0f);
+        }
+        barrier();
 
-        if (power > 0.0f) {
-            continue;
+        if (!done) {
+            uint batch_count = min(uint(WG_SIZE), num_frags - b * WG_SIZE);
+            for (uint i = 0; i < batch_count; i++) {
+                vec2 distance = s_uv[i] - vec2(curr_uv);
+                vec4 co = s_conic_opacity[i];
+                float power = -0.5f * (co.x * distance.x * distance.x +
+                                       co.z * distance.y * distance.y)
+                              - co.y * distance.x * distance.y;
+                if (power > 0.0f) {
+                    continue;
+                }
+
+                float alpha = min(0.99f, co.w * exp(power));
+                if (alpha < 1.0f / 255.0f) {
+                    continue;
+                }
+
+                float test_T = T * (1 - alpha);
+                if (test_T < 0.0001f) {
+                    done = true;
+                    break;
+                }
+
+                c += s_color[i].xyz * alpha * T;
+                T = test_T;
+            }
         }
 
-        float alpha = min(0.99f, co.w * exp(power));
-        if (alpha < 1.0f / 255.0f) {
-            continue;
-        }
+        // All threads must finish reading shared before the next batch
+        // overwrites it.
+        barrier();
+    }
 
-        float test_T = T * (1 - alpha);
-        if (test_T < 0.0001f) {
-            break;
-        }
-
-        c += attr[vertex_key].color_radii.xyz * alpha * T;
-        T = test_T;
+    if (!inside) {
+        return;
     }
 
     // Apply sRGB gamma encoding if writing to an sRGB-format swapchain

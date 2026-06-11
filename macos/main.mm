@@ -1565,7 +1565,7 @@ static bool CreateVulkanDevice(VkPhysicalDevice pd, uint32_t qfi,
     qi.queueFamilyIndex = qfi; qi.queueCount = 1; qi.pQueuePriorities = &prio;
 
     VkPhysicalDeviceFeatures features = {};
-    features.shaderInt64 = VK_TRUE;
+    // shaderInt64 no longer needed — the 3dgs sort uses 32-bit packed keys.
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 
     VkDeviceCreateInfo ci = {};

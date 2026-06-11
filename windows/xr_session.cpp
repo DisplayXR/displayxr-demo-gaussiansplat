@@ -424,15 +424,13 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
     vkGetPhysicalDeviceFeatures2(physDevice, &supportedFeatures2);
 
     // Enable features required by 3DGS compute shaders (only if available)
+    // (shaderInt64 / Int64Atomics no longer needed — the 3dgs sort uses
+    // 32-bit packed keys.)
     VkPhysicalDeviceFeatures features = {};
-    features.shaderInt64 = supportedFeatures2.features.shaderInt64;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 
     VkPhysicalDeviceVulkan12Features features12 = {};
     features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
-    // 64-bit atomics are optional — sort.comp uses CAS fallback when unavailable
-    features12.shaderBufferInt64Atomics = supported12.shaderBufferInt64Atomics;
-    features12.shaderSharedInt64Atomics = supported12.shaderSharedInt64Atomics;
     // Required for the DisplayXR shell IPC path: the runtime imports the
     // service's per-client cross-process workspace_sync_fence as a VK
     // timeline semaphore so the service can ID3D11DeviceContext4::Wait on

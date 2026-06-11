@@ -2,19 +2,20 @@
 // SPDX-License-Identifier: BSL-1.0
 // Ported from VkRadixSort by Mirco Werner (https://github.com/MircoWerner/VkRadixSort)
 // via 3DGS.cpp. Radix sort scatter pass.
-// Uses CAS-based 64-bit atomic fallback for Apple/MoltenVK compatibility.
 
 #version 460
 #extension GL_GOOGLE_include_directive : enable
 #extension GL_KHR_shader_subgroup_basic : enable
 #extension GL_KHR_shader_subgroup_arithmetic : enable
 #extension GL_KHR_shader_subgroup_ballot : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
 
+// 32-bit keys + 32-bit flag words (Adreno has no shaderInt64). The radix sort
+// is identical; BITS=32 packs the WORKGROUP_SIZE per-bin flags into 32-bit
+// words (no uint64_t / flags1+flags2 CAS split needed).
 #define WORKGROUP_SIZE 256
 #define RADIX_SORT_BINS 256U
-#define BITS 64
-#define key_t uint64_t
+#define BITS 32
+#define key_t uint
 
 layout (constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
@@ -50,10 +51,9 @@ layout (std430, set = 0, binding = 4) buffer histograms {
 shared uint[RADIX_SORT_BINS / SUBGROUP_SIZE] sums;
 shared uint[RADIX_SORT_BINS] global_offsets;
 
-// CAS-based 64-bit flag storage: split into two 32-bit arrays
+// 32-bit flag words: WORKGROUP_SIZE thread flags packed into 32-bit ints.
 struct BinFlags {
-    uint flags1[WORKGROUP_SIZE / BITS];
-    uint flags2[WORKGROUP_SIZE / BITS];
+    uint flags[WORKGROUP_SIZE / BITS];
 };
 shared BinFlags[RADIX_SORT_BINS] bin_flags;
 
@@ -91,15 +91,14 @@ void main() {
     }
 
     const uint flags_bin = lID / BITS;
-    const uint64_t flags_bit = 1UL << (lID % BITS);
+    const uint flags_bit = 1u << (lID % BITS);
 
     for (uint index = 0; index < g_num_blocks_per_workgroup; index++) {
         uint elementId = wID * g_num_blocks_per_workgroup * WORKGROUP_SIZE + index * WORKGROUP_SIZE + lID;
 
         if (lID < RADIX_SORT_BINS) {
             for (int i = 0; i < WORKGROUP_SIZE / BITS; i++) {
-                bin_flags[lID].flags1[i] = 0U;
-                bin_flags[lID].flags2[i] = 0U;
+                bin_flags[lID].flags[i] = 0U;
             }
         }
         barrier();
@@ -113,8 +112,7 @@ void main() {
             payload_in = g_payload_in[elementId];
             binID = uint(element_in >> g_shift) & uint(RADIX_SORT_BINS - 1);
             binOffset = global_offsets[binID];
-            atomicAdd(bin_flags[binID].flags1[flags_bin], uint(flags_bit));
-            atomicAdd(bin_flags[binID].flags2[flags_bin], uint(flags_bit >> 32));
+            atomicAdd(bin_flags[binID].flags[flags_bin], flags_bit);
         }
         barrier();
 
@@ -122,13 +120,9 @@ void main() {
             uint prefix = 0;
             uint count = 0;
             for (uint i = 0; i < WORKGROUP_SIZE / BITS; i++) {
-                const uint flag1 = bin_flags[binID].flags1[i];
-                const uint flag2 = bin_flags[binID].flags2[i];
-                const uint full_count = bitCount(flag1) + bitCount(flag2);
-                const uint64_t f = flags_bit - 1;
-                const uint partial_bits1 = flag1 & uint(f);
-                const uint partial_bits2 = flag2 & uint(f >> 32);
-                const uint partial_count = bitCount(partial_bits1) + bitCount(partial_bits2);
+                const uint flag = bin_flags[binID].flags[i];
+                const uint full_count = bitCount(flag);
+                const uint partial_count = bitCount(flag & (flags_bit - 1u));
                 prefix += (i < flags_bin) ? full_count : 0U;
                 prefix += (i == flags_bin) ? partial_count : 0U;
                 count += full_count;

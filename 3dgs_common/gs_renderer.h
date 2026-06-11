@@ -161,6 +161,20 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t subgroupSize_ = 32;
+
+    // ── GPU timestamp profiling ──────────────────────────────────────────
+    // Per-stage VkQueryPool timestamps around each renderEye dispatch group
+    // (preprocess / prefix-sum / preprocess-sort / radix-sort / tile-boundary
+    // / render / blit) to pinpoint where the per-eye GPU time goes. Logged
+    // every kTsLogPeriod renderEye calls via GS_LOGI (logcat on Android,
+    // stdout on desktop). timestampPeriod_ == 0 → timestamps unsupported on
+    // this queue, profiling disabled.
+    static constexpr uint32_t kNumTimestamps = 8;
+    VkQueryPool tsPool_ = VK_NULL_HANDLE;
+    float timestampPeriod_ = 0.0f;   // ns per tick (0 = unsupported)
+    uint32_t tsValidBits_ = 0;       // valid high bits of the queue's timestamp
+    uint64_t frameCounter_ = 0;
+
     bool initialized_ = false;
     bool sceneLoaded_ = false;
     std::string loadedScenePath_;
@@ -181,8 +195,8 @@ private:
     GsBuffer prefixSumPingBuffer_;  // N * 4 bytes
     GsBuffer prefixSumPongBuffer_;  // N * 4 bytes
     GsBuffer totalSumHostBuffer_;   // 4 bytes (host-visible)
-    GsBuffer sortKeysEvenBuffer_;   // maxSort * 8 bytes
-    GsBuffer sortKeysOddBuffer_;    // maxSort * 8 bytes
+    GsBuffer sortKeysEvenBuffer_;   // maxSort * 4 bytes (32-bit packed keys)
+    GsBuffer sortKeysOddBuffer_;    // maxSort * 4 bytes
     GsBuffer sortValsEvenBuffer_;   // maxSort * 4 bytes
     GsBuffer sortValsOddBuffer_;    // maxSort * 4 bytes
     GsBuffer sortHistBuffer_;       // numWorkgroups * 256 * 4 bytes
@@ -245,6 +259,13 @@ private:
 
     // ── CPU pick data (compact: 20 bytes/gaussian) ─────────────────────
     std::vector<GsPickData> pickData_;
+
+    // Outlier-trimmed scene bbox (splat centers), cached at scene load.
+    // Used per-eye to compute the linear 16-bit sort-depth quantization range
+    // (see renderEye) — floaters outside it clamp to the range ends.
+    float sceneBBoxMin_[3] = {0, 0, 0};
+    float sceneBBoxMax_[3] = {0, 0, 0};
+    bool sceneBBoxValid_ = false;
 
     // ── Private methods ──────────────────────────────────────────────────
     bool createPipelines();

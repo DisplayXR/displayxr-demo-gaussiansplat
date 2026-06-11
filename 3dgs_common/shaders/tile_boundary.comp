@@ -7,10 +7,9 @@
 #extension GL_GOOGLE_include_directive : enable
 #include "common.glsl"
 
-#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
-
+// 32-bit packed keys: tile index is the high 16 bits (see preprocess_sort.comp).
 layout (std430, set = 0, binding = 0) readonly buffer SortedList {
-    uint64_t keys[];
+    uint keys[];
 };
 
 layout (std430, set = 0, binding = 1) writeonly buffer Out {
@@ -29,11 +28,11 @@ void main() {
         return;
     }
 
-    uint key = uint(keys[index] >> 32);
+    uint key = keys[index] >> 16;
     if (index == 0) {
         boundaries[key * 2] = index;
     } else {
-        uint prevKey = uint(keys[index - 1] >> 32);
+        uint prevKey = keys[index - 1] >> 16;
         if (key != prevKey) {
             boundaries[key * 2] = index;
             boundaries[prevKey * 2 + 1] = index;

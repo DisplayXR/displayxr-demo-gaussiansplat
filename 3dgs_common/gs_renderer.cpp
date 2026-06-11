@@ -12,6 +12,16 @@
 #include "gs_scene_loader.h"
 #include "gs_spz_loader.h"
 #include <cstdio>
+
+// On Android, printf() to stdout is NOT captured by logcat — only
+// __android_log_print is. Route renderer diagnostics through it so the
+// GPU-timestamp profiling actually shows up; desktop keeps stdout.
+#if defined(__ANDROID__)
+#  include <android/log.h>
+#  define GS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "gausssplat_vk_android", __VA_ARGS__)
+#else
+#  define GS_LOGI(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
+#endif
 #include <cstring>
 #include <cmath>
 #include <cfloat>
@@ -192,9 +202,32 @@ bool GsRenderer::init(VkInstance instance,
     subgroupSize_ = subgroupProps.subgroupSize;
     if (subgroupSize_ == 0) subgroupSize_ = 32;
 
+    // GPU timestamp support: timestampPeriod (ns/tick) is a device limit, but
+    // timestamps only work on a queue whose family reports timestampValidBits>0.
+    timestampPeriod_ = props2.properties.limits.timestampPeriod;
+    {
+        uint32_t qfCount = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(physDevice_, &qfCount, nullptr);
+        std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+        vkGetPhysicalDeviceQueueFamilyProperties(physDevice_, &qfCount, qfProps.data());
+        if (queueFamilyIndex < qfCount)
+            tsValidBits_ = qfProps[queueFamilyIndex].timestampValidBits;
+    }
+
     // Tile dimensions
     tileX_ = (width_ + 15) / 16;
     tileY_ = (height_ + 15) / 16;
+
+    // The 32-bit sort key carries the tile index in its high 16 bits
+    // (preprocess_sort.comp), so the tile grid must stay within 65536 tiles
+    // (= 16.7 Mpx per eye at 16x16 tiles — far above any current canvas).
+    if ((uint64_t)tileX_ * (uint64_t)tileY_ > 65536) {
+        fprintf(stderr,
+                "GsRenderer: %ux%u px = %u tiles exceeds the 16-bit sort tile "
+                "index (max 65536 tiles = 16.7 Mpx/eye)\n",
+                width_, height_, tileX_ * tileY_);
+        return false;
+    }
 
     // Create command pool
     VkCommandPoolCreateInfo poolInfo = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -206,9 +239,24 @@ bool GsRenderer::init(VkInstance instance,
         return false;
     }
 
+    // Timestamp query pool (one pool of kNumTimestamps, reset+reused per eye).
+    // Logging is throttled (one line per kTsLogPeriod renderEye calls) and
+    // auto-disabled when the queue lacks timestamp support.
+    if (timestampPeriod_ > 0.0f && tsValidBits_ > 0) {
+        VkQueryPoolCreateInfo qpci = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = kNumTimestamps;
+        if (vkCreateQueryPool(device_, &qpci, nullptr, &tsPool_) != VK_SUCCESS) {
+            tsPool_ = VK_NULL_HANDLE;
+            timestampPeriod_ = 0.0f;  // disable profiling
+        }
+    } else {
+        timestampPeriod_ = 0.0f;  // disable profiling
+    }
+
     initialized_ = true;
-    printf("GsRenderer: initialized (%ux%u, subgroup=%u, tiles=%ux%u)\n",
-           width_, height_, subgroupSize_, tileX_, tileY_);
+    GS_LOGI("GsRenderer: initialized (%ux%u, subgroup=%u, tiles=%ux%u, ts_period=%.2fns valid_bits=%u)",
+            width_, height_, subgroupSize_, tileX_, tileY_, timestampPeriod_, tsValidBits_);
     return true;
 }
 
@@ -254,9 +302,10 @@ bool GsRenderer::createPipelines()
         vkDestroyShaderModule(device_, mod, nullptr);
     }
 
-    // 4. preprocess_sort: set0 = {SSBO, SSBO, SSBO, SSBO}, push = uint
+    // 4. preprocess_sort: set0 = {SSBO, SSBO, SSBO, SSBO},
+    // push = {uint tileX, float depthMin, float invDepthRange}
     dslPreprocessSort_ = createDSLayout(device_, {S, S, S, S});
-    layoutPreprocessSort_ = createPipeLayout(device_, {dslPreprocessSort_}, sizeof(uint32_t));
+    layoutPreprocessSort_ = createPipeLayout(device_, {dslPreprocessSort_}, 3 * sizeof(uint32_t));
     {
         auto mod = createShaderModule(device_, preprocess_sort_comp_data,
                                       sizeof(preprocess_sort_comp_data));
@@ -315,6 +364,18 @@ bool GsRenderer::createPipelines()
                                       sizeof(render_comp_data));
         pipeRender_ = createComputePipeline(device_, layoutRender_, mod);
         vkDestroyShaderModule(device_, mod, nullptr);
+    }
+
+    // Launch gracefully when a pipeline can't link (e.g. a driver rejecting a
+    // shader feature) instead of crashing on the first dispatch.
+    const VkPipeline pipes[8] = {pipePrecompCov3d_, pipePreprocess_, pipePrefixSum_,
+                                 pipePreprocessSort_, pipeHist_,     pipeSort_,
+                                 pipeTileBoundary_,   pipeRender_};
+    for (int i = 0; i < 8; ++i) {
+        if (pipes[i] == VK_NULL_HANDLE) {
+            fprintf(stderr, "GsRenderer: compute pipeline %d failed to create\n", i);
+            return false;
+        }
     }
 
     printf("GsRenderer: 8 compute pipelines created\n");
@@ -377,11 +438,11 @@ bool GsRenderer::createBuffers()
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         hostVis);
 
-    // Sort key/value buffers (4x capacity)
+    // Sort key/value buffers (32-bit packed keys — see preprocess_sort.comp)
     sortKeysEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)maxSortInstances_ * 8, ssboUsage, devLocal);
+        (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
     sortKeysOddBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)maxSortInstances_ * 8, ssboUsage, devLocal);
+        (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
     sortValsEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
         (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
     sortValsOddBuffer_ = gsCreateBuffer(device_, physDevice_,
@@ -680,6 +741,10 @@ bool GsRenderer::loadScene(const char* plyPath)
                    keepMin[2], keepMax[2]);
         }
     }
+
+    // Cache the (outlier-trimmed) scene bbox for the per-eye sort-depth
+    // quantization range. One O(N) pass at load, reused every renderEye.
+    sceneBBoxValid_ = getSceneBBox(sceneBBoxMin_, sceneBBoxMax_);
 
     // Create compute pipelines (first time only — they don't depend on scene size)
     if (pipePrecompCov3d_ == VK_NULL_HANDLE) {
@@ -983,12 +1048,23 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         vkBeginCommandBuffer(cmd, &bi);
 
+        // GPU timestamp profiling: reset the pool then stamp BOTTOM_OF_PIPE at
+        // each stage boundary. ts[0]=start … ts[7]=after blit (ts[0..2] in
+        // CMD1, ts[3..7] in CMD2 — both wait-idled, one pool spans them; the
+        // ts[2]→ts[3] gap includes the CPU totalSum readback between cmds).
+        const bool tsOn = (tsPool_ != VK_NULL_HANDLE);
+        if (tsOn) {
+            vkCmdResetQueryPool(cmd, tsPool_, 0, kNumTimestamps);
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool_, 0);
+        }
+
         // Preprocess dispatch
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocess_);
         VkDescriptorSet ppSets[] = {dsPreprocessSet0_, dsPreprocessSet1_};
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             layoutPreprocess_, 0, 2, ppSets, 0, nullptr);
         vkCmdDispatch(cmd, groups256, 1, 1);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 1);  // ts[1] preprocess
 
         // Barrier: preprocess writes → prefix sum reads
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -1042,6 +1118,7 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         totalCopy.srcOffset = (VkDeviceSize)(N - 1) * 4;
         totalCopy.size = 4;
         vkCmdCopyBuffer(cmd, prefixResult, totalSumHostBuffer_.buffer, 1, &totalCopy);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 2);  // ts[2] prefix_sum (+copy)
 
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1093,21 +1170,89 @@ void GsRenderer::renderEye(VkImage swapchainImage,
 
         VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
 
+        // GPU timestamps ts[3..7] (pool reset + ts[0..2] happened in CMD1).
+        const bool tsOn = (tsPool_ != VK_NULL_HANDLE);
+
         // ─── preprocess_sort ─────────────────────────────────────────
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocessSort_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             layoutPreprocessSort_, 0, 1, &dsPreprocessSort_, 0, nullptr);
         uint32_t vpTileX = (viewportWidth + 15) / 16;
+        {
+            // 16-bit tile index bound (see preprocess_sort.comp) — one-time
+            // warning only; init() already rejects oversized canvases.
+            static bool warnedTileBound = false;
+            uint32_t vpTileY = (viewportHeight + 15) / 16;
+            if (!warnedTileBound && (uint64_t)vpTileX * vpTileY > 65536) {
+                fprintf(stderr,
+                        "GsRenderer: viewport %ux%u exceeds the 16-bit sort "
+                        "tile index (65536 tiles) — splats will missort\n",
+                        viewportWidth, viewportHeight);
+                warnedTileBound = true;
+            }
+        }
+
+        // Linear 16-bit sort-depth quantization range: the view-space depth
+        // span of the scene bbox under this eye. The naive float-bits
+        // truncation (floatBitsToUint(depth) >> 16) keeps only 7 mantissa
+        // bits ≈ 128 depth buckets per octave — coarse enough that splats
+        // collapse onto iso-depth plateaus and blend in scatter order,
+        // visible as striping across tilted surfaces. Mapping the actual
+        // scene span linearly onto the full 65536 buckets makes the bucket
+        // size ~15 ppm of the span (invisible).
+        float depthQMin = 0.2f;       // shader hard-culls p_view.z <= 0.2
+        float depthQMax = depthQMin + 100.0f;  // fallback when bbox unknown
+        if (sceneBBoxValid_) {
+            float mnD = FLT_MAX, mxD = -FLT_MAX;
+            for (int ci = 0; ci < 8; ci++) {
+                const float cx = (ci & 1) ? sceneBBoxMax_[0] : sceneBBoxMin_[0];
+                const float cy = (ci & 2) ? sceneBBoxMax_[1] : sceneBBoxMin_[1];
+                const float cz = (ci & 4) ? sceneBBoxMax_[2] : sceneBBoxMin_[2];
+                // Shader depth = (ubo.view_mat * p).z, where updateUniforms
+                // negates the caller viewMatrix's z row — mirror that here.
+                const float d = -(viewMatrix[2] * cx + viewMatrix[6] * cy +
+                                  viewMatrix[10] * cz + viewMatrix[14]);
+                mnD = std::min(mnD, d);
+                mxD = std::max(mxD, d);
+            }
+            // Pad 2% so gaussian tails just outside the center bbox don't all
+            // tie at the range ends; clamp to the active cull window.
+            const float pad = 0.02f * (mxD - mnD);
+            mnD -= pad;
+            mxD += pad;
+            if (clipNearViewSpace > 0.0f) mnD = std::max(mnD, clipNearViewSpace);
+            if (clipFarViewSpace > 0.0f) mxD = std::min(mxD, clipFarViewSpace);
+            mnD = std::max(mnD, 0.2f);
+            if (mxD > mnD + 1e-6f) {
+                depthQMin = mnD;
+                depthQMax = mxD;
+            }
+        }
+        struct PreprocessSortPC {
+            uint32_t tileX;
+            float depthMin;
+            float invDepthRange;  // 65535 / (depthMax - depthMin)
+        } psPC = {vpTileX, depthQMin, 65535.0f / (depthQMax - depthQMin)};
+        {
+            static bool loggedDepthRange = false;
+            if (!loggedDepthRange) {
+                GS_LOGI("GS_DEPTHQ range=[%.3f, %.3f] bboxValid=%d clipNear=%.3f clipFar=%.3f",
+                        depthQMin, depthQMax, (int)sceneBBoxValid_,
+                        clipNearViewSpace, clipFarViewSpace);
+                loggedDepthRange = true;
+            }
+        }
         vkCmdPushConstants(cmd, layoutPreprocessSort_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(uint32_t), &vpTileX);
+                           0, sizeof(psPC), &psPC);
         vkCmdDispatch(cmd, groups256, 1, 1);
 
         mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 3);  // ts[3] preprocess_sort
 
-        // ─── Radix sort: 8 passes (64-bit keys, 8 bits per pass) ────
+        // ─── Radix sort: 4 passes (32-bit keys, 8 bits per pass) ────
         struct RadixSortPC {
             uint32_t num_elements;
             uint32_t shift;
@@ -1115,7 +1260,7 @@ void GsRenderer::renderEye(VkImage swapchainImage,
             uint32_t num_blocks_per_workgroup;
         };
 
-        for (uint32_t pass = 0; pass < 8; pass++) {
+        for (uint32_t pass = 0; pass < 4; pass++) {
             bool even = (pass % 2 == 0);
 
             RadixSortPC pc;
@@ -1152,7 +1297,9 @@ void GsRenderer::renderEye(VkImage swapchainImage,
             vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
         }
-        // After 8 passes (even number), sorted result is back in even buffers
+        // After 4 passes (even number), sorted result is back in even buffers
+        // (tile_boundary + render bind the even buffers — keep the pass count even)
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 4);  // ts[4] radix_sort
 
         // ─── Fill tileBoundary with zeros ────────────────────────────
         vkCmdFillBuffer(cmd, tileBoundaryBuffer_.buffer, 0,
@@ -1176,6 +1323,7 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 5);  // ts[5] tile_boundary
 
         // ─── Render ──────────────────────────────────────────────────
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeRender_);
@@ -1195,6 +1343,7 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         uint32_t renderGroupsX = (viewportWidth + 15) / 16;
         uint32_t renderGroupsY = (viewportHeight + 15) / 16;
         vkCmdDispatch(cmd, renderGroupsX, renderGroupsY, 1);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 6);  // ts[6] render
 
         // ─── Copy render image → swapchain viewport region ──────────
 
@@ -1257,6 +1406,7 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+        if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 7);  // ts[7] blit/copy
 
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1265,6 +1415,32 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue_);
         vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+
+        // ── Read back GPU timestamps, log per-stage ms every kTsLogPeriod ──
+        frameCounter_++;
+        constexpr uint64_t kTsLogPeriod = 120;
+        if (tsOn && (frameCounter_ % kTsLogPeriod == 0)) {
+            uint64_t ts[kNumTimestamps] = {};
+            VkResult qr = vkGetQueryPoolResults(
+                device_, tsPool_, 0, kNumTimestamps, sizeof(ts), ts,
+                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            if (qr == VK_SUCCESS) {
+                const uint64_t mask = (tsValidBits_ >= 64)
+                    ? ~0ULL : ((1ULL << tsValidBits_) - 1ULL);
+                auto ms = [&](uint32_t a, uint32_t b) -> double {
+                    uint64_t d = (ts[b] & mask) - (ts[a] & mask);
+                    return (double)d * (double)timestampPeriod_ / 1.0e6;
+                };
+                // NOTE: preSort (ts[2]→ts[3]) spans the CMD1→CMD2 gap, so it
+                // includes the CPU totalSum readback; TOTAL likewise.
+                GS_LOGI("GS_TS eye(vpX=%u) inst=%u vp=%ux%u | "
+                        "preproc=%.2f prefix=%.2f preSort=%.2f radix=%.2f "
+                        "tileBnd=%.2f render=%.2f blit=%.2f | TOTAL=%.2f ms",
+                        viewportX, numInstances, viewportWidth, viewportHeight,
+                        ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4),
+                        ms(4, 5), ms(5, 6), ms(6, 7), ms(0, 7));
+            }
+        }
     }
 }
 
@@ -1734,9 +1910,9 @@ void GsRenderer::growSortBuffers(uint32_t requiredCapacity)
     gsDestroyBuffer(device_, sortHistBuffer_);
 
     sortKeysEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 8, ssboUsage, devLocal);
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
     sortKeysOddBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 8, ssboUsage, devLocal);
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
     sortValsEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
         (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
     sortValsOddBuffer_ = gsCreateBuffer(device_, physDevice_,
@@ -1904,6 +2080,12 @@ void GsRenderer::cleanup()
     if (cmdPool_ != VK_NULL_HANDLE) {
         vkDestroyCommandPool(device_, cmdPool_, nullptr);
         cmdPool_ = VK_NULL_HANDLE;
+    }
+
+    // Destroy timestamp query pool
+    if (tsPool_ != VK_NULL_HANDLE) {
+        vkDestroyQueryPool(device_, tsPool_, nullptr);
+        tsPool_ = VK_NULL_HANDLE;
     }
 
     device_ = VK_NULL_HANDLE;  // Prevent double-cleanup from destructor
