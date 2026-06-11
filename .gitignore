@@ -4,3 +4,6 @@ installer/macos/*.pkg
 _artifact/
 _package/
 *.log
+.gradle/
+android/.cxx/
+local.properties
