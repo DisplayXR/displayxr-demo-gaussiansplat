@@ -55,6 +55,12 @@ jobs:
           else
             BASE=${{ github.event.before }}
           fi
+          # event.before is unusable on new-branch pushes (all zeros) and
+          # force-pushes (old tip unreachable) — build unconditionally then.
+          if [ -z "$BASE" ] || ! git cat-file -e "$BASE" 2>/dev/null; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CHANGED=$(git diff --name-only "$BASE" HEAD)
           NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
           if [ -n "$CHANGED" ] && [ -z "$NON_DOC" ]; then
