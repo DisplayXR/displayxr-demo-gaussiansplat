@@ -1194,17 +1194,22 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocessSort_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             layoutPreprocessSort_, 0, 1, &dsPreprocessSort_, 0, nullptr);
-        uint32_t vpTileX = (viewportWidth + 15) / 16;
+        // Tile-grid width for the sort-key linearization (tileIndex = i + j*tileX
+        // in preprocess_sort.comp). MUST use the scaled render dims rw/rh — the
+        // same grid render.comp derives from its width/height push constant — or
+        // fragments linearize into a grid render.comp doesn't read, collapsing
+        // the splat into the top tile rows.
+        uint32_t vpTileX = (rw + 15) / 16;
         {
             // 16-bit tile index bound (see preprocess_sort.comp) — one-time
             // warning only; init() already rejects oversized canvases.
             static bool warnedTileBound = false;
-            uint32_t vpTileY = (viewportHeight + 15) / 16;
+            uint32_t vpTileY = (rh + 15) / 16;
             if (!warnedTileBound && (uint64_t)vpTileX * vpTileY > 65536) {
                 fprintf(stderr,
-                        "GsRenderer: viewport %ux%u exceeds the 16-bit sort "
+                        "GsRenderer: render grid %ux%u exceeds the 16-bit sort "
                         "tile index (65536 tiles) — splats will missort\n",
-                        viewportWidth, viewportHeight);
+                        rw, rh);
                 warnedTileBound = true;
             }
         }
