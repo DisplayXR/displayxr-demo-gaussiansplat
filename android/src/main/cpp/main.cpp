@@ -833,11 +833,22 @@ poll_xr_events()
 bool
 render_frame()
 {
+	// Frame-phase profiler: wall-clock wait / render(2 eyes) / endFrame to see
+	// whether the wall is app compute (renderEye) or runtime pacing+weave
+	// (xrWaitFrame / xrEndFrame). Logged every 120 frames next to the fps line.
+	auto pf_now = []{ return std::chrono::steady_clock::now(); };
+	auto pf_ms = [](auto a, auto b){
+		return std::chrono::duration<double, std::milli>(b - a).count(); };
+	static double pf_wait = 0, pf_render = 0, pf_end = 0;
+	auto pf_t0 = pf_now();
+
 	XrFrameWaitInfo wait_info = {};
 	wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
 	XrFrameState frame_state = {};
 	frame_state.type = XR_TYPE_FRAME_STATE;
 	XrResult res = xrWaitFrame(g_session, &wait_info, &frame_state);
+	auto pf_t1 = pf_now();
+	pf_wait = pf_ms(pf_t0, pf_t1);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrWaitFrame", res);
 		return false;
@@ -907,6 +918,7 @@ render_frame()
 			}
 			// Splat model (recenter + spin) — same for both eyes.
 			const Mat4 splat_model = build_splat_model((float)g_frame_count * g_spin_speed);
+			auto pf_r0 = pf_now();
 			for (uint32_t i = 0; i < kViewCount; ++i) {
 				XrSwapchainImageAcquireInfo acq = {};
 				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
@@ -964,6 +976,7 @@ render_frame()
 				projection_views[i].subImage.imageArrayIndex = 0;
 			}
 			rendered = (res == XR_SUCCESS);
+			pf_render = pf_ms(pf_r0, pf_now());
 		} else {
 			log_xr_result("xrLocateViews", res);
 		}
@@ -983,7 +996,9 @@ render_frame()
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	end_info.layerCount = rendered ? 1 : 0;
 	end_info.layers = rendered ? layers : nullptr;
+	auto pf_e0 = pf_now();
 	res = xrEndFrame(g_session, &end_info);
+	pf_end = pf_ms(pf_e0, pf_now());
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEndFrame", res);
 		return false;
@@ -995,8 +1010,9 @@ render_frame()
 		auto now = std::chrono::steady_clock::now();
 		double ms = std::chrono::duration<double, std::milli>(now - last).count() / 120.0;
 		last = now;
-		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps)", (unsigned long long)g_frame_count,
-		     ms, ms > 0.0 ? 1000.0 / ms : 0.0);
+		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps) | PHASE wait=%.1f render=%.1f end=%.1f ms",
+		     (unsigned long long)g_frame_count,
+		     ms, ms > 0.0 ? 1000.0 / ms : 0.0, pf_wait, pf_render, pf_end);
 	}
 	return true;
 }
