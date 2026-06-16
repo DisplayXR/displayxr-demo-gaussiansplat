@@ -714,6 +714,41 @@ gs_init()
 		}
 	}
 	g_gs.setRenderScale(gsScale);
+
+	// gauss is GPU-bound on the per-frame (gaussian,tile) fragment count (~1.4M
+	// for the butterfly). Two load-time culls cut it; both set before loadScene
+	// (load_butterfly runs after gs_init), both force-stop+relaunch to apply.
+	//
+	// (1) Opacity cull `debug.dxr.gs.minalpha` (0 = off): drops near-transparent
+	//     splats. Effective on scenes WITH faint splats; near-useless on dense
+	//     opaque scenes like butterfly.spz (all >0.1), so default off.
+	float gsMinAlpha = 0.0f;
+	{
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.gs.minalpha", buf) > 0) {
+			float v = (float)atof(buf);
+			if (v >= 0.0f && v < 1.0f)
+				gsMinAlpha = v;
+		}
+	}
+	g_gs.setCullMinOpacity(gsMinAlpha);
+
+	// (2) Decimation `debug.dxr.gs.keep` (1.0 = off): keep this fraction of
+	//     gaussians (hash-uniform). Cuts the fragment count ~linearly, so it
+	//     helps when the app's GPU compute is the bottleneck. On the nubia at
+	//     render-scale 0.6 it is NOT — the frame is runtime/DP-weave-bound
+	//     (~130ms floor), so dropping 60% of gaussians changed fps by <0.5.
+	//     Default OFF; available for heavier scenes / more GPU-bound devices.
+	float gsKeep = 1.0f;
+	{
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.gs.keep", buf) > 0) {
+			float v = (float)atof(buf);
+			if (v > 0.05f && v <= 1.0f)
+				gsKeep = v;
+		}
+	}
+	g_gs.setKeepFraction(gsKeep);
 	g_gs_ready = true;
 	LOGI("GsRenderer initialized (%ux%u/eye, render_scale=%.2f)",
 	     g_views[0].width, g_views[0].height, gsScale);
@@ -839,7 +874,7 @@ render_frame()
 	auto pf_now = []{ return std::chrono::steady_clock::now(); };
 	auto pf_ms = [](auto a, auto b){
 		return std::chrono::duration<double, std::milli>(b - a).count(); };
-	static double pf_wait = 0, pf_render = 0, pf_end = 0;
+	static double pf_wait = 0, pf_render = 0, pf_end = 0, pf_setup = 0;
 	auto pf_t0 = pf_now();
 
 	XrFrameWaitInfo wait_info = {};
@@ -919,6 +954,7 @@ render_frame()
 			// Splat model (recenter + spin) — same for both eyes.
 			const Mat4 splat_model = build_splat_model((float)g_frame_count * g_spin_speed);
 			auto pf_r0 = pf_now();
+			pf_setup = pf_ms(pf_t1, pf_r0);  // xrBeginFrame + xrLocateViews (IPC for view_rig)
 			for (uint32_t i = 0; i < kViewCount; ++i) {
 				XrSwapchainImageAcquireInfo acq = {};
 				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
@@ -1010,9 +1046,11 @@ render_frame()
 		auto now = std::chrono::steady_clock::now();
 		double ms = std::chrono::duration<double, std::milli>(now - last).count() / 120.0;
 		last = now;
-		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps) | PHASE wait=%.1f render=%.1f end=%.1f ms",
+		LOGI("frame %llu  ~%.1f ms/frame (%.1f fps) | PHASE wait=%.1f setup=%.1f render=%.1f end=%.1f ms | "
+		     "predDisplayPeriod=%.1f ms",
 		     (unsigned long long)g_frame_count,
-		     ms, ms > 0.0 ? 1000.0 / ms : 0.0, pf_wait, pf_render, pf_end);
+		     ms, ms > 0.0 ? 1000.0 / ms : 0.0, pf_wait, pf_setup, pf_render, pf_end,
+		     (double)frame_state.predictedDisplayPeriod / 1.0e6);
 	}
 	return true;
 }
