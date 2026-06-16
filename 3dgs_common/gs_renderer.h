@@ -154,6 +154,25 @@ struct GsRenderer {
     void setRenderScale(float s) { renderScale_ = (s > 0.05f && s <= 1.0f) ? s : 1.0f; }
     float renderScale() const { return renderScale_; }
 
+    // Load-time opacity cull: drop gaussians whose (already sigmoid'd) opacity is
+    // below this before upload. Near-transparent splats still expand into
+    // (gaussian,tile) fragments that get sorted + composited every eye but
+    // contribute almost nothing — culling them cuts preprocess + sort + render
+    // together (the GPU-bound cost on mobile). 0 = off (keep all). Must be set
+    // BEFORE loadScene(). Typical 0.02–0.1.
+    void setCullMinOpacity(float a) { cullMinOpacity_ = (a >= 0.0f && a < 1.0f) ? a : 0.0f; }
+    float cullMinOpacity() const { return cullMinOpacity_; }
+
+    // Load-time decimation: keep ~this fraction of gaussians (hash-selected so
+    // it's uniform regardless of file ordering), dropping the rest before
+    // upload. Unlike the opacity cull this works on dense OPAQUE scenes (e.g.
+    // butterfly.spz, ~all splats >0.1 opacity) where opacity culling drops
+    // nothing — it cuts the gaussian count, hence the (gaussian,tile) fragment
+    // count, hence preprocess + sort + composite, ~linearly. Splats are soft so
+    // moderate decimation thins gracefully. 1.0 = off. Set BEFORE loadScene().
+    void setKeepFraction(float f) { cullKeepFrac_ = (f > 0.05f && f <= 1.0f) ? f : 1.0f; }
+    float keepFraction() const { return cullKeepFrac_; }
+
     // Clean up all resources.
     void cleanup();
 
@@ -170,7 +189,9 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t subgroupSize_ = 32;
-    float renderScale_ = 1.0f;   // see setRenderScale()
+    float renderScale_ = 1.0f;      // see setRenderScale()
+    float cullMinOpacity_ = 0.0f;   // see setCullMinOpacity()
+    float cullKeepFrac_ = 1.0f;     // see setKeepFraction()
 
     // ── GPU timestamp profiling ──────────────────────────────────────────
     // Per-stage VkQueryPool timestamps around each renderEye dispatch group

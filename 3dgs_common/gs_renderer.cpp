@@ -677,6 +677,51 @@ bool GsRenderer::loadScene(const char* plyPath)
         return false;
     }
 
+    // Load-time opacity cull (perf): compact out near-transparent gaussians
+    // before upload. scale_opacity[3] is the sigmoid'd opacity in [0,1]. These
+    // splats expand into sort+composite fragments every eye but barely affect
+    // the image — dropping them cuts the GPU-bound fragment count directly.
+    // setCullMinOpacity(0) keeps the original behaviour (no cull).
+    if (cullMinOpacity_ > 0.0f && vertices.size() >= 1024) {
+        size_t total = vertices.size();
+        size_t kept = 0;
+        for (size_t i = 0; i < total; i++) {
+            if (vertices[i].scale_opacity[3] < cullMinOpacity_) continue;
+            vertices[kept++] = vertices[i];
+        }
+        if (kept >= 1) {  // never cull to empty
+            size_t dropped = total - kept;
+            vertices.resize(kept);
+            GS_LOGI("GsRenderer: opacity cull dropped %zu/%zu gaussians "
+                    "(minOpacity=%.3f, %zu kept)",
+                    dropped, total, (double)cullMinOpacity_, kept);
+        }
+    }
+
+    // Load-time decimation (perf): keep ~cullKeepFrac_ of the gaussians,
+    // hash-selected for a spatially-uniform thinning independent of file order.
+    // Works on dense opaque scenes where the opacity cull drops nothing. Cuts
+    // the fragment count (hence sort + composite) ~linearly with the count.
+    if (cullKeepFrac_ < 0.999f && vertices.size() >= 1024) {
+        size_t total = vertices.size();
+        // keep i when its hashed bucket falls under the keep threshold
+        const uint32_t thresh = (uint32_t)(cullKeepFrac_ * 65536.0f);
+        size_t kept = 0;
+        for (size_t i = 0; i < total; i++) {
+            // cheap integer hash (Knuth multiplicative), take 16 bits
+            uint32_t h = ((uint32_t)i * 2654435761u) >> 16;
+            if ((h & 0xFFFFu) >= thresh) continue;
+            vertices[kept++] = vertices[i];
+        }
+        if (kept >= 1) {  // never decimate to empty
+            size_t dropped = total - kept;
+            vertices.resize(kept);
+            GS_LOGI("GsRenderer: decimation dropped %zu/%zu gaussians "
+                    "(keepFrac=%.3f, %zu kept)",
+                    dropped, total, (double)cullKeepFrac_, kept);
+        }
+    }
+
     numGaussians_ = (uint32_t)vertices.size();
     numPrefixSumIter_ = (uint32_t)std::ceil(std::log2((double)numGaussians_));
     if (numPrefixSumIter_ == 0) numPrefixSumIter_ = 1;
