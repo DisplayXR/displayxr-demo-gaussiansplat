@@ -694,11 +694,29 @@ gs_init()
 		LOGE("GsRenderer::init failed");
 		return false;
 	}
-	// Full quality: all gaussians at full resolution. On the nubia the fps is
-	// capped by the runtime weave/present, not app compute — subsampling and
-	// render-scale experiments left fps unchanged on the android wip branch.
+	// Render-scale: at 1.0 the per-eye GPU compute (~67ms on the nubia: render
+	// ~32 + radix ~18 + preSort ~9) far exceeds the ~33ms DP-weave period, so
+	// gauss is compute-bound (~7fps), NOT weave-capped. Driving the compute
+	// pipeline at a reduced internal resolution lowers render + tile-grid /
+	// instance count (sort/preSort) together, recovering fps up to the weave
+	// ceiling. Tunable live for sweeps: `setprop debug.dxr.gs.scale 0.6`
+	// (force-stop + relaunch). Empty/0/1.0 = native full resolution.
+	// Default 0.6: on the nubia this ~3x's real fps (~2.5 -> ~7.5) vs native.
+	// Below ~0.6 fps plateaus (the per-eye synchronous double-submit + readback
+	// becomes the floor), so 0.6 is the quality/perf knee. Override for sweeps.
+	float gsScale = 0.6f;
+	{
+		char buf[PROP_VALUE_MAX] = {0};
+		if (__system_property_get("debug.dxr.gs.scale", buf) > 0) {
+			float v = (float)atof(buf);
+			if (v > 0.05f && v <= 1.0f)
+				gsScale = v;
+		}
+	}
+	g_gs.setRenderScale(gsScale);
 	g_gs_ready = true;
-	LOGI("GsRenderer initialized (%ux%u/eye)", g_views[0].width, g_views[0].height);
+	LOGI("GsRenderer initialized (%ux%u/eye, render_scale=%.2f)",
+	     g_views[0].width, g_views[0].height, gsScale);
 	return true;
 }
 

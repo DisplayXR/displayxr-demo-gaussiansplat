@@ -1029,8 +1029,25 @@ void GsRenderer::renderEye(VkImage swapchainImage,
 {
     if (!hasScene()) return;
 
-    // Update uniform buffer with this eye's matrices
-    updateUniforms(viewMatrix, projMatrix, viewportWidth, viewportHeight,
+    // Render-scale: drive the entire compute pipeline (projection, tile grid,
+    // sort, per-pixel composite) at a reduced internal resolution rw x rh, then
+    // upscale-blit to the full viewport region below. The projection is fully
+    // self-consistent at rw/rh (focal length, pixel coords and gaussian pixel
+    // radii in preprocess.comp all derive from these dims), so a smaller rw/rh
+    // both lowers the per-pixel render cost and shrinks the tile grid, which
+    // drops the (gaussian,tile) instance count fed to sort/preSort. Floored to a
+    // multiple of the 16px tile so the grid stays whole. renderImage_ is full-
+    // viewport-sized, so the scaled region [0,0]-[rw,rh] always fits.
+    uint32_t rw = viewportWidth, rh = viewportHeight;
+    if (renderScale_ < 0.999f) {
+        uint32_t sw = (uint32_t)(viewportWidth  * renderScale_);
+        uint32_t sh = (uint32_t)(viewportHeight * renderScale_);
+        rw = (sw < 16u) ? 16u : (sw & ~15u);
+        rh = (sh < 16u) ? 16u : (sh & ~15u);
+    }
+
+    // Update uniform buffer with this eye's matrices (at the scaled dims)
+    updateUniforms(viewMatrix, projMatrix, rw, rh,
                    clipNearViewSpace, clipFarViewSpace, clipFadeFrac);
 
     uint32_t N = numGaussians_;
@@ -1335,13 +1352,13 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         // so the compositor's sampler decodes sRGB→linear on read, and the
         // display surface re-encodes linear→sRGB on output (single gamma).
         // Manual linearToSrgb() would cause double encoding (washed out colors).
-        uint32_t renderPC[4] = {viewportWidth, viewportHeight, 0u,
+        uint32_t renderPC[4] = {rw, rh, 0u,
                                 transparentBg ? 1u : 0u};
         vkCmdPushConstants(cmd, layoutRender_, VK_SHADER_STAGE_COMPUTE_BIT,
                            0, sizeof(renderPC), renderPC);
 
-        uint32_t renderGroupsX = (viewportWidth + 15) / 16;
-        uint32_t renderGroupsY = (viewportHeight + 15) / 16;
+        uint32_t renderGroupsX = (rw + 15) / 16;
+        uint32_t renderGroupsY = (rh + 15) / 16;
         vkCmdDispatch(cmd, renderGroupsX, renderGroupsY, 1);
         if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 6);  // ts[6] render
 
@@ -1376,19 +1393,24 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb2);
 
-        // Blit viewport region (handles RGBA→BGRA format conversion)
+        // Blit the scaled render region (rw x rh) up to the full viewport
+        // region of the swapchain (handles RGBA→BGRA format conversion + the
+        // render-scale upscale). LINEAR so the upscale is smooth (NEAREST when
+        // 1:1 — identical result, marginally cheaper).
         VkImageBlit blitRegion = {};
         blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blitRegion.srcOffsets[0] = {0, 0, 0};
-        blitRegion.srcOffsets[1] = {(int32_t)viewportWidth, (int32_t)viewportHeight, 1};
+        blitRegion.srcOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
         blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         blitRegion.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
         blitRegion.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
                                     (int32_t)(viewportY + viewportHeight), 1};
+        VkFilter blitFilter = (rw == viewportWidth && rh == viewportHeight)
+                                  ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         vkCmdBlitImage(cmd,
             renderImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1, &blitRegion, VK_FILTER_NEAREST);
+            1, &blitRegion, blitFilter);
 
         // Barrier: swapchain image → COLOR_ATTACHMENT_OPTIMAL
         imb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1433,10 +1455,11 @@ void GsRenderer::renderEye(VkImage swapchainImage,
                 };
                 // NOTE: preSort (ts[2]→ts[3]) spans the CMD1→CMD2 gap, so it
                 // includes the CPU totalSum readback; TOTAL likewise.
-                GS_LOGI("GS_TS eye(vpX=%u) inst=%u vp=%ux%u | "
+                GS_LOGI("GS_TS eye(vpX=%u) inst=%u vp=%ux%u render=%ux%u(scale=%.2f) | "
                         "preproc=%.2f prefix=%.2f preSort=%.2f radix=%.2f "
                         "tileBnd=%.2f render=%.2f blit=%.2f | TOTAL=%.2f ms",
                         viewportX, numInstances, viewportWidth, viewportHeight,
+                        rw, rh, renderScale_,
                         ms(0, 1), ms(1, 2), ms(2, 3), ms(3, 4),
                         ms(4, 5), ms(5, 6), ms(6, 7), ms(0, 7));
             }
