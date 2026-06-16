@@ -145,6 +145,15 @@ struct GsRenderer {
                    float clipFarViewSpace = 0.0f,
                    float clipFadeFrac = 0.0f);
 
+    // Render-scale: run the entire compute pipeline (projection, tile grid,
+    // sort, per-pixel composite) at scale*viewport dims, then upscale-blit the
+    // result to the full viewport. Splats are soft so moderate downscale costs
+    // little visually, while it cuts the per-pixel render cost AND shrinks the
+    // tile grid → fewer (gaussian,tile) instances → less sort/preSort work.
+    // 1.0 = native (default, desktop). Clamped to (0.05, 1.0].
+    void setRenderScale(float s) { renderScale_ = (s > 0.05f && s <= 1.0f) ? s : 1.0f; }
+    float renderScale() const { return renderScale_; }
+
     // Clean up all resources.
     void cleanup();
 
@@ -161,6 +170,7 @@ private:
     uint32_t width_ = 0;
     uint32_t height_ = 0;
     uint32_t subgroupSize_ = 32;
+    float renderScale_ = 1.0f;   // see setRenderScale()
 
     // ── GPU timestamp profiling ──────────────────────────────────────────
     // Per-stage VkQueryPool timestamps around each renderEye dispatch group
