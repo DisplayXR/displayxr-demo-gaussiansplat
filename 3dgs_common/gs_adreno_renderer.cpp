@@ -152,13 +152,20 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     // Render-scale: the whole pipeline runs at scale×eye dims then upscales the
     // blit. Per-fragment overdraw dominates, so this is a near-linear fps lever.
     renderScale_ = 1.0f;
+    keepFrac_ = 1.0f;
 #if defined(__ANDROID__)
-    renderScale_ = 0.6f;  // Adreno default
+    renderScale_ = 0.6f;   // Adreno default
+    keepFrac_ = 0.45f;     // decimate to ~45% of gaussians by default
     {
         char v[PROP_VALUE_MAX] = {0};
         if (__system_property_get("debug.dxr.gs.scale", v) > 0) {
             float s = (float)atof(v);
             if (s > 0.05f) renderScale_ = s;
+        }
+        v[0] = 0;
+        if (__system_property_get("debug.dxr.gs.keep", v) > 0) {
+            float k = (float)atof(v);
+            if (k > 0.01f && k <= 1.0f) keepFrac_ = k;
         }
     }
 #endif
@@ -173,11 +180,32 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
         return false;
     }
 
+    // Frame-pipelining ring: kFrameRing command buffers + fences (start
+    // signaled so the first kFrameRing submits don't wait on stale fences).
+    {
+        VkCommandBufferAllocateInfo cba = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cba.commandPool = cmdPool_; cba.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cba.commandBufferCount = kFrameRing;
+        if (vkAllocateCommandBuffers(device_, &cba, ringCmd_) != VK_SUCCESS) {
+            GS_LOGE("GsAdreno: ring cmd-buffer alloc failed"); return false;
+        }
+        VkFenceCreateInfo fci = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+        for (uint32_t i = 0; i < kFrameRing; i++)
+            vkCreateFence(device_, &fci, nullptr, &ringFence_[i]);
+        ringReady_ = true;
+    }
+
     if (timestampPeriod_ > 0.0f && tsValidBits_ > 0) {
         VkQueryPoolCreateInfo q = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
         q.queryType = VK_QUERY_TYPE_TIMESTAMP; q.queryCount = kNumTimestamps;
-        if (vkCreateQueryPool(device_, &q, nullptr, &tsPool_) != VK_SUCCESS) {
-            tsPool_ = VK_NULL_HANDLE; timestampPeriod_ = 0.0f;
+        for (uint32_t i = 0; i < kFrameRing; i++) {
+            if (vkCreateQueryPool(device_, &q, nullptr, &tsPool_[i]) != VK_SUCCESS) {
+                for (uint32_t j = 0; j < kFrameRing; j++) {
+                    if (tsPool_[j]) { vkDestroyQueryPool(device_, tsPool_[j], nullptr); tsPool_[j] = VK_NULL_HANDLE; }
+                }
+                timestampPeriod_ = 0.0f; break;
+            }
         }
     } else {
         timestampPeriod_ = 0.0f;
@@ -202,6 +230,27 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     bool ok = (ext == ".spz") ? ParseSpzFile(path, verts) : ParsePlyFile(path, verts);
     if (!ok || verts.empty()) { GS_LOGE("GsAdreno: parse failed: %s", scenePath); return false; }
+
+    // Load-time decimation: keep ~keepFrac_ of the gaussians, hash-selected for
+    // a spatially-uniform thinning independent of file order. Every stage
+    // (preprocess, keygen, radix sort, instanced draw) scales with the count,
+    // so this is a near-linear cut to per-eye GPU time. Soft overlapping splats
+    // hide the thinning well on dense scenes like butterfly.
+    if (keepFrac_ < 0.999f && verts.size() >= 1024) {
+        const size_t total = verts.size();
+        const uint32_t thresh = (uint32_t)(keepFrac_ * 65536.0f);
+        size_t kept = 0;
+        for (size_t i = 0; i < total; i++) {
+            uint32_t h = ((uint32_t)i * 2654435761u) >> 16;  // Knuth multiplicative hash
+            if ((h & 0xFFFFu) >= thresh) continue;
+            verts[kept++] = verts[i];
+        }
+        if (kept >= 1024) {
+            verts.resize(kept);
+            GS_LOGI("GsAdreno: decimation keep=%.2f -> %zu/%zu gaussians",
+                    (double)keepFrac_, kept, total);
+        }
+    }
 
     numGaussians_ = (uint32_t)verts.size();
     loadedScenePath_ = path;
@@ -561,17 +610,39 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
         if (mx > mn + 1e-6f) { depthQMin = mn; depthQMax = mx; }
     }
 
-    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    ai.commandPool = cmdPool_; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
-    VkCommandBuffer cmd; vkAllocateCommandBuffers(device_, &ai, &cmd);
+    // Pipelining ring: wait only on THIS slot's fence (its prior submit was
+    // kFrameRing eyes ago — already finished in steady state). No global
+    // vkQueueWaitIdle, so the app's GPU work overlaps the runtime/DP weave and
+    // the next eye/frame instead of CPU-blocking on every eye.
+    const uint32_t slot = (uint32_t)(frameCounter_ % kFrameRing);
+    vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
+
+    const bool tsOn = (timestampPeriod_ > 0.0f && tsPool_[slot] != VK_NULL_HANDLE);
+    VkQueryPool tsq = tsOn ? tsPool_[slot] : VK_NULL_HANDLE;
+
+    // This slot's fence is now signaled → its PREVIOUS timestamps are ready.
+    if (tsOn && frameCounter_ >= kFrameRing && (frameCounter_ % 120) == 0) {
+        uint64_t ts[kNumTimestamps] = {};
+        if (vkGetQueryPoolResults(device_, tsq, 0, kNumTimestamps, sizeof(ts), ts,
+                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+            const uint64_t mask = (tsValidBits_ >= 64) ? ~0ULL : ((1ULL << tsValidBits_) - 1ULL);
+            auto ms = [&](uint32_t a, uint32_t b) -> double {
+                return (double)((ts[b] & mask) - (ts[a] & mask)) * (double)timestampPeriod_ / 1.0e6; };
+            GS_LOGI("GS_TS[adreno] N=%u render=%ux%u(scale=%.2f keep=%.2f) | preproc=%.2f keygen=%.2f "
+                    "radix=%.2f draw=%.2f blit=%.2f | TOTAL=%.2f ms",
+                    N, rw, rh, renderScale_, keepFrac_, ms(0,1), ms(1,2), ms(2,3), ms(3,4), ms(4,5), ms(0,5));
+        }
+    }
+
+    vkResetFences(device_, 1, &ringFence_[slot]);
+    VkCommandBuffer cmd = ringCmd_[slot];
     VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
+    vkBeginCommandBuffer(cmd, &bi);  // implicit reset (pool: RESET_COMMAND_BUFFER_BIT)
 
-    const bool tsOn = (tsPool_ != VK_NULL_HANDLE);
     if (tsOn) {
-        vkCmdResetQueryPool(cmd, tsPool_, 0, kNumTimestamps);
-        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool_, 0);
+        vkCmdResetQueryPool(cmd, tsq, 0, kNumTimestamps);
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsq, 0);
     }
 
     VkMemoryBarrier mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -588,7 +659,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutPreprocess_, 0, 2, pp, 0, nullptr);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 1);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 1);
 
     // ── 2. keygen: far-first depth key + index payload ──
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeKeys_);
@@ -598,11 +669,17 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdPushConstants(cmd, layoutKeys_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(kpc), &kpc);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 2);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 2);
 
-    // ── 3. radix sort N keys (4 × 8-bit passes; result lands in EVEN buffers) ──
+    // ── 3. radix sort N keys. The depth key (splat_keys.comp: 65535-depth16)
+    //    is only 16-bit, so just 2 of the 4 8-bit passes carry information —
+    //    bits 16-31 are always zero for valid keys. Sorting 2 passes instead of
+    //    4 halves the radix cost (the dominant stage) with NO ordering change;
+    //    culled keys (0xFFFFFFFF) still land last by their low-16 (0xFFFF) and
+    //    draw as degenerate quads anyway. 2 passes → result back in EVEN. ──
+    constexpr uint32_t kRadixPasses = 2;  // 16-bit depth key
     struct RadixPC { uint32_t num_elements, shift, num_workgroups, num_blocks_per_workgroup; };
-    for (uint32_t pass = 0; pass < 4; pass++) {
+    for (uint32_t pass = 0; pass < kRadixPasses; pass++) {
         bool even = (pass % 2 == 0);
         RadixPC pc = {N, pass * 8, numSortWorkgroups_, numRadixBlocksPerWG_};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeHist_);
@@ -618,7 +695,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
         vkCmdDispatch(cmd, numSortWorkgroups_, 1, 1);
         computeBarrier();
     }
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 3);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 3);
 
     // Make attr[] + sorted payloads visible to the vertex shader.
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
@@ -643,7 +720,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdPushConstants(cmd, layoutSplat_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(splatPC), splatPC);
     vkCmdDraw(cmd, 4, N, 0, 0);
     vkCmdEndRenderPass(cmd);  // renderImage_ now in TRANSFER_SRC_OPTIMAL
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 4);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 4);
 
     // ── 5. blit (linear upscale) the scaled region to the swapchain viewport ──
     VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -673,29 +750,13 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     sb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 5);
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 5);
 
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue_);
-    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
-
+    vkQueueSubmit(queue_, 1, &si, ringFence_[slot]);  // fence (not waitIdle) → pipelined
     frameCounter_++;
-    constexpr uint64_t kTsLogPeriod = 120;
-    if (tsOn && (frameCounter_ % kTsLogPeriod == 0)) {
-        uint64_t ts[kNumTimestamps] = {};
-        if (vkGetQueryPoolResults(device_, tsPool_, 0, kNumTimestamps, sizeof(ts), ts,
-                sizeof(uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
-            const uint64_t mask = (tsValidBits_ >= 64) ? ~0ULL : ((1ULL << tsValidBits_) - 1ULL);
-            auto ms = [&](uint32_t a, uint32_t b) -> double {
-                return (double)((ts[b] & mask) - (ts[a] & mask)) * (double)timestampPeriod_ / 1.0e6; };
-            GS_LOGI("GS_TS[adreno] N=%u render=%ux%u(scale=%.2f) | preproc=%.2f keygen=%.2f "
-                    "radix=%.2f draw=%.2f blit=%.2f | TOTAL=%.2f ms",
-                    N, rw, rh, renderScale_, ms(0,1), ms(1,2), ms(2,3), ms(3,4), ms(4,5), ms(0,5));
-        }
-    }
 }
 
 // ═══════════════════════════ getRobustSceneBounds ═══════════════════════════
@@ -760,7 +821,12 @@ void GsAdrenoRenderer::cleanupScene() {
 void GsAdrenoRenderer::cleanup() {
     if (device_ == VK_NULL_HANDLE) return;
     cleanupScene();
-    if (tsPool_) { vkDestroyQueryPool(device_, tsPool_, nullptr); tsPool_ = VK_NULL_HANDLE; }
+    if (queue_) vkQueueWaitIdle(queue_);  // ring submits may be in flight
+    for (uint32_t i = 0; i < kFrameRing; i++) {
+        if (tsPool_[i]) { vkDestroyQueryPool(device_, tsPool_[i], nullptr); tsPool_[i] = VK_NULL_HANDLE; }
+        if (ringFence_[i]) { vkDestroyFence(device_, ringFence_[i], nullptr); ringFence_[i] = VK_NULL_HANDLE; }
+    }
+    ringReady_ = false;
     if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
     initialized_ = false;
 }
