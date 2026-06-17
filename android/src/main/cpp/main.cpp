@@ -36,7 +36,7 @@
 #include <sys/system_properties.h>
 #include <unistd.h>
 
-#include "gs_renderer.h"
+#include "gs_adreno_renderer.h"
 
 // XR_EXT_view_rig (#396 W7): vendored DisplayXR extension header.
 #include <openxr/XR_EXT_view_rig.h>
@@ -115,9 +115,10 @@ PerView g_views[kViewCount];
 
 VkFormat g_swapchain_format = VK_FORMAT_UNDEFINED;
 
-// The 3DGS compute renderer (8 compute shaders). Renders butterfly.spz to
-// each eye's swapchain image; the runtime's Leia DP weaves them.
-GsRenderer g_gs;
+// The Adreno/TBDR-native splat renderer (graphics pipeline: preprocess →
+// depth-sort N → instanced alpha-blended quads, ROP composite in tile memory).
+// Renders butterfly.spz to each eye's swapchain image; the Leia DP weaves them.
+GsAdrenoRenderer g_gs;
 bool g_gs_ready = false;
 std::atomic<bool> g_scene_loaded{false};
 

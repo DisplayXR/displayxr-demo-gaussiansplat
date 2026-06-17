@@ -43,8 +43,14 @@ if(NOT GLSLANGVALIDATOR_COMMAND)
     message(FATAL_ERROR "glslangValidator required — install the Vulkan SDK on the build host")
 endif()
 set(SHADER_DIR "${GS_COMMON}/shaders")
-set(GS_SHADERS precomp_cov3d.comp preprocess.comp prefix_sum.comp
-    preprocess_sort.comp hist.comp sort.comp tile_boundary.comp render.comp)
+# Adreno/TBDR-native graphics-pipeline splat path (gs_adreno_renderer.cpp):
+# preprocess(N) -> keygen -> radix sort(N) -> instanced quad draw. NONE of the
+# desktop compute-compositor shaders (preprocess/preprocess_sort/prefix_sum/
+# tile_boundary/render) are built — the hardware ROP composites in tile memory.
+# glslangValidator infers the stage from the extension, so splat.vert/.frag
+# compile the same way (header splat.vert.h, var splat_vert_data, etc.).
+set(GS_SHADERS precomp_cov3d.comp adreno_preprocess.comp hist.comp sort.comp
+    splat_keys.comp splat.vert splat.frag)
 set(SHADER_HEADERS "")
 foreach(S ${GS_SHADERS})
     string(MAKE_C_IDENTIFIER ${S} VN)          # preprocess_sort.comp -> preprocess_sort_comp
@@ -69,8 +75,9 @@ find_package(OpenXR REQUIRED CONFIG)
 
 add_library(gausssplat_vk_android SHARED
     main.cpp
-    # ── SHARED renderer (3dgs_common/) ──
-    ${GS_COMMON}/gs_renderer.cpp
+    # ── Adreno/TBDR-native renderer (3dgs_common/) — NOT the desktop
+    #    gs_renderer.cpp compute compositor; this is the mobile graphics path. ──
+    ${GS_COMMON}/gs_adreno_renderer.cpp
     ${GS_COMMON}/gs_scene_loader.cpp
     ${GS_COMMON}/gs_spz_loader.cpp
     ${GS_COMMON}/gs_vulkan_utils.cpp
