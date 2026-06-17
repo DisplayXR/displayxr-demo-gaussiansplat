@@ -1,0 +1,52 @@
+// Copyright 2025, Leia Inc.
+// SPDX-License-Identifier: BSL-1.0
+//
+// Depth-sort key generation for the graphics-pipeline splat rasterizer.
+// One key per GAUSSIAN (not per tile-fragment) — so the radix sort that
+// follows runs over N (~177k) instead of the ~1.4M fragments the compute path
+// produced. key = 65535 - depth16 so an ascending radix sort yields BACK-TO-
+// FRONT order (far gaussians first), which is what the "over" blend wants.
+// Culled gaussians (radii 0 / no magic) get the max key so they sort to the
+// end (and draw as degenerate quads). No prefix-sum / fragment expansion: the
+// CPU already knows N, so this removes the GPU->CPU readback stall entirely.
+
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#include "common.glsl"
+
+layout (std430, set = 0, binding = 0) readonly buffer Vertices {
+    VertexAttribute attr[];
+};
+
+layout (std430, set = 0, binding = 1) writeonly buffer OutKeys {
+    uint keys[];
+};
+
+layout (std430, set = 0, binding = 2) writeonly buffer OutPayloads {
+    uint payloads[];
+};
+
+layout (push_constant) uniform Constants {
+    uint count;             // number of gaussians (N)
+    float depthMin;
+    float invDepthRange;    // 65535 / (depthMax - depthMin)
+};
+
+layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= count) {
+        return;
+    }
+
+    payloads[i] = i;
+
+    if (attr[i].color_radii.w <= 0.0 || attr[i].magic != MAGIC) {
+        keys[i] = 0xFFFFFFFFu;   // culled → sort last
+        return;
+    }
+
+    uint depth16 = uint(clamp((attr[i].depth - depthMin) * invDepthRange, 0.0, 65535.0));
+    keys[i] = 65535u - depth16;  // far (large depth) → small key → drawn first
+}
