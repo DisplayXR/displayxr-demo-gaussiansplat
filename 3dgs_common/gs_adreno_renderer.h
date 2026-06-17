@@ -110,10 +110,24 @@ private:
     // Internal render scale (1.0 = full res). Default 0.6 on Android — the
     // pipeline runs at scale×eye dims then linear-upscales the blit.
     float renderScale_ = 1.0f;
+    float keepFrac_ = 1.0f;     // load-time decimation (1.0 = keep all)
+
+    // ── Frame pipelining ring ──
+    // Each renderEye submits with a per-slot fence instead of vkQueueWaitIdle,
+    // so the app's GPU work no longer blocks the CPU or serializes against the
+    // runtime/DP weave — the next eye/frame can be queued while this one runs
+    // (the documented #1 gauss lever: a light app hits ~32 fps through the same
+    // OOP runtime/DP because it doesn't idle-block). A slot's fence is waited
+    // only when that slot is reused (kFrameRing submissions later), so in steady
+    // state the wait is already satisfied.
+    static constexpr uint32_t kFrameRing = 3;
+    VkCommandBuffer ringCmd_[kFrameRing] = {};
+    VkFence ringFence_[kFrameRing] = {};
+    bool ringReady_ = false;
 
     // ── GPU timestamp profiling (per-stage, logged every kTsLogPeriod eyes) ──
     static constexpr uint32_t kNumTimestamps = 6;  // top,preproc,keygen,radix,draw,blit
-    VkQueryPool tsPool_ = VK_NULL_HANDLE;
+    VkQueryPool tsPool_[kFrameRing] = {};  // per-slot (read when the slot's fence signals)
     float timestampPeriod_ = 0.0f;
     uint32_t tsValidBits_ = 0;
     uint64_t frameCounter_ = 0;
