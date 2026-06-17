@@ -154,8 +154,8 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     renderScale_ = 1.0f;
     keepFrac_ = 1.0f;
 #if defined(__ANDROID__)
-    renderScale_ = 0.6f;   // Adreno default
-    keepFrac_ = 0.45f;     // decimate to ~45% of gaussians by default
+    renderScale_ = 0.45f;  // Adreno default — holds ~30 fps with the parallel sort
+    keepFrac_ = 0.25f;     // decimate to ~25% of gaussians (soft splats hide it)
     {
         char v[PROP_VALUE_MAX] = {0};
         if (__system_property_get("debug.dxr.gs.scale", v) > 0) {
@@ -321,9 +321,17 @@ bool GsAdrenoRenderer::createSceneResources() {
     uniformBuffer_ = gsCreateBuffer(device_, physDevice_, sizeof(GsUniformBuffer),
                                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis);
 
-    // Radix sort: sized for N gaussians (NOT N×8 fragments) → ~7× fewer
-    // workgroups than the desktop fragment sort.
-    numSortWorkgroups_ = (N + numRadixBlocksPerWG_ * 256 - 1) / (numRadixBlocksPerWG_ * 256);
+    // Radix sort workgroup sizing — parallelism, NOT just coverage. With a
+    // fixed 256 blocks/workgroup the whole sort collapses onto 1 workgroup at
+    // mobile N (44k → ceil(44k/65536)=1 WG = ~256 threads = a sliver of the
+    // Adreno), which is why the sort dominated at ~10 ms for trivial work.
+    // Instead pick blocks/WG so we dispatch ~kTargetSortWG workgroups to
+    // saturate the GPU. (The desktop path got ~22 WG only incidentally, via its
+    // N×8 fragment over-allocation.) Same sort, just spread across the cores.
+    constexpr uint32_t kTargetSortWG = 64;
+    numRadixBlocksPerWG_ = (N + 256u * kTargetSortWG - 1u) / (256u * kTargetSortWG);
+    if (numRadixBlocksPerWG_ < 1u) numRadixBlocksPerWG_ = 1u;
+    numSortWorkgroups_ = (N + numRadixBlocksPerWG_ * 256u - 1u) / (numRadixBlocksPerWG_ * 256u);
     if (numSortWorkgroups_ == 0) numSortWorkgroups_ = 1;
     histBuffer_ = gsCreateBuffer(device_, physDevice_,
         (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssbo, devLocal);
