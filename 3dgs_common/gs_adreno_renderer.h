@@ -145,21 +145,25 @@ private:
     uint32_t numSortWorkgroups_ = 0;
 
     // ── GPU buffers ──
+    // Load-time, read-only per frame → single instance (shared across the ring
+    // is safe; no frame ever writes them).
     GsBuffer vertexBuffer_;     // N × 240
     GsBuffer cov3dBuffer_;      // N × 24
-    GsBuffer uniformBuffer_[kFrameRing];  // 176 (host-visible), per ring slot —
-                                          // a single shared UBO raced across the 3
-                                          // in-flight eyes → left-eye judder (#44)
-                                          // review). Per-slot + write-after-fence.
-    GsBuffer attrBuffer_;       // N × 64 (VertexAttribute)
-    GsBuffer keysEvenBuffer_;   // N × 4
-    GsBuffer keysOddBuffer_;    // N × 4
-    GsBuffer valsEvenBuffer_;   // N × 4 (gaussian indices)
-    GsBuffer valsOddBuffer_;    // N × 4
-    GsBuffer histBuffer_;       // numSortWorkgroups_ × 256 × 4
+    // Per-frame mutated → one instance PER RING SLOT. The ring lets up to
+    // kFrameRing eyes be GPU-in-flight at once (renderEye waits only on its own
+    // slot's fence), so any buffer written each frame must be private to its
+    // slot — otherwise frame N+1's preprocess/keygen/sort clobbers data frame N
+    // is still reading for its draw (cross-frame WAR/RAW). See header note.
+    GsBuffer uniformBuffer_[kFrameRing];    // 176 (host-visible)
+    GsBuffer attrBuffer_[kFrameRing];       // N × 64 (VertexAttribute)
+    GsBuffer keysEvenBuffer_[kFrameRing];   // N × 4
+    GsBuffer keysOddBuffer_[kFrameRing];    // N × 4
+    GsBuffer valsEvenBuffer_[kFrameRing];   // N × 4 (gaussian indices)
+    GsBuffer valsOddBuffer_[kFrameRing];    // N × 4
+    GsBuffer histBuffer_[kFrameRing];       // numSortWorkgroups_ × 256 × 4
 
-    // ── Internal scaled render target ──
-    GsImage renderImage_;       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
+    // ── Internal scaled render target (per slot: draw target + blit source) ──
+    GsImage renderImage_[kFrameRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
 
     // ── Compute pipelines (5) ──
     VkPipeline pipeCov3d_ = VK_NULL_HANDLE;
@@ -169,8 +173,8 @@ private:
     VkPipeline pipeSort_ = VK_NULL_HANDLE;
     // ── Graphics pipeline (instanced splat quads) ──
     VkPipeline pipeSplat_ = VK_NULL_HANDLE;
-    VkRenderPass renderPass_ = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer_ = VK_NULL_HANDLE;
+    VkRenderPass renderPass_ = VK_NULL_HANDLE;            // format-compatible with every slot's framebuffer
+    VkFramebuffer framebuffer_[kFrameRing] = {};          // wraps renderImage_[slot].view
 
     VkPipelineLayout layoutCov3d_ = VK_NULL_HANDLE;
     VkPipelineLayout layoutPreprocess_ = VK_NULL_HANDLE;
@@ -188,15 +192,17 @@ private:
     VkDescriptorSetLayout dslSplat_ = VK_NULL_HANDLE;
 
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
+    // Single sets reference only load-time read-only buffers (vertex, cov3d).
     VkDescriptorSet dsCov3d_ = VK_NULL_HANDLE;
     VkDescriptorSet dsPreprocessSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsPreprocessSet1_[kFrameRing] = {}; // per-slot (binds uniformBuffer_[slot])
-    VkDescriptorSet dsKeys_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsHistEven_ = VK_NULL_HANDLE;   // keysEven→hist
-    VkDescriptorSet dsHistOdd_ = VK_NULL_HANDLE;    // keysOdd→hist
-    VkDescriptorSet dsSortEvenToOdd_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsSortOddToEven_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsSplat_ = VK_NULL_HANDLE;
+    // Per-slot sets reference per-slot (uniform/attr/keys/vals/hist) buffers.
+    VkDescriptorSet dsPreprocessSet1_[kFrameRing] = {};
+    VkDescriptorSet dsKeys_[kFrameRing] = {};
+    VkDescriptorSet dsHistEven_[kFrameRing] = {};   // keysEven→hist
+    VkDescriptorSet dsHistOdd_[kFrameRing] = {};    // keysOdd→hist
+    VkDescriptorSet dsSortEvenToOdd_[kFrameRing] = {};
+    VkDescriptorSet dsSortOddToEven_[kFrameRing] = {};
+    VkDescriptorSet dsSplat_[kFrameRing] = {};
 
     // ── CPU-side scene data (auto-framing + depth-quant range) ──
     std::vector<float> posX_, posY_, posZ_;  // gaussian centers
@@ -207,7 +213,8 @@ private:
     // ── Private helpers ──
     bool createSceneResources();
     void dispatchCov3d();
-    void updateUniforms(uint32_t slot, const float viewMatrix[16], const float projMatrix[16],
+    void updateUniforms(uint32_t slot,
+                        const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
                         float clipNear, float clipFar, float clipFadeFrac);
     void cleanupScene();
