@@ -86,6 +86,19 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
     comdlg32
 )
 
+# Splat-renderer selection (see gs_renderer_select.h). AUTO = compute on x64,
+# graphics on ARM64 (Snapdragon-X / Windows-on-ARM is tile-based deferred, so
+# the graphics path wins there). Force GRAPHICS to benchmark the TBDR path on an
+# immediate-mode desktop GPU — the gate the desktop-eval plan requires before
+# flipping any default on Windows — or COMPUTE to pin the legacy path.
+set(GS_RENDERER "AUTO" CACHE STRING "Splat renderer: AUTO | COMPUTE | GRAPHICS")
+set_property(CACHE GS_RENDERER PROPERTY STRINGS AUTO COMPUTE GRAPHICS)
+if(GS_RENDERER STREQUAL "GRAPHICS")
+    target_compile_definitions(gaussian_splatting_handle_vk_win PRIVATE GS_RENDERER_GRAPHICS=1)
+elseif(GS_RENDERER STREQUAL "COMPUTE")
+    target_compile_definitions(gaussian_splatting_handle_vk_win PRIVATE GS_RENDERER_COMPUTE=1)
+endif()
+
 if(MSVC)
     # /utf-8: tell MSVC the source files are UTF-8 (and the runtime
     # char set is UTF-8). Without this MSVC reads source literals

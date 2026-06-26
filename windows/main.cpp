@@ -24,7 +24,7 @@
 #include "logging.h"
 #include "input_handler.h"
 #include "xr_session.h"
-#include "gs_renderer.h"
+#include "gs_renderer_select.h"   // GsActiveRenderer = compute (x64) or graphics (_M_ARM64)
 #include "gs_scene_loader.h"
 #include "display3d_view.h"
 #include "view_rig_math.h"
@@ -98,7 +98,7 @@ static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
 
 // 3DGS state
-static GsRenderer g_gsRenderer;
+static GsActiveRenderer g_gsRenderer;
 // Cross-thread scene-load queue: the file dialog runs on the main (message-pump)
 // thread, but the actual GsRenderer::loadScene() submits Vulkan work on the
 // graphics queue and so MUST run on the same thread that drives per-frame

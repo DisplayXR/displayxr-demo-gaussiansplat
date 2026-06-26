@@ -66,13 +66,22 @@ struct GsAdrenoRenderer {
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
 
-    // Raycast pick for double-tap focus: returns the center of the loaded gaussian
-    // the ray passes closest to (within a scene-relative radius), in world space.
-    // A simple nearest-to-ray test over the CPU centers (posX_/Y/Z_) — enough to
-    // recenter the orbit on a tapped feature; no alpha compositing like the desktop
-    // GsRenderer::pickGaussian. Returns false on a clean miss / no scene.
+    // Drop-in parity with GsRenderer for the shared desktop demo harness
+    // (windows/macos main). The graphics renderer keeps only CPU splat centers
+    // (posX/Y/Z_), so these are honest but simpler than GsRenderer's
+    // opacity-weighted versions:
+    //  - getMainObjectBounds delegates to the robust [5%,95%] percentile bounds
+    //    (no voxel flood-fill); gridSize is ignored.
+    //  - pickGaussian does a nearest-center ray test over the cached centers,
+    //    gated by a scene-relative hit radius (clean misses return false, so a
+    //    double-tap on empty space doesn't latch onto a far floater), and
+    //    honouring the same [clipNear,clipFar] view-depth window as renderEye.
+    bool getMainObjectBounds(uint32_t gridSize,
+                             float outCenter[3], float outExtent[3]) const;
     bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
-                      float hitPos[3], float maxDistance = 100.0f) const;
+                      float hitPos[3], float maxDistance = 100.0f,
+                      const float viewMatrix[16] = nullptr,
+                      float clipNear = 0.0f, float clipFar = 0.0f) const;
 
     // Render one eye to a viewport region of a swapchain image. viewMatrix and
     // projMatrix are column-major float[16]. clipNearViewSpace/clipFarViewSpace

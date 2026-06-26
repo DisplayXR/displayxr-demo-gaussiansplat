@@ -89,6 +89,7 @@ endif()
 
 set(SHADER_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 set(SHADER_SOURCES
+    # Compute compositor (GsRenderer) — immediate-mode desktop path.
     shaders/precomp_cov3d.comp
     shaders/preprocess.comp
     shaders/prefix_sum.comp
@@ -97,6 +98,15 @@ set(SHADER_SOURCES
     shaders/sort.comp
     shaders/tile_boundary.comp
     shaders/render.comp
+    # Graphics pipeline (GsAdrenoRenderer) — TBDR path, also built on desktop so
+    # the renderer is selectable at compile time (gs_renderer_select.h). The
+    # glslangValidator loop infers stage from extension, so .vert/.frag here
+    # compile the same way (header splat.vert.h, var splat_vert_data, etc.).
+    # precomp_cov3d/hist/sort are shared with the compute path above.
+    shaders/adreno_preprocess.comp
+    shaders/splat_keys.comp
+    shaders/splat.vert
+    shaders/splat.frag
 )
 
 set(SHADER_HEADERS "")
@@ -123,6 +133,9 @@ endforeach()
 add_library(gs_renderer STATIC
     gs_renderer.h
     gs_renderer.cpp
+    gs_adreno_renderer.h
+    gs_adreno_renderer.cpp
+    gs_renderer_select.h
     gs_scene_loader.h
     gs_scene_loader.cpp
     gs_spz_loader.h

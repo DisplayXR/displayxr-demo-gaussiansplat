@@ -821,13 +821,30 @@ bool GsAdrenoRenderer::getRobustSceneBounds(float loPct, float hiPct,
     return true;
 }
 
-bool GsAdrenoRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
-                                    float hitPos[3], float maxDistance) const {
-    if (numGaussians_ == 0) return false;
+// ════════════════════ getMainObjectBounds / pickGaussian ════════════════════
 
-    // Scene-relative hit radius: a tap "hits" if the ray passes within ~12% of the
-    // scene's largest extent of a gaussian center — forgiving on a touchscreen
-    // without latching onto far-off floaters.
+bool GsAdrenoRenderer::getMainObjectBounds(uint32_t /*gridSize*/,
+                                           float outCenter[3], float outExtent[3]) const {
+    // No voxel flood-fill on the graphics leg: the robust [5%,95%] percentile
+    // bounds already exclude stray floaters and frame the main cluster well
+    // enough for auto-framing. (GsRenderer's flood-fill is a refinement, not a
+    // correctness requirement.)
+    return getRobustSceneBounds(0.05f, 0.95f, outCenter, outExtent);
+}
+
+bool GsAdrenoRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
+                                    float hitPos[3], float maxDistance,
+                                    const float viewMatrix[16],
+                                    float clipNear, float clipFar) const {
+    if (numGaussians_ == 0) return false;
+    float dl = std::sqrt(rayDir[0]*rayDir[0] + rayDir[1]*rayDir[1] + rayDir[2]*rayDir[2]);
+    if (dl < 1e-8f) return false;
+    const float dx = rayDir[0]/dl, dy = rayDir[1]/dl, dz = rayDir[2]/dl;
+
+    // Scene-relative hit radius: a tap "hits" only if the ray passes within ~12%
+    // of the scene's largest extent of a center — forgiving on a touchscreen
+    // without latching onto far-off floaters. Seeding bestPerp2 with this radius
+    // makes a clean miss (no center inside it) return false.
     float c[3], e[3];
     float maxPerp = 0.2f;
     if (getRobustSceneBounds(0.02f, 0.98f, c, e)) {
@@ -835,28 +852,29 @@ bool GsAdrenoRenderer::pickGaussian(const float rayOrigin[3], const float rayDir
         m = m > e[2] ? m : e[2];
         if (m > 1e-4f) maxPerp = 0.12f * m;
     }
-    const float maxPerp2 = maxPerp * maxPerp;
-
-    // Front-most gaussian center the ray passes within maxPerp of.
-    float bestT = 1e30f;
-    int bestIdx = -1;
+    // Closest splat center to the ray, among those in front of the eye, within
+    // maxDistance, inside the optional view-depth clip window (same window
+    // renderEye culls to, so a clipped splat can never be picked), and within
+    // the scene-relative hit radius.
+    float bestPerp2 = maxPerp * maxPerp, bestT = 0.0f; int bestIdx = -1;
     for (uint32_t i = 0; i < numGaussians_; i++) {
-        const float dx = posX_[i] - rayOrigin[0];
-        const float dy = posY_[i] - rayOrigin[1];
-        const float dz = posZ_[i] - rayOrigin[2];
-        const float t = dx * rayDir[0] + dy * rayDir[1] + dz * rayDir[2];
-        if (t < 0.05f || t > maxDistance) continue; // behind the eye / too far
-        const float px = dx - t * rayDir[0];
-        const float py = dy - t * rayDir[1];
-        const float pz = dz - t * rayDir[2];
-        const float perp2 = px * px + py * py + pz * pz;
-        if (perp2 > maxPerp2) continue;
-        if (t < bestT) { bestT = t; bestIdx = (int)i; }
+        float ox = posX_[i]-rayOrigin[0], oy = posY_[i]-rayOrigin[1], oz = posZ_[i]-rayOrigin[2];
+        float t = ox*dx + oy*dy + oz*dz;                 // projection along ray
+        if (t <= 0.0f || t > maxDistance) continue;       // behind eye or too far
+        if (viewMatrix && (clipNear > 0.0f || clipFar > 0.0f)) {
+            float vd = -(viewMatrix[2]*posX_[i] + viewMatrix[6]*posY_[i] +
+                         viewMatrix[10]*posZ_[i] + viewMatrix[14]);
+            if (clipNear > 0.0f && vd < clipNear) continue;
+            if (clipFar  > 0.0f && vd > clipFar)  continue;
+        }
+        float px = ox - t*dx, py = oy - t*dy, pz = oz - t*dz;
+        float perp2 = px*px + py*py + pz*pz;
+        if (perp2 < bestPerp2) { bestPerp2 = perp2; bestT = t; bestIdx = (int)i; }
     }
     if (bestIdx < 0) return false;
-    hitPos[0] = posX_[bestIdx];
-    hitPos[1] = posY_[bestIdx];
-    hitPos[2] = posZ_[bestIdx];
+    hitPos[0] = rayOrigin[0] + bestT*dx;
+    hitPos[1] = rayOrigin[1] + bestT*dy;
+    hitPos[2] = rayOrigin[2] + bestT*dz;
     return true;
 }
 
