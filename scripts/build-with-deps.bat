@@ -1,8 +1,30 @@
 @echo off
 setlocal
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
+:: Usage: scripts\build-with-deps.bat [x64|arm64]
+:: arm64 cross-compiles the gauss-splat Windows app from an x64 host. On ARM64
+:: the renderer auto-selects the graphics pipeline (gs_renderer_select.h sees
+:: _M_ARM64 — Snapdragon-X/Windows-on-ARM is tile-based deferred). Builds into a
+:: separate build_arm64\ tree. NOTE: builds but will not RUN until the DisplayXR
+:: runtime + a vendor display-processor plug-in exist for ARM64 (LeiaSR is
+:: x64-only today).
+set ARCH=%~1
+if "%ARCH%"=="" set ARCH=x64
+if /i "%ARCH%"=="x64" (
+    set "VCVARS=vcvars64.bat"
+    set "BUILDDIR=build"
+    set "ARCH_ARG="
+) else if /i "%ARCH%"=="arm64" (
+    set "VCVARS=vcvarsamd64_arm64.bat"
+    set "BUILDDIR=build_arm64"
+    set "ARCH_ARG=-DDISPLAYXR_TARGET_ARCH=ARM64"
+) else (
+    echo ERROR: unknown architecture "%ARCH%" ^(expected x64 or arm64^)
+    exit /b 1
+)
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\%VCVARS%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
-    echo ERROR: VS 2022 not found
+    echo ERROR: VS 2022 %VCVARS% not found
+    if /i "%ARCH%"=="arm64" echo For arm64, add the "MSVC ... ARM64/ARM64EC build tools" VS component.
     exit /b 1
 )
 set "PATH=%LOCALAPPDATA%\Microsoft\WinGet\Packages\Ninja-build.Ninja_Microsoft.Winget.Source_8wekyb3d8bbwe;%PATH%"
@@ -21,8 +43,9 @@ if "%VULKAN_SDK%"=="" (
 REM --- OpenXR loader -------------------------------------------------------------
 REM Auto-provision the prebuilt Khronos loader, pinned to the same spec revision as
 REM the vendored openxr_includes/ headers (XR_CURRENT_API_VERSION = 1.1.51). Cached
-REM under build\openxr_sdk so a fresh clone builds with no manually-staged SDK.
-REM (Mirrors what .github/workflows/build-windows.yml does in CI.)
+REM under build\openxr_sdk so a fresh clone builds with no manually-staged SDK. The
+REM prebuilt zip ships every arch (x64/ARM64/...), so one download serves both the
+REM x64 and arm64 configures. (Mirrors what .github/workflows/build-windows.yml does.)
 set "OPENXR_VER=1.1.51"
 set "OPENXR_DIR=%CD%\build\openxr_sdk"
 if not exist "%OPENXR_DIR%\x64\lib\openxr_loader.lib" (
@@ -36,8 +59,8 @@ if not exist "%OPENXR_DIR%\x64\lib\openxr_loader.lib" (
       "Remove-Item 'build\openxr_loader.zip' -Force" || exit /b 1
 )
 
-echo === Configuring ===
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DOpenXR_ROOT="%CD:\=/%/build/openxr_sdk" || exit /b 1
+echo === Configuring (%ARCH%) ===
+cmake -S . -B %BUILDDIR% -G Ninja -DCMAKE_BUILD_TYPE=Release %ARCH_ARG% -DOpenXR_ROOT="%CD:\=/%/build/openxr_sdk" || exit /b 1
 echo === Building ===
-cmake --build build || exit /b 1
-echo === DONE ===
+cmake --build %BUILDDIR% || exit /b 1
+echo === DONE: %BUILDDIR%\windows\gaussian_splatting_handle_vk_win.exe ===
