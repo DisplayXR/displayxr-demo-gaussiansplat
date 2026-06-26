@@ -57,7 +57,7 @@
 #include "mode_switch.h" // dxr::ModeSwitch — smooth 2D<->3D disparity ramp (inline on macOS)
 #include "display3d_view.h"
 #include "camera3d_view.h"
-#include "gs_renderer.h"
+#include "gs_renderer_select.h"   // GsActiveRenderer = graphics on Apple Silicon (default)
 #include "gs_scene_loader.h"
 #include "atlas_capture.h"
 
@@ -184,7 +184,7 @@ static NSUInteger g_savedWindowStyle = 0;
 static bool g_transparentBg = false;
 
 // 3DGS state
-static GsRenderer g_gsRenderer;
+static GsActiveRenderer g_gsRenderer;
 static std::string g_loadedFileName;
 
 static double g_avgFrameTime = 0.0;

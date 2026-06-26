@@ -24,7 +24,10 @@
 #pragma once
 
 #if !defined(GS_RENDERER_GRAPHICS) && !defined(GS_RENDERER_COMPUTE)
-#  if defined(__ANDROID__) || (defined(_WIN32) && defined(_M_ARM64))
+#  if defined(__ANDROID__) || defined(__APPLE__) || (defined(_WIN32) && defined(_M_ARM64))
+//   Apple Silicon is TBDR like Adreno, so the graphics path is the macOS
+//   default (over MoltenVK). x86_64 macs are EOL for this product; if one ever
+//   matters, predefine GS_RENDERER_COMPUTE for it.
 #    define GS_RENDERER_GRAPHICS 1
 #  else
 #    define GS_RENDERER_COMPUTE 1

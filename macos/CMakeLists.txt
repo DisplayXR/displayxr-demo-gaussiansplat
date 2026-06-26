@@ -62,6 +62,17 @@ target_link_libraries(gaussian_splatting_handle_vk_macos PRIVATE
     "-framework UniformTypeIdentifiers"
 )
 
+# Splat-renderer selection (see gs_renderer_select.h). AUTO = graphics on
+# Apple Silicon (TBDR, over MoltenVK) — the macOS default. Force COMPUTE to
+# benchmark/compare the legacy compute compositor, or GRAPHICS to pin it.
+set(GS_RENDERER "AUTO" CACHE STRING "Splat renderer: AUTO | COMPUTE | GRAPHICS")
+set_property(CACHE GS_RENDERER PROPERTY STRINGS AUTO COMPUTE GRAPHICS)
+if(GS_RENDERER STREQUAL "GRAPHICS")
+    target_compile_definitions(gaussian_splatting_handle_vk_macos PRIVATE GS_RENDERER_GRAPHICS=1)
+elseif(GS_RENDERER STREQUAL "COMPUTE")
+    target_compile_definitions(gaussian_splatting_handle_vk_macos PRIVATE GS_RENDERER_COMPUTE=1)
+endif()
+
 # Copy bundled default scene next to the exe (auto-loaded at startup).
 set(BUNDLED_SCENE "${CMAKE_CURRENT_SOURCE_DIR}/assets/butterfly.spz")
 if(EXISTS "${BUNDLED_SCENE}")
