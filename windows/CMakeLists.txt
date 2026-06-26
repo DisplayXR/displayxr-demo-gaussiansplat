@@ -24,6 +24,23 @@ if(NOT Vulkan_FOUND)
 endif()
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
+# Prebuilt-loader arch subdir (the Khronos SDK ships x64/ and ARM64/). Defaults
+# to x64; follows an ARM64 MSVC target, or pass -DDISPLAYXR_TARGET_ARCH=ARM64.
+# The selected arch is searched first; x64 stays as a fallback so the default
+# x64 build is unaffected.
+if(NOT DEFINED DISPLAYXR_TARGET_ARCH)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "ARM64" OR CMAKE_GENERATOR_PLATFORM MATCHES "ARM64")
+        set(DISPLAYXR_TARGET_ARCH "ARM64")
+    else()
+        set(DISPLAYXR_TARGET_ARCH "x64")
+    endif()
+endif()
+if(DISPLAYXR_TARGET_ARCH MATCHES "[Aa][Rr][Mm]64")
+    set(_OXR_ARCH_DIR "ARM64")
+else()
+    set(_OXR_ARCH_DIR "x64")
+endif()
+
 # OpenXR loader — CONFIG pkg first, then a user-specified OpenXR_ROOT fallback.
 set(OPENXR_FOUND FALSE)
 find_package(OpenXR QUIET CONFIG)
@@ -35,7 +52,7 @@ endif()
 if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
     find_library(OPENXR_LOADER_LIB
         NAMES openxr_loader openxr_loader-1_0
-        PATHS "${OpenXR_ROOT}/x64/lib" "${OpenXR_ROOT}/lib" "${OpenXR_ROOT}/bin"
+        PATHS "${OpenXR_ROOT}/${_OXR_ARCH_DIR}/lib" "${OpenXR_ROOT}/x64/lib" "${OpenXR_ROOT}/lib" "${OpenXR_ROOT}/bin"
         NO_DEFAULT_PATH
     )
     if(OPENXR_LOADER_LIB)
@@ -43,7 +60,7 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
         add_library(OpenXR::openxr_loader SHARED IMPORTED)
         find_file(OPENXR_LOADER_DLL
             NAMES openxr_loader.dll openxr_loader-1_0.dll
-            PATHS "${OpenXR_ROOT}/x64/bin" "${OpenXR_ROOT}/bin"
+            PATHS "${OpenXR_ROOT}/${_OXR_ARCH_DIR}/bin" "${OpenXR_ROOT}/x64/bin" "${OpenXR_ROOT}/bin"
             NO_DEFAULT_PATH
         )
         if(OPENXR_LOADER_DLL)
