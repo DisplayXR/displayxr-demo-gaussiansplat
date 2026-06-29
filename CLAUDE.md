@@ -98,6 +98,17 @@ Anti-aliased edges become hard-mask alpha on Leia hardware (fundamental SR-weave
 
 The CMakeLists has historically broken on dev paths with spaces (e.g. `C:\Users\Sparks i7 3080\...`). Two specific fixes were applied previously; check `git log -- CMakeLists.txt 3dgs_common/CMakeLists.txt windows/CMakeLists.txt` for prior space-in-path patches before assuming the build works on a fresh clone in a quoted-path workspace. If `scripts\build_windows.bat` fails with a path-quoting error, that's the symptom.
 
+**Dev-build dependency rule (don't regress).** `scripts\build-with-deps.bat`
+**auto-provisions the OpenXR loader**, pinned to the same spec rev as the vendored
+`openxr_includes/` headers (`XR_CURRENT_API_VERSION`, currently 1.1.51) — never
+hardcode an SDK path (`C:/dev/openxr_sdk`, `C:/VulkanSDK/<ver>`); Vulkan comes
+from the `VULKAN_SDK` env. A fresh clone must build with only VS 2022 + Ninja +
+the Vulkan SDK. Keep all three pins equal: CI (`build-windows.yml`) == dev script
+== header rev. This is a **dev clone-and-build** concern only — the released
+installer always provisioned the loader via CI and bundles `openxr_loader.dll`
+next to the exe, so it was never affected. (Fixed in #46; the broken script was
+inherited from the modelviewer bootstrap.)
+
 ## Releasing
 
 Each demo cuts its own release tag (`vX.Y.Z`) on its own cadence. The
