@@ -318,8 +318,9 @@ bool GsAdrenoRenderer::createSceneResources() {
     keysOddBuffer_ = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
     valsEvenBuffer_= gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
     valsOddBuffer_ = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
-    uniformBuffer_ = gsCreateBuffer(device_, physDevice_, sizeof(GsUniformBuffer),
-                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis);
+    for (uint32_t i = 0; i < kFrameRing; i++)
+        uniformBuffer_[i] = gsCreateBuffer(device_, physDevice_, sizeof(GsUniformBuffer),
+                                           VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis);
 
     // Radix sort workgroup sizing — parallelism, NOT just coverage. With a
     // fixed 256 blocks/workgroup the whole sort collapses onto 1 workgroup at
@@ -345,9 +346,9 @@ bool GsAdrenoRenderer::createSceneResources() {
     {
         VkDescriptorPoolSize sizes[2] = {
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 40},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4}};
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 4 + kFrameRing}};
         VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        ci.maxSets = 12; ci.poolSizeCount = 2; ci.pPoolSizes = sizes;
+        ci.maxSets = 12 + kFrameRing; ci.poolSizeCount = 2; ci.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(device_, &ci, nullptr, &descriptorPool_) != VK_SUCCESS)
             return false;
     }
@@ -487,9 +488,11 @@ bool GsAdrenoRenderer::createSceneResources() {
     dsPreprocessSet0_ = allocDS(device_, descriptorPool_, dslPreprocessSet0_);
     writeDS(device_, dsPreprocessSet0_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, vertexBuffer_.buffer, vertexBuffer_.size);
     writeDS(device_, dsPreprocessSet0_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, cov3dBuffer_.buffer, cov3dBuffer_.size);
-    dsPreprocessSet1_ = allocDS(device_, descriptorPool_, dslPreprocessSet1_);
-    writeDS(device_, dsPreprocessSet1_, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uniformBuffer_.buffer, uniformBuffer_.size);
-    writeDS(device_, dsPreprocessSet1_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_.buffer, attrBuffer_.size);
+    for (uint32_t i = 0; i < kFrameRing; i++) {
+        dsPreprocessSet1_[i] = allocDS(device_, descriptorPool_, dslPreprocessSet1_);
+        writeDS(device_, dsPreprocessSet1_[i], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uniformBuffer_[i].buffer, uniformBuffer_[i].size);
+        writeDS(device_, dsPreprocessSet1_[i], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_.buffer, attrBuffer_.size);
+    }
 
     dsKeys_ = allocDS(device_, descriptorPool_, dslKeys_);
     writeDS(device_, dsKeys_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_.buffer, attrBuffer_.size);
@@ -547,7 +550,7 @@ void GsAdrenoRenderer::dispatchCov3d() {
 
 // ═══════════════════════════ updateUniforms ═════════════════════════════════
 
-void GsAdrenoRenderer::updateUniforms(const float viewMatrix[16], const float projMatrix[16],
+void GsAdrenoRenderer::updateUniforms(uint32_t slot, const float viewMatrix[16], const float projMatrix[16],
                                       uint32_t vpWidth, uint32_t vpHeight,
                                       float clipNear, float clipFar, float clipFadeFrac) {
     GsUniformBuffer ub;
@@ -574,9 +577,9 @@ void GsAdrenoRenderer::updateUniforms(const float viewMatrix[16], const float pr
     ub.tan_fovy = (std::abs(p11) > 1e-6f) ? (1.0f / std::abs(p11)) : 1.0f;
     ub.clip_far = clipFar; ub.clip_fade_frac = clipFadeFrac; ub.clip_near = clipNear;
     void* m = nullptr;
-    vkMapMemory(device_, uniformBuffer_.memory, 0, sizeof(GsUniformBuffer), 0, &m);
+    vkMapMemory(device_, uniformBuffer_[slot].memory, 0, sizeof(GsUniformBuffer), 0, &m);
     memcpy(m, &ub, sizeof(GsUniformBuffer));
-    vkUnmapMemory(device_, uniformBuffer_.memory);
+    vkUnmapMemory(device_, uniformBuffer_[slot].memory);
 }
 
 // ═══════════════════════════════ renderEye ══════════════════════════════════
@@ -596,8 +599,6 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     uint32_t rh = (uint32_t)std::lround(viewportHeight * renderScale_);
     if (rw < 1) rw = 1; if (rh < 1) rh = 1;
     if (rw > width_) rw = width_; if (rh > height_) rh = height_;
-
-    updateUniforms(viewMatrix, projMatrix, rw, rh, clipNearViewSpace, clipFarViewSpace, clipFadeFrac);
 
     // Per-eye depth-quant range: project the cached scene bbox corners to view
     // depth, pad 2%, clamp to the cull window (matches the desktop derivation).
@@ -624,6 +625,12 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     // the next eye/frame instead of CPU-blocking on every eye.
     const uint32_t slot = (uint32_t)(frameCounter_ % kFrameRing);
     vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
+
+    // Write THIS slot's uniform only AFTER its prior GPU use has finished (the
+    // fence above), and into a per-slot buffer — so an eye still in flight can't
+    // have its camera matrices clobbered by the next eye's update. (This was the
+    // left-eye-stutter race: a single shared uniform written before the wait.)
+    updateUniforms(slot, viewMatrix, projMatrix, rw, rh, clipNearViewSpace, clipFarViewSpace, clipFadeFrac);
 
     const bool tsOn = (timestampPeriod_ > 0.0f && tsPool_[slot] != VK_NULL_HANDLE);
     VkQueryPool tsq = tsOn ? tsPool_[slot] : VK_NULL_HANDLE;
@@ -663,7 +670,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
 
     // ── 1. preprocess: project + conic + SH + depth → attr[] ──
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocess_);
-    VkDescriptorSet pp[] = {dsPreprocessSet0_, dsPreprocessSet1_};
+    VkDescriptorSet pp[] = {dsPreprocessSet0_, dsPreprocessSet1_[slot]};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutPreprocess_, 0, 2, pp, 0, nullptr);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
@@ -809,12 +816,14 @@ void GsAdrenoRenderer::cleanupScene() {
     dl(layoutCov3d_); dl(layoutPreprocess_); dl(layoutKeys_); dl(layoutHist_); dl(layoutSort_); dl(layoutSplat_);
     ds(dslCov3d_); ds(dslPreprocessSet0_); ds(dslPreprocessSet1_); ds(dslKeys_); ds(dslHist_); ds(dslSort_); ds(dslSplat_);
     if (descriptorPool_) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
-    dsCov3d_ = dsPreprocessSet0_ = dsPreprocessSet1_ = dsKeys_ = VK_NULL_HANDLE;
+    dsCov3d_ = dsPreprocessSet0_ = dsKeys_ = VK_NULL_HANDLE;
+    for (uint32_t i = 0; i < kFrameRing; i++) dsPreprocessSet1_[i] = VK_NULL_HANDLE;
     dsHistEven_ = dsHistOdd_ = dsSortEvenToOdd_ = dsSortOddToEven_ = dsSplat_ = VK_NULL_HANDLE;
 
     gsDestroyImage(device_, renderImage_);
     gsDestroyBuffer(device_, vertexBuffer_); gsDestroyBuffer(device_, cov3dBuffer_);
-    gsDestroyBuffer(device_, uniformBuffer_); gsDestroyBuffer(device_, attrBuffer_);
+    for (uint32_t i = 0; i < kFrameRing; i++) gsDestroyBuffer(device_, uniformBuffer_[i]);
+    gsDestroyBuffer(device_, attrBuffer_);
     gsDestroyBuffer(device_, keysEvenBuffer_); gsDestroyBuffer(device_, keysOddBuffer_);
     gsDestroyBuffer(device_, valsEvenBuffer_); gsDestroyBuffer(device_, valsOddBuffer_);
     gsDestroyBuffer(device_, histBuffer_);

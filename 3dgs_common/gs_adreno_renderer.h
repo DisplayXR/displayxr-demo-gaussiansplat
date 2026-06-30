@@ -139,7 +139,8 @@ private:
     // ── GPU buffers ──
     GsBuffer vertexBuffer_;     // N × 240
     GsBuffer cov3dBuffer_;      // N × 24
-    GsBuffer uniformBuffer_;    // 176 (host-visible)
+    GsBuffer uniformBuffer_[kFrameRing];  // 176 (host-visible), one per ring slot — eyes
+                                          // in flight must not share (else left-eye stutter)
     GsBuffer attrBuffer_;       // N × 64 (VertexAttribute)
     GsBuffer keysEvenBuffer_;   // N × 4
     GsBuffer keysOddBuffer_;    // N × 4
@@ -179,7 +180,7 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet dsCov3d_ = VK_NULL_HANDLE;
     VkDescriptorSet dsPreprocessSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsPreprocessSet1_ = VK_NULL_HANDLE;
+    VkDescriptorSet dsPreprocessSet1_[kFrameRing] = {};  // per-slot (binds uniformBuffer_[slot])
     VkDescriptorSet dsKeys_ = VK_NULL_HANDLE;
     VkDescriptorSet dsHistEven_ = VK_NULL_HANDLE;   // keysEven→hist
     VkDescriptorSet dsHistOdd_ = VK_NULL_HANDLE;    // keysOdd→hist
@@ -196,7 +197,7 @@ private:
     // ── Private helpers ──
     bool createSceneResources();
     void dispatchCov3d();
-    void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
+    void updateUniforms(uint32_t slot, const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
                         float clipNear, float clipFar, float clipFadeFrac);
     void cleanupScene();
