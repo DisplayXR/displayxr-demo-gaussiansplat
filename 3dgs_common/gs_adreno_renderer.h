@@ -66,6 +66,14 @@ struct GsAdrenoRenderer {
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
 
+    // Raycast pick for double-tap focus: returns the center of the loaded gaussian
+    // the ray passes closest to (within a scene-relative radius), in world space.
+    // A simple nearest-to-ray test over the CPU centers (posX_/Y/Z_) — enough to
+    // recenter the orbit on a tapped feature; no alpha compositing like the desktop
+    // GsRenderer::pickGaussian. Returns false on a clean miss / no scene.
+    bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
+                      float hitPos[3], float maxDistance = 100.0f) const;
+
     // Render one eye to a viewport region of a swapchain image. viewMatrix and
     // projMatrix are column-major float[16]. clipNearViewSpace/clipFarViewSpace
     // (>0) cull splats outside the view-space forward-depth window; clipFadeFrac
@@ -139,7 +147,10 @@ private:
     // ── GPU buffers ──
     GsBuffer vertexBuffer_;     // N × 240
     GsBuffer cov3dBuffer_;      // N × 24
-    GsBuffer uniformBuffer_;    // 176 (host-visible)
+    GsBuffer uniformBuffer_[kFrameRing];  // 176 (host-visible), per ring slot —
+                                          // a single shared UBO raced across the 3
+                                          // in-flight eyes → left-eye judder (#44)
+                                          // review). Per-slot + write-after-fence.
     GsBuffer attrBuffer_;       // N × 64 (VertexAttribute)
     GsBuffer keysEvenBuffer_;   // N × 4
     GsBuffer keysOddBuffer_;    // N × 4
@@ -179,7 +190,7 @@ private:
     VkDescriptorPool descriptorPool_ = VK_NULL_HANDLE;
     VkDescriptorSet dsCov3d_ = VK_NULL_HANDLE;
     VkDescriptorSet dsPreprocessSet0_ = VK_NULL_HANDLE;
-    VkDescriptorSet dsPreprocessSet1_ = VK_NULL_HANDLE;
+    VkDescriptorSet dsPreprocessSet1_[kFrameRing] = {}; // per-slot (binds uniformBuffer_[slot])
     VkDescriptorSet dsKeys_ = VK_NULL_HANDLE;
     VkDescriptorSet dsHistEven_ = VK_NULL_HANDLE;   // keysEven→hist
     VkDescriptorSet dsHistOdd_ = VK_NULL_HANDLE;    // keysOdd→hist
@@ -196,7 +207,7 @@ private:
     // ── Private helpers ──
     bool createSceneResources();
     void dispatchCov3d();
-    void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
+    void updateUniforms(uint32_t slot, const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
                         float clipNear, float clipFar, float clipFadeFrac);
     void cleanupScene();
