@@ -141,15 +141,31 @@ float g_spin_speed = 0.01f;
 bool g_has_view_rig = false;
 std::atomic<float> g_rig_vh{1.0f};
 
-// Swipe-orbit: a one-finger drag rotates the virtual display (yaw about up, pitch
-// about right), matching the macOS/Windows gauss mouse-drag (same 0.005 rad/px
-// sensitivity, same -= convention, pitch clamped to ±1.5). Accumulated in
-// process_touch_event (fed via MainActivity.dispatchTouchEvent → nativeOnTouch,
-// runtime#499) and applied to the DISPLAY rig pose orientation at xrLocateViews; a
-// double-tap resets to the framed pose. The OOP runtime honors the app-supplied rig
-// pose, so this needs no runtime change.
-std::atomic<float> g_orbit_yaw{0.0f};
-std::atomic<float> g_orbit_pitch{0.0f};
+// Tablet gesture state (fed via MainActivity.dispatchTouchEvent → nativeOnTouch +
+// a GestureDetector, runtime#499). All applied to the DISPLAY rig pose / vH at
+// xrLocateViews; the OOP runtime honors the app-supplied rig pose, so none of this
+// needs a runtime change. Mirrors the macOS/Windows gauss controls:
+//   1-finger drag  → orbit (rig orientation, yaw about up / pitch about right)
+//   2-finger pinch → zoom  (scales the virtual display height)
+//   double-tap     → focus (raycast the splat, smooth-fly the rig to the hit;
+//                           this is also how you navigate laterally)
+//   long-press     → reset (orbit/zoom/recenter back to the framed pose)
+std::atomic<float> g_orbit_yaw{0.0f};   // 1-finger drag, 0.005 rad/px, -= convention
+std::atomic<float> g_orbit_pitch{0.0f}; // clamped ±1.5 rad
+std::atomic<float> g_zoom{1.0f};        // pinch: >1 zooms in (rig_vh = base/g_zoom)
+std::atomic<float> g_pan_x{0.0f};       // rig position X — moved by double-tap focus
+std::atomic<float> g_pan_y{0.0f};       // rig position Y — moved by double-tap focus
+
+// Double-tap focus: a pending screen-space tap (NDC), resolved against the splat in
+// the render loop (needs the located views) into a smooth rig-position fly-to. The
+// transition lerps g_pan_* toward the hit point over a few frames.
+std::atomic<bool> g_focus_pending{false};
+std::atomic<float> g_focus_ndc_x{0.0f};
+std::atomic<float> g_focus_ndc_y{0.0f};
+std::atomic<bool> g_transitioning{false};
+float g_trans_from_x = 0.0f, g_trans_from_y = 0.0f;
+float g_trans_to_x = 0.0f, g_trans_to_y = 0.0f;
+float g_trans_t = 0.0f;
 
 // Build a quaternion from yaw (about +Y) then pitch (about +X), verbatim from
 // common/view_rig_math.h quat_from_yaw_pitch (inlined to avoid an extra include
@@ -938,16 +954,31 @@ render_frame()
 		// XrView{pose, fov}. Identity pose = display plane at the world
 		// origin; the recentered splat straddles it. The raw channel reports
 		// the DP's display-space eyes (verification/logging only — no HUD).
-		const float rig_vh = g_rig_vh.load(std::memory_order_relaxed);
+		// Advance a focus fly-to transition (double-tap), easing g_pan_* toward the
+		// picked hit point over ~0.4 s. Inert until a focus sets g_transitioning.
+		if (g_transitioning.load(std::memory_order_relaxed)) {
+			g_trans_t += 0.06f; // ~16 frames at 60 fps
+			float u = g_trans_t > 1.0f ? 1.0f : g_trans_t;
+			const float s = u * u * (3.0f - 2.0f * u); // smoothstep
+			g_pan_x.store(g_trans_from_x + (g_trans_to_x - g_trans_from_x) * s,
+			              std::memory_order_relaxed);
+			g_pan_y.store(g_trans_from_y + (g_trans_to_y - g_trans_from_y) * s,
+			              std::memory_order_relaxed);
+			if (u >= 1.0f) g_transitioning.store(false, std::memory_order_relaxed);
+		}
+
+		// Tablet gestures applied to the rig: pinch → zoom (smaller vH = zoomed in),
+		// 2-finger drag → pan (rig position in its view plane), 1-finger drag →
+		// orbit (rig orientation). The runtime resolves the off-axis Kooima around
+		// this pose (server-side over IPC on the OOP path).
+		const float rig_vh = g_rig_vh.load(std::memory_order_relaxed) /
+		                     g_zoom.load(std::memory_order_relaxed);
 		XrPosef rig_pose = {};
-		// Swipe-orbit: rotate the virtual display by the accumulated drag (identity
-		// when untouched). Matches macOS/Windows gauss, which set the same rig
-		// orientation from a mouse drag; the runtime resolves the off-axis Kooima
-		// around it (server-side over IPC on the OOP path).
 		orbit_quat_from_yaw_pitch(g_orbit_yaw.load(std::memory_order_relaxed),
 		                          g_orbit_pitch.load(std::memory_order_relaxed),
 		                          &rig_pose.orientation);
-		rig_pose.position = {0.0f, 0.0f, 0.0f};
+		rig_pose.position = {g_pan_x.load(std::memory_order_relaxed),
+		                     g_pan_y.load(std::memory_order_relaxed), 0.0f};
 		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
 		if (g_has_view_rig) {
@@ -982,6 +1013,65 @@ render_frame()
 				     views[0].fov.angleUp, views[0].fov.angleDown);
 				logged_rig = true;
 			}
+
+			// Double-tap focus: raycast the tapped point against the splat and fly
+			// the rig (lateral pan) to the hit, so the tapped feature becomes the new
+			// orbit center — the Android analogue of the desktop double-click focus.
+			// Uses the shared 3dgs_common CPU picker (g_gs.pickGaussian).
+			if (g_focus_pending.exchange(false, std::memory_order_acquire)) {
+				// Center eye = average of the located views' poses + off-axis fovs.
+				XrVector3f cpos = {0, 0, 0};
+				XrFovf cfov = {0, 0, 0, 0};
+				for (uint32_t e = 0; e < kViewCount; ++e) {
+					cpos.x += views[e].pose.position.x;
+					cpos.y += views[e].pose.position.y;
+					cpos.z += views[e].pose.position.z;
+					cfov.angleLeft += views[e].fov.angleLeft;
+					cfov.angleRight += views[e].fov.angleRight;
+					cfov.angleUp += views[e].fov.angleUp;
+					cfov.angleDown += views[e].fov.angleDown;
+				}
+				const float inv = 1.0f / (float)kViewCount;
+				cpos.x *= inv; cpos.y *= inv; cpos.z *= inv;
+				cfov.angleLeft *= inv; cfov.angleRight *= inv;
+				cfov.angleUp *= inv; cfov.angleDown *= inv;
+				const XrQuaternionf q = views[0].pose.orientation; // eyes share orientation
+
+				const float ndcX = g_focus_ndc_x.load(std::memory_order_relaxed);
+				const float ndcY = g_focus_ndc_y.load(std::memory_order_relaxed);
+				// View-space ray dir through the tap (off-axis fov); camera looks −Z.
+				const float tl = tanf(cfov.angleLeft), tr = tanf(cfov.angleRight);
+				const float tdn = tanf(cfov.angleDown), tup = tanf(cfov.angleUp);
+				float vx = tl + (tr - tl) * (ndcX + 1.0f) * 0.5f;
+				float vy = tdn + (tup - tdn) * (ndcY + 1.0f) * 0.5f;
+				float vz = -1.0f;
+				const float vl = sqrtf(vx * vx + vy * vy + vz * vz);
+				vx /= vl; vy /= vl; vz /= vl;
+				// Rotate the view-space dir into world: d' = v + 2qw(q×v) + 2q×(q×v).
+				const float qx = q.x, qy = q.y, qz = q.z, qw = q.w;
+				const float tX = 2.0f * (qy * vz - qz * vy);
+				const float tY = 2.0f * (qz * vx - qx * vz);
+				const float tZ = 2.0f * (qx * vy - qy * vx);
+				const float wx = vx + qw * tX + (qy * tZ - qz * tY);
+				const float wy = vy + qw * tY + (qz * tX - qx * tZ);
+				const float wz = vz + qw * tZ + (qx * tY - qy * tX);
+
+				float rayOrigin[3] = {cpos.x, cpos.y, cpos.z};
+				float rayDir[3] = {wx, wy, wz};
+				float hit[3];
+				if (g_gs.pickGaussian(rayOrigin, rayDir, hit, 100.0f)) {
+					g_trans_from_x = g_pan_x.load(std::memory_order_relaxed);
+					g_trans_from_y = g_pan_y.load(std::memory_order_relaxed);
+					g_trans_to_x = hit[0];
+					g_trans_to_y = hit[1];
+					g_trans_t = 0.0f;
+					g_transitioning.store(true, std::memory_order_relaxed);
+					LOGI("focus: hit (%.3f,%.3f,%.3f) → recenter", hit[0], hit[1], hit[2]);
+				} else {
+					LOGI("focus: ray missed the splat (ndc %.2f,%.2f)", ndcX, ndcY);
+				}
+			}
+
 			// Splat model (recenter + spin) — same for both eyes.
 			const Mat4 splat_model = build_splat_model((float)g_frame_count * g_spin_speed);
 			auto pf_r0 = pf_now();
@@ -1163,56 +1253,90 @@ handle_cmd(struct android_app *app, int32_t cmd)
 // xrLocateViews. action uses MotionEvent.ACTION_* (0=DOWN, 1=UP, 2=MOVE), time_ms is
 // the event time (for double-tap timing). Single-pointer (pointer 0).
 void
-process_touch_event(int32_t action, float x, float y, int64_t time_ms)
+process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1, float y1)
 {
-	static float last_x = 0.0f, last_y = 0.0f;
-	static float moved_px = 0.0f;
-	static int64_t last_up_ms = 0;
+	static float last_x = 0.0f, last_y = 0.0f;            // 1-finger orbit anchor
+	static float pinch_last = 0.0f;                        // last 2-finger distance
+	static bool two_finger = false;                        // a 2-finger gesture is active
+	static bool drag_valid = false;                        // a clean 1-finger drag
 
+	if (count >= 2) {
+		// ── two fingers: pinch-to-zoom ── (suppresses orbit). Two-finger pan was
+		// intentionally dropped — it competed with the pinch; lateral navigation is
+		// via double-tap focus instead.
+		drag_valid = false;
+		const float ex = x0 - x1, ey = y0 - y1;
+		const float dist = sqrtf(ex * ex + ey * ey);
+		if (two_finger && pinch_last > 1.0f) {
+			// Pinch: scale zoom by the finger-distance ratio (clamped 0.2×–8×).
+			float z = g_zoom.load(std::memory_order_relaxed) * (dist / pinch_last);
+			if (z < 0.2f) z = 0.2f;
+			if (z > 8.0f) z = 8.0f;
+			g_zoom.store(z, std::memory_order_relaxed);
+		}
+		pinch_last = dist;
+		two_finger = true;
+		return;
+	}
+
+	// ── fewer than two fingers ──
+	pinch_last = 0.0f;
 	switch (action) {
 	case AMOTION_EVENT_ACTION_DOWN:
-		last_x = x;
-		last_y = y;
-		moved_px = 0.0f;
+		last_x = x0;
+		last_y = y0;
+		drag_valid = true;
+		two_finger = false;
 		break;
-	case AMOTION_EVENT_ACTION_MOVE: {
-		const float dx = x - last_x;
-		const float dy = y - last_y;
-		last_x = x;
-		last_y = y;
-		moved_px += fabsf(dx) + fabsf(dy);
-		// Match macOS/Windows gauss: 0.005 rad/px, sign-flipped so the virtual
-		// display tracks the finger; pitch clamped to ±1.5 rad. The runtime applies
-		// this rig orientation, so the splat orbits the way a mouse drag does there.
-		float yaw = g_orbit_yaw.load(std::memory_order_relaxed) - dx * 0.005f;
-		float pitch = g_orbit_pitch.load(std::memory_order_relaxed) - dy * 0.005f;
-		if (pitch > 1.5f) pitch = 1.5f;
-		if (pitch < -1.5f) pitch = -1.5f;
-		g_orbit_yaw.store(yaw, std::memory_order_relaxed);
-		g_orbit_pitch.store(pitch, std::memory_order_relaxed);
-		break;
-	}
-	case AMOTION_EVENT_ACTION_UP: {
-		// A drag (significant travel) never counts as a tap. Two near-stationary
-		// taps within ~300 ms reset the orbit (like Space on the desktop gauss).
-		if (moved_px > 24.0f) {
-			last_up_ms = 0;
-			break;
-		}
-		const int64_t dt = time_ms - last_up_ms;
-		if (last_up_ms != 0 && dt > 0 && dt < 300) {
-			LOGI("swipe: double-tap → reset orbit");
-			g_orbit_yaw.store(0.0f, std::memory_order_relaxed);
-			g_orbit_pitch.store(0.0f, std::memory_order_relaxed);
-			last_up_ms = 0;
-		} else {
-			last_up_ms = time_ms;
+	case AMOTION_EVENT_ACTION_MOVE:
+		// Suppress orbit while/after a 2-finger gesture (until all fingers lift) so
+		// lifting one finger of a pinch doesn't snap the orbit.
+		if (drag_valid && !two_finger) {
+			const float dx = x0 - last_x;
+			const float dy = y0 - last_y;
+			last_x = x0;
+			last_y = y0;
+			// macOS/Windows gauss: 0.005 rad/px, sign-flipped so the display tracks
+			// the finger; pitch clamped ±1.5.
+			float yaw = g_orbit_yaw.load(std::memory_order_relaxed) - dx * 0.005f;
+			float pitch = g_orbit_pitch.load(std::memory_order_relaxed) - dy * 0.005f;
+			if (pitch > 1.5f) pitch = 1.5f;
+			if (pitch < -1.5f) pitch = -1.5f;
+			g_orbit_yaw.store(yaw, std::memory_order_relaxed);
+			g_orbit_pitch.store(pitch, std::memory_order_relaxed);
 		}
 		break;
-	}
+	case AMOTION_EVENT_ACTION_UP:
+	case AMOTION_EVENT_ACTION_CANCEL:
+		drag_valid = false;
+		two_finger = false;
+		break;
 	default:
 		break;
 	}
+}
+
+// Double-tap focus: store the tap NDC; the render loop raycasts it against the
+// splat once it has the located views, and flies the rig to the hit (Chunk 2).
+void
+request_focus(float ndc_x, float ndc_y)
+{
+	g_focus_ndc_x.store(ndc_x, std::memory_order_relaxed);
+	g_focus_ndc_y.store(ndc_y, std::memory_order_relaxed);
+	g_focus_pending.store(true, std::memory_order_release);
+}
+
+// Long-press / reset: orbit, zoom, pan back to the framed pose.
+void
+reset_view(void)
+{
+	g_orbit_yaw.store(0.0f, std::memory_order_relaxed);
+	g_orbit_pitch.store(0.0f, std::memory_order_relaxed);
+	g_zoom.store(1.0f, std::memory_order_relaxed);
+	g_pan_x.store(0.0f, std::memory_order_relaxed);
+	g_pan_y.store(0.0f, std::memory_order_relaxed);
+	g_transitioning.store(false, std::memory_order_relaxed);
+	LOGI("gesture: reset view");
 }
 
 } // namespace
@@ -1239,13 +1363,32 @@ Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
-// Swipe-orbit bridge: MainActivity.dispatchTouchEvent forwards pointer-0 events
-// here (the native InputQueue is not fed under the runtime overlay, runtime#499).
+// Gesture bridge: MainActivity.dispatchTouchEvent forwards multitouch here (the
+// native InputQueue is not fed under the runtime overlay, runtime#499). count is
+// the pointer count; (x1,y1) are valid only when count>=2.
 extern "C" JNIEXPORT void JNICALL
 Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeOnTouch(
-    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat x, jfloat y, jlong time_ms)
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jint count, jfloat x0, jfloat y0, jfloat x1,
+    jfloat y1)
 {
-	process_touch_event(action, x, y, (int64_t)time_ms);
+	process_touch_event(action, count, x0, y0, x1, y1);
+}
+
+// Double-tap focus (from the Java GestureDetector). ndc_x/ndc_y are the tap in
+// normalized device coords (+Y up); resolved against the splat in the render loop.
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeFocusAt(
+    JNIEnv * /*env*/, jobject /*thiz*/, jfloat ndc_x, jfloat ndc_y)
+{
+	request_focus(ndc_x, ndc_y);
+}
+
+// Long-press reset (from the Java GestureDetector).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeResetView(
+    JNIEnv * /*env*/, jobject /*thiz*/)
+{
+	reset_view();
 }
 
 extern "C" void
