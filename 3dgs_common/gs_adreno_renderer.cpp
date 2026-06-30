@@ -154,8 +154,11 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     renderScale_ = 1.0f;
     keepFrac_ = 1.0f;
 #if defined(__ANDROID__)
-    renderScale_ = 0.45f;  // Adreno default — holds ~30 fps with the parallel sort
-    keepFrac_ = 0.25f;     // decimate to ~25% of gaussians (soft splats hide it)
+    // Max-quality default: native resolution + all gaussians. On the NP02J this is
+    // ~22 fps (vs ~48 at 0.45/0.25) — the team chose image quality over framerate
+    // for the demo. debug.dxr.gs.scale / .keep still override live for perf sweeps.
+    renderScale_ = 1.0f;
+    keepFrac_ = 1.0f;
     {
         char v[PROP_VALUE_MAX] = {0};
         if (__system_property_get("debug.dxr.gs.scale", v) > 0) {

@@ -129,8 +129,21 @@ std::atomic<bool> g_scene_loaded{false};
 // frames itself; size is governed by g_rig_vh (virtual display height in
 // world units), not by pushing the model away.
 float g_scene_center[3] = {0.0f, 0.0f, 0.0f};
-// Slow turntable spin about Y (radians/frame). 0 = static.
+// Slow turntable spin about Y (radians/frame). 0 = static. The angle is
+// accumulated (g_spin_angle) and only advances after 10 s of no touch input
+// (g_last_input_ms), so the scene is still at startup and while the user interacts.
 float g_spin_speed = 0.01f;
+float g_spin_angle = 0.0f;                 // render-thread accumulated auto-spin
+std::atomic<int64_t> g_last_input_ms{0};   // last touch (ms); 0 = uninit → set frame 0
+
+// Milliseconds on a monotonic clock (usable from the UI/JNI threads and render).
+static int64_t now_ms() {
+	return std::chrono::duration_cast<std::chrono::milliseconds>(
+	           std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+// Any touch resets the auto-spin idle timer.
+static void mark_user_input() { g_last_input_ms.store(now_ms(), std::memory_order_relaxed); }
 
 // XR_EXT_view_rig state (#396 W7). g_has_view_rig latches at instance create
 // when the runtime advertises the extension. The rig is a DISPLAY rig with
@@ -148,25 +161,29 @@ std::atomic<float> g_rig_vh{1.0f};
 // needs a runtime change. Mirrors the macOS/Windows gauss controls:
 //   1-finger drag  → orbit (rig orientation, yaw about up / pitch about right)
 //   2-finger pinch → zoom  (scales the virtual display height)
-//   double-tap     → focus (raycast the splat, smooth-fly the rig to the hit;
-//                           this is also how you navigate laterally)
-//   long-press     → reset (orbit/zoom/recenter back to the framed pose)
+//   double-tap     → focus: raycast the splat; the picked 3D point becomes the
+//                    orbit/spin PIVOT (g_scene_center), so orbit AND the auto-spin
+//                    rotate about the tapped feature, at its true depth.
+//   long-press     → reset (orbit/zoom + pivot back to the framed centroid)
 std::atomic<float> g_orbit_yaw{0.0f};   // 1-finger drag, 0.005 rad/px, -= convention
 std::atomic<float> g_orbit_pitch{0.0f}; // clamped ±1.5 rad
 std::atomic<float> g_zoom{1.0f};        // pinch: >1 zooms in (rig_vh = base/g_zoom)
-std::atomic<float> g_pan_x{0.0f};       // rig position X — moved by double-tap focus
-std::atomic<float> g_pan_y{0.0f};       // rig position Y — moved by double-tap focus
 
-// Double-tap focus: a pending screen-space tap (NDC), resolved against the splat in
-// the render loop (needs the located views) into a smooth rig-position fly-to. The
-// transition lerps g_pan_* toward the hit point over a few frames.
+// Double-tap focus / long-press reset: the UI thread sets a pending tap NDC (or a
+// reset request); the render loop raycasts it (needs the located views) and
+// smooth-transitions g_scene_center — the recenter pivot build_splat_model rotates
+// about — toward the hit (focus) or the framed centroid (reset). 3D, so the tapped
+// feature's true depth becomes the pivot (and lands at the comfortable ZDP).
 std::atomic<bool> g_focus_pending{false};
 std::atomic<float> g_focus_ndc_x{0.0f};
 std::atomic<float> g_focus_ndc_y{0.0f};
-std::atomic<bool> g_transitioning{false};
-float g_trans_from_x = 0.0f, g_trans_from_y = 0.0f;
-float g_trans_to_x = 0.0f, g_trans_to_y = 0.0f;
-float g_trans_t = 0.0f;
+std::atomic<bool> g_reset_pending{false};
+// Pivot transition state — render-thread-only (g_scene_center is render-local).
+bool g_pivot_transitioning = false;
+float g_pivot_from[3] = {0, 0, 0};
+float g_pivot_to[3] = {0, 0, 0};
+float g_pivot_t = 0.0f;
+float g_scene_center_orig[3] = {0, 0, 0}; // framed centroid (set at load) — reset target
 
 // Build a quaternion from yaw (about +Y) then pitch (about +X), verbatim from
 // common/view_rig_math.h quat_from_yaw_pitch (inlined to avoid an extra include
@@ -788,6 +805,10 @@ load_butterfly(struct android_app *app)
 	// auto-fit semantics (vHeight = scene height).
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_gs.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
+		// Remember the framed centroid as the long-press reset target.
+		g_scene_center_orig[0] = g_scene_center[0];
+		g_scene_center_orig[1] = g_scene_center[1];
+		g_scene_center_orig[2] = g_scene_center[2];
 		float face = ext[0] > ext[1] ? ext[0] : ext[1];  // width/height extent
 		g_rig_vh.store(face * 1.1f, std::memory_order_relaxed);
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) rig_vh=%.2f",
@@ -903,17 +924,16 @@ render_frame()
 		// XrView{pose, fov}. Identity pose = display plane at the world
 		// origin; the recentered splat straddles it. The raw channel reports
 		// the DP's display-space eyes (verification/logging only — no HUD).
-		// Advance a focus fly-to transition (double-tap), easing g_pan_* toward the
-		// picked hit point over ~0.4 s. Inert until a focus sets g_transitioning.
-		if (g_transitioning.load(std::memory_order_relaxed)) {
-			g_trans_t += 0.06f; // ~16 frames at 60 fps
-			float u = g_trans_t > 1.0f ? 1.0f : g_trans_t;
+		// Advance the pivot transition (double-tap focus / long-press reset), easing
+		// g_scene_center toward the target over ~0.4 s. build_splat_model recenters +
+		// spins about g_scene_center, so orbit AND the auto-spin pivot around it.
+		if (g_pivot_transitioning) {
+			g_pivot_t += 0.06f; // ~16 frames at 60 fps
+			float u = g_pivot_t > 1.0f ? 1.0f : g_pivot_t;
 			const float s = u * u * (3.0f - 2.0f * u); // smoothstep
-			g_pan_x.store(g_trans_from_x + (g_trans_to_x - g_trans_from_x) * s,
-			              std::memory_order_relaxed);
-			g_pan_y.store(g_trans_from_y + (g_trans_to_y - g_trans_from_y) * s,
-			              std::memory_order_relaxed);
-			if (u >= 1.0f) g_transitioning.store(false, std::memory_order_relaxed);
+			for (int a = 0; a < 3; a++)
+				g_scene_center[a] = g_pivot_from[a] + (g_pivot_to[a] - g_pivot_from[a]) * s;
+			if (u >= 1.0f) g_pivot_transitioning = false;
 		}
 
 		// Tablet gestures applied to the rig: pinch → zoom (smaller vH = zoomed in),
@@ -926,8 +946,7 @@ render_frame()
 		orbit_quat_from_yaw_pitch(g_orbit_yaw.load(std::memory_order_relaxed),
 		                          g_orbit_pitch.load(std::memory_order_relaxed),
 		                          &rig_pose.orientation);
-		rig_pose.position = {g_pan_x.load(std::memory_order_relaxed),
-		                     g_pan_y.load(std::memory_order_relaxed), 0.0f};
+		rig_pose.position = {0.0f, 0.0f, 0.0f};
 		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
 		if (g_has_view_rig) {
@@ -963,10 +982,31 @@ render_frame()
 				logged_rig = true;
 			}
 
-			// Double-tap focus: raycast the tapped point against the splat and fly
-			// the rig (lateral pan) to the hit, so the tapped feature becomes the new
-			// orbit center — the Android analogue of the desktop double-click focus.
-			// Uses the shared 3dgs_common CPU picker (g_gs.pickGaussian).
+			// Auto-spin idle gate: only advance the turntable after 10 s of no touch
+			// (including from startup), so the scene is still until the user has been
+			// idle. Seed the timer on the first frame so startup counts as "fresh".
+			{
+				int64_t now = now_ms();
+				int64_t last = g_last_input_ms.load(std::memory_order_relaxed);
+				if (last == 0) { last = now; g_last_input_ms.store(now, std::memory_order_relaxed); }
+				if (now - last > 10000) g_spin_angle += g_spin_speed;
+			}
+
+			// Long-press reset: ease the pivot back to the framed centroid (orbit/zoom
+			// were already reset on the UI thread).
+			if (g_reset_pending.exchange(false, std::memory_order_acquire)) {
+				for (int a = 0; a < 3; a++) {
+					g_pivot_from[a] = g_scene_center[a];
+					g_pivot_to[a] = g_scene_center_orig[a];
+				}
+				g_pivot_t = 0.0f;
+				g_pivot_transitioning = true;
+			}
+
+			// Double-tap focus: raycast the tapped point against the splat; the hit
+			// (in 3D) becomes the new pivot (g_scene_center), so orbit AND the auto-
+			// spin rotate about the tapped feature at its true depth — the Android
+			// analogue of the desktop double-click focus. Shared CPU picker.
 			if (g_focus_pending.exchange(false, std::memory_order_acquire)) {
 				// Center eye = average of the located views' poses + off-axis fovs.
 				XrVector3f cpos = {0, 0, 0};
@@ -1005,16 +1045,24 @@ render_frame()
 				const float wy = vy + qw * tY + (qz * tX - qx * tZ);
 				const float wz = vz + qw * tZ + (qx * tY - qy * tX);
 
-				float rayOrigin[3] = {cpos.x, cpos.y, cpos.z};
-				float rayDir[3] = {wx, wy, wz};
+				// Splats render as splat_model * raw (recenter + auto-spin about Y); the
+				// picker tests RAW positions, so inverse-transform the ray (undo the spin,
+				// add back the recenter pivot) into raw space before picking.
+				const float pang = g_spin_angle;
+				const float pc = cosf(pang), ps = sinf(pang);
+				float rayOrigin[3] = {pc * cpos.x - ps * cpos.z + g_scene_center[0],
+				                      cpos.y + g_scene_center[1],
+				                      ps * cpos.x + pc * cpos.z + g_scene_center[2]};
+				float rayDir[3] = {pc * wx - ps * wz, wy, ps * wx + pc * wz};
+				{ float l = sqrtf(rayDir[0]*rayDir[0] + rayDir[1]*rayDir[1] + rayDir[2]*rayDir[2]); if (l > 1e-6f) { rayDir[0] /= l; rayDir[1] /= l; rayDir[2] /= l; } }
 				float hit[3];
 				if (g_gs.pickGaussian(rayOrigin, rayDir, hit, 100.0f)) {
-					g_trans_from_x = g_pan_x.load(std::memory_order_relaxed);
-					g_trans_from_y = g_pan_y.load(std::memory_order_relaxed);
-					g_trans_to_x = hit[0];
-					g_trans_to_y = hit[1];
-					g_trans_t = 0.0f;
-					g_transitioning.store(true, std::memory_order_relaxed);
+					g_pivot_from[0] = g_scene_center[0];
+					g_pivot_from[1] = g_scene_center[1];
+					g_pivot_from[2] = g_scene_center[2]; g_pivot_to[0] = hit[0];
+					g_pivot_to[1] = hit[1]; g_pivot_to[2] = hit[2];
+					g_pivot_t = 0.0f;
+					g_pivot_transitioning = true;
 					LOGI("focus: hit (%.3f,%.3f,%.3f) → recenter", hit[0], hit[1], hit[2]);
 				} else {
 					LOGI("focus: ray missed the splat (ndc %.2f,%.2f)", ndcX, ndcY);
@@ -1022,7 +1070,7 @@ render_frame()
 			}
 
 			// Splat model (recenter + spin) — same for both eyes.
-			const Mat4 splat_model = build_splat_model((float)g_frame_count * g_spin_speed);
+			const Mat4 splat_model = build_splat_model(g_spin_angle);
 			auto pf_r0 = pf_now();
 			pf_setup = pf_ms(pf_t1, pf_r0);  // xrBeginFrame + xrLocateViews (IPC for view_rig)
 			for (uint32_t i = 0; i < kViewCount; ++i) {
@@ -1204,6 +1252,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 void
 process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1, float y1)
 {
+	mark_user_input(); // any touch holds the auto-spin idle timer
 	static float last_x = 0.0f, last_y = 0.0f;            // 1-finger orbit anchor
 	static float pinch_last = 0.0f;                        // last 2-finger distance
 	static bool two_finger = false;                        // a 2-finger gesture is active
@@ -1270,21 +1319,23 @@ process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1,
 void
 request_focus(float ndc_x, float ndc_y)
 {
+	mark_user_input();
 	g_focus_ndc_x.store(ndc_x, std::memory_order_relaxed);
 	g_focus_ndc_y.store(ndc_y, std::memory_order_relaxed);
 	g_focus_pending.store(true, std::memory_order_release);
 }
 
-// Long-press / reset: orbit, zoom, pan back to the framed pose.
+// Long-press / reset: orbit + zoom here; the pivot eases back to the framed centroid
+// on the render thread (g_reset_pending).
 void
 reset_view(void)
 {
+	mark_user_input();
 	g_orbit_yaw.store(0.0f, std::memory_order_relaxed);
 	g_orbit_pitch.store(0.0f, std::memory_order_relaxed);
 	g_zoom.store(1.0f, std::memory_order_relaxed);
-	g_pan_x.store(0.0f, std::memory_order_relaxed);
-	g_pan_y.store(0.0f, std::memory_order_relaxed);
-	g_transitioning.store(false, std::memory_order_relaxed);
+	g_reset_pending.store(true, std::memory_order_release);
+	/* pivot reset runs on the render thread */
 	LOGI("gesture: reset view");
 }
 
