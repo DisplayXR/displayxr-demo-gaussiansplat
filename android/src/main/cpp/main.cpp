@@ -141,6 +141,31 @@ float g_spin_speed = 0.01f;
 bool g_has_view_rig = false;
 std::atomic<float> g_rig_vh{1.0f};
 
+// Swipe-orbit: a one-finger drag rotates the virtual display (yaw about up, pitch
+// about right), matching the macOS/Windows gauss mouse-drag (same 0.005 rad/px
+// sensitivity, same -= convention, pitch clamped to ±1.5). Accumulated in
+// process_touch_event (fed via MainActivity.dispatchTouchEvent → nativeOnTouch,
+// runtime#499) and applied to the DISPLAY rig pose orientation at xrLocateViews; a
+// double-tap resets to the framed pose. The OOP runtime honors the app-supplied rig
+// pose, so this needs no runtime change.
+std::atomic<float> g_orbit_yaw{0.0f};
+std::atomic<float> g_orbit_pitch{0.0f};
+
+// Build a quaternion from yaw (about +Y) then pitch (about +X), verbatim from
+// common/view_rig_math.h quat_from_yaw_pitch (inlined to avoid an extra include
+// path on the Android build). Same convention as the macOS/Windows gauss.
+static inline void
+orbit_quat_from_yaw_pitch(float yaw, float pitch, XrQuaternionf *out)
+{
+	float cy = cosf(yaw / 2.0f), sy = sinf(yaw / 2.0f);
+	float cp = cosf(pitch / 2.0f), sp = sinf(pitch / 2.0f);
+	// q = qYaw * qPitch (yaw applied in the world frame, pitch in the local frame).
+	out->w = cy * cp;
+	out->x = cy * sp;
+	out->y = sy * cp;
+	out->z = -sy * sp;
+}
+
 std::atomic<int> g_display_rotation{0};
 std::atomic<bool> g_runtime_unavailable{false};
 uint64_t g_frame_count = 0;
@@ -915,7 +940,13 @@ render_frame()
 		// the DP's display-space eyes (verification/logging only — no HUD).
 		const float rig_vh = g_rig_vh.load(std::memory_order_relaxed);
 		XrPosef rig_pose = {};
-		rig_pose.orientation = {0.0f, 0.0f, 0.0f, 1.0f};
+		// Swipe-orbit: rotate the virtual display by the accumulated drag (identity
+		// when untouched). Matches macOS/Windows gauss, which set the same rig
+		// orientation from a mouse drag; the runtime resolves the off-axis Kooima
+		// around it (server-side over IPC on the OOP path).
+		orbit_quat_from_yaw_pitch(g_orbit_yaw.load(std::memory_order_relaxed),
+		                          g_orbit_pitch.load(std::memory_order_relaxed),
+		                          &rig_pose.orientation);
 		rig_pose.position = {0.0f, 0.0f, 0.0f};
 		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
@@ -1123,6 +1154,67 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	}
 }
 
+// Swipe-orbit input. gauss owns its NativeActivity window, but the runtime client's
+// MonadoView display surface sits above it, so the native InputQueue
+// (app->onInputEvent) is NOT fed (runtime#499) — touch arrives via
+// MainActivity.dispatchTouchEvent → nativeOnTouch JNI instead (the same path the
+// cube + model-viewer demos use). A one-finger drag rotates the virtual display
+// (yaw/pitch), a double-tap re-centers; the values feed the DISPLAY rig pose at
+// xrLocateViews. action uses MotionEvent.ACTION_* (0=DOWN, 1=UP, 2=MOVE), time_ms is
+// the event time (for double-tap timing). Single-pointer (pointer 0).
+void
+process_touch_event(int32_t action, float x, float y, int64_t time_ms)
+{
+	static float last_x = 0.0f, last_y = 0.0f;
+	static float moved_px = 0.0f;
+	static int64_t last_up_ms = 0;
+
+	switch (action) {
+	case AMOTION_EVENT_ACTION_DOWN:
+		last_x = x;
+		last_y = y;
+		moved_px = 0.0f;
+		break;
+	case AMOTION_EVENT_ACTION_MOVE: {
+		const float dx = x - last_x;
+		const float dy = y - last_y;
+		last_x = x;
+		last_y = y;
+		moved_px += fabsf(dx) + fabsf(dy);
+		// Match macOS/Windows gauss: 0.005 rad/px, sign-flipped so the virtual
+		// display tracks the finger; pitch clamped to ±1.5 rad. The runtime applies
+		// this rig orientation, so the splat orbits the way a mouse drag does there.
+		float yaw = g_orbit_yaw.load(std::memory_order_relaxed) - dx * 0.005f;
+		float pitch = g_orbit_pitch.load(std::memory_order_relaxed) - dy * 0.005f;
+		if (pitch > 1.5f) pitch = 1.5f;
+		if (pitch < -1.5f) pitch = -1.5f;
+		g_orbit_yaw.store(yaw, std::memory_order_relaxed);
+		g_orbit_pitch.store(pitch, std::memory_order_relaxed);
+		break;
+	}
+	case AMOTION_EVENT_ACTION_UP: {
+		// A drag (significant travel) never counts as a tap. Two near-stationary
+		// taps within ~300 ms reset the orbit (like Space on the desktop gauss).
+		if (moved_px > 24.0f) {
+			last_up_ms = 0;
+			break;
+		}
+		const int64_t dt = time_ms - last_up_ms;
+		if (last_up_ms != 0 && dt > 0 && dt < 300) {
+			LOGI("swipe: double-tap → reset orbit");
+			g_orbit_yaw.store(0.0f, std::memory_order_relaxed);
+			g_orbit_pitch.store(0.0f, std::memory_order_relaxed);
+			last_up_ms = 0;
+		} else {
+			last_up_ms = time_ms;
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
 } // namespace
 
 // ─── JNI bridge to MainActivity ──────────────────────────────────────────
@@ -1147,11 +1239,23 @@ Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeXrReady(
 	return (g_instance != XR_NULL_HANDLE) ? JNI_TRUE : JNI_FALSE;
 }
 
+// Swipe-orbit bridge: MainActivity.dispatchTouchEvent forwards pointer-0 events
+// here (the native InputQueue is not fed under the runtime overlay, runtime#499).
+extern "C" JNIEXPORT void JNICALL
+Java_com_displayxr_gausssplat_1vk_1android_MainActivity_nativeOnTouch(
+    JNIEnv * /*env*/, jobject /*thiz*/, jint action, jfloat x, jfloat y, jlong time_ms)
+{
+	process_touch_event(action, x, y, (int64_t)time_ms);
+}
+
 extern "C" void
 android_main(struct android_app *app)
 {
 	LOGI("gausssplat_vk_android: android_main entered");
 	app->onAppCmd = handle_cmd;
+	// Swipe-orbit touch arrives via MainActivity.dispatchTouchEvent → nativeOnTouch
+	// (runtime#499: the native InputQueue is not fed under the runtime's overlay),
+	// not via app->onInputEvent.
 
 	if (!initialize_loader(app)) {
 		LOGE("OpenXR loader init failed");

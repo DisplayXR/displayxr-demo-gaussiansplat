@@ -26,6 +26,7 @@ import android.hardware.display.DisplayManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.MotionEvent
 
 class MainActivity : NativeActivity() {
 
@@ -42,6 +43,20 @@ class MainActivity : NativeActivity() {
 
     // Implemented in main.cpp. rotation = Surface.ROTATION_0/90/180/270 → 0/1/2/3.
     private external fun nativeSetRotation(rotation: Int)
+
+    // Swipe-orbit: forward pointer-0 touch to native. The runtime's display overlay
+    // covers this NativeActivity, so its native InputQueue gets no touchable frame
+    // (runtime#499); dispatchTouchEvent is what actually delivers the gesture.
+    private external fun nativeOnTouch(action: Int, x: Float, y: Float, eventTimeMs: Long)
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        try {
+            nativeOnTouch(event.actionMasked, event.getX(0), event.getY(0), event.eventTime)
+        } catch (_: Throwable) {
+            // Native lib not bound yet — ignore until it is.
+        }
+        return super.dispatchTouchEvent(event)
+    }
 
     // True once xrCreateInstance failed with RUNTIME_UNAVAILABLE.
     private external fun nativeRuntimeUnavailable(): Boolean
