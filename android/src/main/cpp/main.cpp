@@ -733,67 +733,15 @@ gs_init()
 {
 	if (!g_gs.init(g_vk_instance, g_vk_phys_device, g_vk_device, g_vk_queue,
 	               g_vk_queue_family, g_views[0].width, g_views[0].height)) {
-		LOGE("GsRenderer::init failed");
+		LOGE("GsAdrenoRenderer::init failed");
 		return false;
 	}
-	// Render-scale: at 1.0 the per-eye GPU compute (~67ms on the nubia: render
-	// ~32 + radix ~18 + preSort ~9) far exceeds the ~33ms DP-weave period, so
-	// gauss is compute-bound (~7fps), NOT weave-capped. Driving the compute
-	// pipeline at a reduced internal resolution lowers render + tile-grid /
-	// instance count (sort/preSort) together, recovering fps up to the weave
-	// ceiling. Tunable live for sweeps: `setprop debug.dxr.gs.scale 0.6`
-	// (force-stop + relaunch). Empty/0/1.0 = native full resolution.
-	// Default 0.6: on the nubia this ~3x's real fps (~2.5 -> ~7.5) vs native.
-	// Below ~0.6 fps plateaus (the per-eye synchronous double-submit + readback
-	// becomes the floor), so 0.6 is the quality/perf knee. Override for sweeps.
-	float gsScale = 0.6f;
-	{
-		char buf[PROP_VALUE_MAX] = {0};
-		if (__system_property_get("debug.dxr.gs.scale", buf) > 0) {
-			float v = (float)atof(buf);
-			if (v > 0.05f && v <= 1.0f)
-				gsScale = v;
-		}
-	}
-	g_gs.setRenderScale(gsScale);
-
-	// gauss is GPU-bound on the per-frame (gaussian,tile) fragment count (~1.4M
-	// for the butterfly). Two load-time culls cut it; both set before loadScene
-	// (load_butterfly runs after gs_init), both force-stop+relaunch to apply.
-	//
-	// (1) Opacity cull `debug.dxr.gs.minalpha` (0 = off): drops near-transparent
-	//     splats. Effective on scenes WITH faint splats; near-useless on dense
-	//     opaque scenes like butterfly.spz (all >0.1), so default off.
-	float gsMinAlpha = 0.0f;
-	{
-		char buf[PROP_VALUE_MAX] = {0};
-		if (__system_property_get("debug.dxr.gs.minalpha", buf) > 0) {
-			float v = (float)atof(buf);
-			if (v >= 0.0f && v < 1.0f)
-				gsMinAlpha = v;
-		}
-	}
-	g_gs.setCullMinOpacity(gsMinAlpha);
-
-	// (2) Decimation `debug.dxr.gs.keep` (1.0 = off): keep this fraction of
-	//     gaussians (hash-uniform). Cuts the fragment count ~linearly, so it
-	//     helps when the app's GPU compute is the bottleneck. On the nubia at
-	//     render-scale 0.6 it is NOT — the frame is runtime/DP-weave-bound
-	//     (~130ms floor), so dropping 60% of gaussians changed fps by <0.5.
-	//     Default OFF; available for heavier scenes / more GPU-bound devices.
-	float gsKeep = 1.0f;
-	{
-		char buf[PROP_VALUE_MAX] = {0};
-		if (__system_property_get("debug.dxr.gs.keep", buf) > 0) {
-			float v = (float)atof(buf);
-			if (v > 0.05f && v <= 1.0f)
-				gsKeep = v;
-		}
-	}
-	g_gs.setKeepFraction(gsKeep);
+	// The Adreno/TBDR-native renderer self-tunes: it reads debug.dxr.gs.scale /
+	// .keep / .minalpha internally in init() (PR #44), so the old compute-era
+	// setRenderScale / setKeepFraction / setCullMinOpacity calls are gone — those
+	// methods don't exist on this renderer.
 	g_gs_ready = true;
-	LOGI("GsRenderer initialized (%ux%u/eye, render_scale=%.2f)",
-	     g_views[0].width, g_views[0].height, gsScale);
+	LOGI("GsAdrenoRenderer initialized (%ux%u/eye)", g_views[0].width, g_views[0].height);
 	return true;
 }
 
