@@ -29,8 +29,10 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 | Drag-and-drop (macOS) | Load a `.ply` / `.spz` dropped onto the window |
 | Space | Reset pose, zoom, depth, auto-orbit, flip |
 | Tab | Toggle HUD |
-| One-finger drag (Android) | Rotate the virtual display (orbit the splat) |
-| Double-tap (Android) | Re-center the orbit |
+| One-finger drag (Android) | Orbit the splat |
+| Two-finger pinch (Android) | Zoom |
+| Double-tap (Android) | Focus: recenter the orbit on the tapped point |
+| Long-press (Android) | Reset orbit / zoom / focus |
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only, requires runtime ≥ v1.3.0) |
 | Esc | Quit |
 
