@@ -1,4 +1,4 @@
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #include <winver.h>
@@ -16,13 +16,13 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName",      "Leia Inc."
+            VALUE "CompanyName",      "The DisplayXR Project"
             VALUE "FileDescription",  "SR 3DGS OpenXR Ext Vulkan Test Application"
             VALUE "FileVersion",      "1.0.0.0"
             VALUE "InternalName",     "gaussian_splatting_handle_vk_win"
-            VALUE "LegalCopyright",   "Copyright 2025 Leia Inc."
+            VALUE "LegalCopyright",   "Copyright 2025 The DisplayXR Project and its contributors"
             VALUE "OriginalFilename", "gaussian_splatting_handle_vk_win.exe"
-            VALUE "ProductName",      "Leia SR Test Apps"
+            VALUE "ProductName",      "DisplayXR 3D Gaussian Splatting"
             VALUE "ProductVersion",   "1.0.0.0"
         END
     END
