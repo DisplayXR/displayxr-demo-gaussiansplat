@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // gausssplat_vk_android entry point. Android leg of the DisplayXR
 // Gaussian-splat demo: reuses cube_handle_vk_android's OpenXR-Android

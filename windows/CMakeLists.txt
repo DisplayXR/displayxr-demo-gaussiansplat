@@ -1,5 +1,5 @@
 # Copyright 2025, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build — lives inside displayxr-demo-gaussiansplat repo as
 # windows/CMakeLists.txt. Assumes sibling dirs: ../common, ../3dgs_common,

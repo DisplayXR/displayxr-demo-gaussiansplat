@@ -89,4 +89,5 @@ The `common/` and `openxr_includes/` directories are also used by other DisplayX
 
 ## License
 
-BSL-1.0 — see `LICENSE`.
+Apache-2.0 — see `LICENSE`. (Vendored OpenXR extension headers under
+`openxr_includes/` remain BSL-1.0 — see their SPDX headers.)

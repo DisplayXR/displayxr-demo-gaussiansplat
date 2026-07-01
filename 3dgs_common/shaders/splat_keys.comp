@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Depth-sort key generation for the graphics-pipeline splat rasterizer.
 // One key per GAUSSIAN (not per tile-fragment) — so the radix sort that

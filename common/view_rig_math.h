@@ -1,5 +1,5 @@
 // Copyright 2026, DisplayXR
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  View/projection builders for the XR_EXT_view_rig consume path (#396 W7)

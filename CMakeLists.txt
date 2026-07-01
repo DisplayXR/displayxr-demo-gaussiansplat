@@ -1,5 +1,5 @@
 # Copyright 2025, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Top-level CMakeLists.txt for the displayxr-demo-gaussiansplat standalone
 # repo. Orchestrates the shared `common` and `3dgs_common` libraries, then

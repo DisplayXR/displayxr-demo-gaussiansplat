@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  macOS Vulkan OpenXR 3D Gaussian Splatting with external window binding
