@@ -1,5 +1,5 @@
-// Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// Copyright 2025, The DisplayXR Project and its contributors
+// SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
  * @brief  Compile-time splat-renderer selection for the shared demo harness.
