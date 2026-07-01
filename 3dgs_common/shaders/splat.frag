@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Fragment stage of the graphics-pipeline splat rasterizer. Evaluates the 2D
 // gaussian (conic quadratic form) at this pixel and emits PREMULTIPLIED colour.

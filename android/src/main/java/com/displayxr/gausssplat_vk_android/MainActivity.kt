@@ -1,5 +1,5 @@
 // Copyright 2026, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Thin NativeActivity wrapper. Two jobs:
 //   1. Surface the runtime CAMERA permission dialog at first launch (CNSDK's

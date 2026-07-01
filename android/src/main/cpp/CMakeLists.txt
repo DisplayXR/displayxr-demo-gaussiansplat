@@ -1,5 +1,5 @@
 # Copyright 2026, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Native build for the Android leg of displayxr-demo-gaussiansplat (3D
 # gaussian-splat viewer). Reuses the cube_handle_vk_android OpenXR-Android

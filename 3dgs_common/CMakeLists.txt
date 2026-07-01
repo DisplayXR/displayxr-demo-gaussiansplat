@@ -1,5 +1,5 @@
 # Copyright 2025, Leia Inc.
-# SPDX-License-Identifier: BSL-1.0
+# SPDX-License-Identifier: Apache-2.0
 #
 # Standalone build (displayxr-demo-gaussiansplat repo). Identical to the
 # in-tree CMakeLists.txt since 3dgs_common has no path references that reach

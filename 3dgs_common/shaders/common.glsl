@@ -1,5 +1,5 @@
 // Copyright 2025, Leia Inc.
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 // Ported from 3DGS.cpp (https://github.com/shg8/3DGS.cpp)
 
 #define TILE_WIDTH 16
