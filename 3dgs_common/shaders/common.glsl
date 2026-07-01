@@ -1,4 +1,4 @@
-// Copyright 2025, Leia Inc.
+// Copyright 2025, The DisplayXR Project and its contributors
 // SPDX-License-Identifier: Apache-2.0
 // Ported from 3DGS.cpp (https://github.com/shg8/3DGS.cpp)
 

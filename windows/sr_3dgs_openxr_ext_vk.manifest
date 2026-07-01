@@ -3,7 +3,7 @@
   <assemblyIdentity
     version="1.0.0.0"
     processorArchitecture="amd64"
-    name="Leia.SR.3DGSOpenXRExtVK"
+    name="DisplayXR.SR3DGSOpenXRExtVK"
     type="win32"
   />
   <description>Leia SR 3DGS OpenXR Ext Vulkan Test Application</description>
