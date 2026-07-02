@@ -21,7 +21,8 @@ if /i "%ARCH%"=="x64" (
     echo ERROR: unknown architecture "%ARCH%" ^(expected x64 or arm64^)
     exit /b 1
 )
-call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\%VCVARS%" >nul 2>&1
+for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+call "%VSPATH%\VC\Auxiliary\Build\%VCVARS%" >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
     echo ERROR: VS 2022 %VCVARS% not found
     if /i "%ARCH%"=="arm64" echo For arm64, add the "MSVC ... ARM64/ARM64EC build tools" VS component.
