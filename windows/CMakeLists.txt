@@ -24,6 +24,23 @@ if(NOT Vulkan_FOUND)
 endif()
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
+# Prebuilt-loader arch subdir (the Khronos SDK ships x64/ and ARM64/). Defaults
+# to x64; follows an ARM64 MSVC target, or pass -DDISPLAYXR_TARGET_ARCH=ARM64.
+# The selected arch is searched first; x64 stays as a fallback so the default
+# x64 build is unaffected.
+if(NOT DEFINED DISPLAYXR_TARGET_ARCH)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID MATCHES "ARM64" OR CMAKE_GENERATOR_PLATFORM MATCHES "ARM64")
+        set(DISPLAYXR_TARGET_ARCH "ARM64")
+    else()
+        set(DISPLAYXR_TARGET_ARCH "x64")
+    endif()
+endif()
+if(DISPLAYXR_TARGET_ARCH MATCHES "[Aa][Rr][Mm]64")
+    set(_OXR_ARCH_DIR "ARM64")
+else()
+    set(_OXR_ARCH_DIR "x64")
+endif()
+
 # OpenXR loader — CONFIG pkg first, then a user-specified OpenXR_ROOT fallback.
 set(OPENXR_FOUND FALSE)
 find_package(OpenXR QUIET CONFIG)
@@ -35,7 +52,7 @@ endif()
 if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
     find_library(OPENXR_LOADER_LIB
         NAMES openxr_loader openxr_loader-1_0
-        PATHS "${OpenXR_ROOT}/x64/lib" "${OpenXR_ROOT}/lib" "${OpenXR_ROOT}/bin"
+        PATHS "${OpenXR_ROOT}/${_OXR_ARCH_DIR}/lib" "${OpenXR_ROOT}/x64/lib" "${OpenXR_ROOT}/lib" "${OpenXR_ROOT}/bin"
         NO_DEFAULT_PATH
     )
     if(OPENXR_LOADER_LIB)
@@ -43,7 +60,7 @@ if(NOT OPENXR_FOUND AND DEFINED OpenXR_ROOT)
         add_library(OpenXR::openxr_loader SHARED IMPORTED)
         find_file(OPENXR_LOADER_DLL
             NAMES openxr_loader.dll openxr_loader-1_0.dll
-            PATHS "${OpenXR_ROOT}/x64/bin" "${OpenXR_ROOT}/bin"
+            PATHS "${OpenXR_ROOT}/${_OXR_ARCH_DIR}/bin" "${OpenXR_ROOT}/x64/bin" "${OpenXR_ROOT}/bin"
             NO_DEFAULT_PATH
         )
         if(OPENXR_LOADER_DLL)
@@ -85,6 +102,19 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
     dwrite
     comdlg32
 )
+
+# Splat-renderer selection (see gs_renderer_select.h). AUTO = compute on x64,
+# graphics on ARM64 (Snapdragon-X / Windows-on-ARM is tile-based deferred, so
+# the graphics path wins there). Force GRAPHICS to benchmark the TBDR path on an
+# immediate-mode desktop GPU — the gate the desktop-eval plan requires before
+# flipping any default on Windows — or COMPUTE to pin the legacy path.
+set(GS_RENDERER "AUTO" CACHE STRING "Splat renderer: AUTO | COMPUTE | GRAPHICS")
+set_property(CACHE GS_RENDERER PROPERTY STRINGS AUTO COMPUTE GRAPHICS)
+if(GS_RENDERER STREQUAL "GRAPHICS")
+    target_compile_definitions(gaussian_splatting_handle_vk_win PRIVATE GS_RENDERER_GRAPHICS=1)
+elseif(GS_RENDERER STREQUAL "COMPUTE")
+    target_compile_definitions(gaussian_splatting_handle_vk_win PRIVATE GS_RENDERER_COMPUTE=1)
+endif()
 
 if(MSVC)
     # /utf-8: tell MSVC the source files are UTF-8 (and the runtime
