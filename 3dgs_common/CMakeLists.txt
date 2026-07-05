@@ -42,6 +42,20 @@ FetchContent_Declare(spz
 FetchContent_MakeAvailable(spz)
 
 # MSVC-compat patches for spz (see in-tree CMakeLists.txt for rationale).
+# SPZ upstream uses std::sort in splat-types.h without including <algorithm>.
+# libc++ (macOS/Clang) drags it in transitively, but libstdc++ (GCC/Linux)
+# does not, so the Linux build fails with "'sort' is not a member of 'std'"
+# (the MSVC block below already injects it for that toolchain). Inject it on
+# ALL compilers here; idempotent via the FIND guard so re-configures + the
+# MSVC block below stay no-ops.
+set(_SPZ_HEADER "${spz_SOURCE_DIR}/src/cc/splat-types.h")
+file(READ "${_SPZ_HEADER}" _spz_hdr)
+string(FIND "${_spz_hdr}" "#include <algorithm>" _spz_has_algo)
+if(_spz_has_algo EQUAL -1)
+    string(REPLACE "#include <cmath>" "#include <cmath>\n#include <algorithm>" _spz_hdr "${_spz_hdr}")
+    file(WRITE "${_SPZ_HEADER}" "${_spz_hdr}")
+endif()
+
 if(MSVC)
     set(_SPZ_HEADER "${spz_SOURCE_DIR}/src/cc/splat-types.h")
     file(READ "${_SPZ_HEADER}" _spz_content)

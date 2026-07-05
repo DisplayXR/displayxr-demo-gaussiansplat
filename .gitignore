@@ -11,3 +11,6 @@ local.properties
 # Android signing keystores — never commit (CI uses GitHub secrets)
 *.jks
 *.keystore
+
+# Claude Code local worktrees / scratch
+.claude/
