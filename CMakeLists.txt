@@ -24,6 +24,11 @@ if(APPLE)
     add_subdirectory(macos)
 elseif(WIN32)
     add_subdirectory(windows)
+elseif(UNIX)
+    # Desktop Linux (build-green, issue #60). OBJCXX stays gated on APPLE above,
+    # so it is naturally dropped here. Window arm = hosted-NULL / SDL-provided;
+    # no xlib binding path is invented (see linux/main.cpp TODO(Phase 3)).
+    add_subdirectory(linux)
 else()
-    message(FATAL_ERROR "displayxr-demo-gaussiansplat supports macOS and Windows only.")
+    message(FATAL_ERROR "displayxr-demo-gaussiansplat supports macOS, Windows and Linux only.")
 endif()

@@ -49,6 +49,25 @@ brew install cmake ninja vulkan-sdk openxr-loader
 ```
 Outputs to `build/macos/gaussian_splatting_handle_vk_macos`.
 
+### Linux (build-green only — issue #60, M8 Linux epic)
+```bash
+sudo apt-get install -y build-essential cmake ninja-build pkg-config \
+  libvulkan-dev vulkan-validationlayers glslang-tools zlib1g-dev \
+  libx11-dev libxcb1-dev libx11-xcb-dev libxxf86vm-dev libxcb-glx0-dev
+./scripts/build_linux.sh
+```
+Outputs to `build/linux/gaussian_splatting_handle_vk_linux` plus
+`build/run_gaussiansplat_linux.sh`. Uses system Vulkan (no MoltenVK) and a
+from-source OpenXR loader pinned to `1.1.43` (equal to `.github/workflows/build-linux.yml`).
+The Linux leg (`linux/main.cpp`) is a **hosted-NULL harness**: it passes no
+window binding, so the runtime self-creates a window. Faithful app-owned
+windowing/input and on-screen validation (needs the Linux runtime + a GPU + an
+X server) is a later pass — see the `TODO(Phase 3)` in `linux/main.cpp` for
+wiring `XR_EXT_xlib_window_binding` (runtime Phase 3a). The generic **COMPUTE**
+splat renderer (`GsRenderer`) is used on Linux desktop; the Adreno/TBDR
+graphics path (`gs_adreno_renderer`) is Android/Apple-Silicon only. Recipe:
+the runtime repo's `docs/guides/linux-demo-port.md`.
+
 ## Input handling
 
 Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` under `WM_KEYDOWN` (around line 355). New shortcuts go there. The README documents the full list (WASD, M, F, V, L, Space, Tab, Esc, etc.).

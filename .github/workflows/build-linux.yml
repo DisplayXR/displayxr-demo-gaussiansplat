@@ -1,0 +1,72 @@
+name: Build Linux
+
+# gaussiansplat Linux build-green dev loop (issue #60; recipe: the runtime repo's
+# docs/guides/linux-demo-port.md).
+#
+# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
+# only on manual dispatch and `linux*` branches — so it can't gate unrelated
+# work while the port is in progress. Promote to a PR-triggered required check
+# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
+# only once it passes reliably.
+#
+# Build-green scope: compile gaussian_splatting_handle_vk_linux on ubuntu-latest.
+# CI has no display/GPU, so the app is never run here; on-screen validation is
+# a separate pass gated on the runtime's Linux Phase 1b + hardware.
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - 'linux'
+      - 'linux-**'
+      - 'feature/linux-**'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  Build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Base list (playbook) + this demo's specifics: glslang-tools for the
+      # SPIR-V shader compile in 3dgs_common, zlib1g-dev for the Niantic SPZ
+      # loader (else 3dgs_common FetchContent-fetches zlib). No FFmpeg — this
+      # demo has none. The X11/Wayland/ALSA headers are here for the hosted-NULL
+      # harness's future SDL window arm AND to keep the loader build consistent
+      # with the sibling demos. libxxf86vm-dev + libxcb-glx0-dev: once GL/EGL
+      # headers are present, OpenXR-SDK-Source flips on GLX platform support —
+      # the loader includes <xcb/glx.h> and its gfxwrapper test helper links
+      # Xxf86vm (the GLX-flip gotcha).
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            zlib1g-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libxxf86vm-dev libxcb-glx0-dev
+
+      # Assert the SPIR-V + zlib toolchain is actually present (fail loudly, not
+      # a hollow green): glslangValidator drives every 3dgs_common shader header.
+      - name: Assert shader + zlib toolchain present
+        run: |
+          command -v glslangValidator >/dev/null || {
+            echo "::error::glslangValidator not found — SPIR-V shader compile would fail"; exit 1; }
+          pkg-config --exists zlib || {
+            echo "::error::zlib not found via pkg-config — SPZ loader dependency missing"; exit 1; }
+
+      - name: Build (build-green; app is not run — no display on CI)
+        run: ./scripts/build_linux.sh
+
+      # Guard against a hollow green: the compute splat renderer must have been
+      # selected + linked (the Adreno/TBDR path is Android/Apple-Silicon only).
+      - name: Assert the demo binary linked
+        run: |
+          test -x build/linux/gaussian_splatting_handle_vk_linux || {
+            echo "::error::gaussian_splatting_handle_vk_linux was not produced"; exit 1; }
