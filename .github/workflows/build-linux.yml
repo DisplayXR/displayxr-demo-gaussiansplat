@@ -3,11 +3,11 @@ name: Build Linux
 # gaussiansplat Linux build-green dev loop (issue #60; recipe: the runtime repo's
 # docs/guides/linux-demo-port.md).
 #
-# DELIBERATELY NOT a required check. It does NOT run on PRs or pushes to main —
-# only on manual dispatch and `linux*` branches — so it can't gate unrelated
-# work while the port is in progress. Promote to a PR-triggered required check
-# (with the DetectChanges docs_only short-circuit the macOS/Windows jobs use)
-# only once it passes reliably.
+# PROMOTED to a PR-triggered required check (DisplayXR/displayxr-runtime#722):
+# runs on every PR like build-windows.yml / build-macos.yml, with the same
+# DetectChanges docs_only short-circuit so doc-only PRs report success in
+# seconds without building. Required context (main-protection ruleset):
+# Build Linux (alongside Build Windows + Build macOS).
 #
 # Build-green scope: compile gaussian_splatting_handle_vk_linux on ubuntu-latest.
 # CI has no display/GPU, so the app is never run here; on-screen validation is
@@ -15,21 +15,61 @@ name: Build Linux
 
 on:
   workflow_dispatch: {}
+  pull_request: {}
   push:
     branches:
       - 'linux'
       - 'linux-**'
       - 'feature/linux-**'
 
+# Cancel any in-progress run for the same PR (or branch) when a new
+# push comes in. Only the latest commit's CI completes.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  Build:
+  DetectChanges:
     runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Full clone — the diff below uses pull_request.base.sha, which can
+          # be older than the merge commit's first parent. Shallow clones miss
+          # those refs and the diff fails with "fatal: bad object".
+          fetch-depth: 0
+      - id: filter
+        run: |
+          # Same docs_only rule as build-windows.yml: heavy jobs still RUN (to
+          # report the required status) but skip their expensive steps.
+          # workflow_dispatch always builds.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Detected non-PR trigger — docs_only=false"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD)
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
+  Build:
+    name: Build Linux
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — reporting success without building."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
 
       # Base list (playbook) + this demo's specifics: glslang-tools for the
       # SPIR-V shader compile in 3dgs_common, zlib1g-dev for the Niantic SPZ
@@ -41,6 +81,7 @@ jobs:
       # the loader includes <xcb/glx.h> and its gfxwrapper test helper links
       # Xxf86vm (the GLX-flip gotcha).
       - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -55,6 +96,7 @@ jobs:
       # Assert the SPIR-V + zlib toolchain is actually present (fail loudly, not
       # a hollow green): glslangValidator drives every 3dgs_common shader header.
       - name: Assert shader + zlib toolchain present
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           command -v glslangValidator >/dev/null || {
             echo "::error::glslangValidator not found — SPIR-V shader compile would fail"; exit 1; }
@@ -62,11 +104,13 @@ jobs:
             echo "::error::zlib not found via pkg-config — SPZ loader dependency missing"; exit 1; }
 
       - name: Build (build-green; app is not run — no display on CI)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./scripts/build_linux.sh
 
       # Guard against a hollow green: the compute splat renderer must have been
       # selected + linked (the Adreno/TBDR path is Android/Apple-Silicon only).
       - name: Assert the demo binary linked
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           test -x build/linux/gaussian_splatting_handle_vk_linux || {
             echo "::error::gaussian_splatting_handle_vk_linux was not produced"; exit 1; }
