@@ -471,8 +471,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
-    LOG_INFO("Creating application window (%dx%d)", width, height);
+static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int32_t screenLeft, int32_t screenTop) {
+    LOG_INFO("Creating application window (%dx%d) at (%d, %d)", width, height, screenLeft, screenTop);
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -498,9 +498,13 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height) {
     RECT rect = { 0, 0, width, height };
     AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
 
+    // INV-1.3: open on the 3D panel (runtime#715 — handle apps otherwise open
+    // on the primary monitor on multi-monitor boxes). (screenLeft, screenTop)
+    // is the panel top-left in virtual-desktop pixels from
+    // XrDisplayDesktopPositionEXT; (0,0) = primary/unknown, a safe default.
     HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
         WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT,
+        screenLeft, screenTop,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
 
@@ -1550,13 +1554,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
             LOG_ERROR("display3d self-test FAILED with %d check(s) — pick ray math has drifted", stFails);
     }
 
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight);
-    if (!hwnd) {
-        LOG_ERROR("Failed to create window");
-        ShutdownLogging();
-        return 1;
-    }
-
     // Add DisplayXR to DLL search path
     {
         HKEY hKey;
@@ -1571,11 +1568,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    // Initialize OpenXR
+    // Initialize OpenXR FIRST — xrGetSystemProperties needs only instance +
+    // system id, and returns the 3D panel desktop position the window below
+    // is created at (INV-1.3 ordering: instance → system → properties →
+    // window → session; runtime#715).
     XrSessionManager xr = {};
     g_xr = &xr;
     if (!InitializeOpenXR(xr)) {
         LOG_ERROR("OpenXR initialization failed");
+        g_xr = nullptr;
+        ShutdownLogging();
+        return 1;
+    }
+
+    // Create the app window on the 3D panel
+    int32_t panelLeft = 0, panelTop = 0;
+    GetDisplayDesktopPosition(panelLeft, panelTop);
+    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight, panelLeft, panelTop);
+    if (!hwnd) {
+        LOG_ERROR("Failed to create window");
+        CleanupOpenXR(xr);
         g_xr = nullptr;
         ShutdownLogging();
         return 1;
