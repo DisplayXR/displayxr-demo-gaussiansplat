@@ -19,6 +19,21 @@ static bool s_hasViewRigExt = false;
 
 bool XrViewRigExtAvailable() { return s_hasViewRigExt; }
 
+// INV-1.3 / runtime#715: 3D panel top-left in OS virtual-desktop pixels
+// (top-down, origin = primary monitor top-left), from
+// XrDisplayDesktopPositionEXT (XR_EXT_display_info spec v16). (0,0) =
+// primary/unknown — a safe default, and what an older runtime (which
+// ignores the unknown chain entry) yields via the zero-init below. Also
+// demo-side statics because XrSessionManager comes from displayxr::common.
+static int32_t s_displayDesktopLeft = 0;
+static int32_t s_displayDesktopTop = 0;
+
+void GetDisplayDesktopPosition(int32_t& left, int32_t& top)
+{
+    left = s_displayDesktopLeft;
+    top = s_displayDesktopTop;
+}
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -132,6 +147,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         XrSystemProperties sysProps = {XR_TYPE_SYSTEM_PROPERTIES};
         XrDisplayInfoEXT displayInfo = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
         XrEyeTrackingModeCapabilitiesEXT eyeCaps = {(XrStructureType)XR_TYPE_EYE_TRACKING_MODE_CAPABILITIES_EXT};
+        // INV-1.3: panel desktop position (display_info v16, runtime#715),
+        // consumed by CreateAppWindow so the window opens on the 3D panel.
+        XrDisplayDesktopPositionEXT desktopPos = {};
+        desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_EXT;
+        eyeCaps.next = &desktopPos;
         displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
         XrResult diResult = xrGetSystemProperties(xr.instance, xr.systemId, &sysProps);
@@ -147,6 +167,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.displayPixelHeight = displayInfo.displayPixelHeight;
             xr.supportedEyeTrackingModes = (uint32_t)eyeCaps.supportedModes;
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
+            s_displayDesktopLeft = desktopPos.left;
+            s_displayDesktopTop = desktopPos.top;
+            LOG_INFO("Display desktop position: (%d, %d)", s_displayDesktopLeft, s_displayDesktopTop);
             LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,

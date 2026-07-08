@@ -19,6 +19,12 @@ bool InitializeOpenXR(XrSessionManager& xr);
 // because displayxr::common's XrSessionManager doesn't carry view-rig state yet.
 bool XrViewRigExtAvailable();
 
+// INV-1.3 / runtime#715: 3D panel top-left in virtual-desktop pixels from
+// XrDisplayDesktopPositionEXT (display_info v16), filled by InitializeOpenXR.
+// (0,0) = primary/unknown (safe default, incl. on older runtimes). Demo-side
+// for the same reason as XrViewRigExtAvailable().
+void GetDisplayDesktopPosition(int32_t& left, int32_t& top);
+
 // Get Vulkan graphics requirements and set up Vulkan instance/device per OpenXR spec
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr);
 
