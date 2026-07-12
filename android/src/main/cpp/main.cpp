@@ -8,7 +8,7 @@
 // 32-bit packed sort keys — no shaderInt64, Adreno-compatible), rendering
 // the bundled butterfly.spz per eye. The runtime's DP weaves the views.
 //
-// W7 (#396): chains XR_EXT_view_rig on xrLocateViews and consumes the
+// W7 (#396): chains XR_DXR_view_rig on xrLocateViews and consumes the
 // runtime's render-ready XrView{pose, fov} — on the Android out-of-process
 // path the server-side Kooima (runtime #510/#513) resolves the live window,
 // orientation, and tracked eyes. The app keeps only the clip policy
@@ -38,8 +38,8 @@
 
 #include "gs_adreno_renderer.h"
 
-// XR_EXT_view_rig (#396 W7): vendored DisplayXR extension header.
-#include <openxr/XR_EXT_view_rig.h>
+// XR_DXR_view_rig (#396 W7): vendored DisplayXR extension header.
+#include <openxr/XR_DXR_view_rig.h>
 
 #define LOG_TAG "gausssplat_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -145,7 +145,7 @@ static int64_t now_ms() {
 // Any touch resets the auto-spin idle timer.
 static void mark_user_input() { g_last_input_ms.store(now_ms(), std::memory_order_relaxed); }
 
-// XR_EXT_view_rig state (#396 W7). g_has_view_rig latches at instance create
+// XR_DXR_view_rig state (#396 W7). g_has_view_rig latches at instance create
 // when the runtime advertises the extension. The rig is a DISPLAY rig with
 // an identity pose: the virtual display plane sits at the world origin, the
 // recentered splat straddles it (ZDP), and the runtime returns render-ready
@@ -354,7 +354,7 @@ create_instance(struct android_app *app)
 {
 	g_runtime_unavailable.store(false, std::memory_order_relaxed);
 
-	// Detect XR_EXT_view_rig (#396 W7) before instance creation; enable it
+	// Detect XR_DXR_view_rig (#396 W7) before instance creation; enable it
 	// when advertised. Without it the plain locate path still renders but
 	// with the device's fixed FOV (no server-side Kooima) — log loudly.
 	g_has_view_rig = false;
@@ -372,7 +372,7 @@ create_instance(struct android_app *app)
 			    XR_SUCCESS) {
 				for (uint32_t i = 0; i < n; ++i) {
 					if (std::strcmp(props[i].extensionName,
-					                XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+					                XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
 						break;
 					}
@@ -380,9 +380,9 @@ create_instance(struct android_app *app)
 			}
 		}
 	}
-	LOGI("XR_EXT_view_rig: %s", g_has_view_rig ? "AVAILABLE" : "NOT FOUND");
+	LOGI("XR_DXR_view_rig: %s", g_has_view_rig ? "AVAILABLE" : "NOT FOUND");
 	if (!g_has_view_rig) {
-		LOGW("XR_EXT_view_rig missing — falling back to plain xrLocateViews "
+		LOGW("XR_DXR_view_rig missing — falling back to plain xrLocateViews "
 		     "(fixed device FOV, no server-side Kooima; expect degraded 3D)");
 	}
 
@@ -392,7 +392,7 @@ create_instance(struct android_app *app)
 	};
 	uint32_t extension_count = 2;
 	if (g_has_view_rig) {
-		extensions[extension_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 	}
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -918,7 +918,7 @@ render_frame()
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 
-		// XR_EXT_view_rig (#396 W7): chain the DISPLAY rig so the runtime owns
+		// XR_DXR_view_rig (#396 W7): chain the DISPLAY rig so the runtime owns
 		// the live-window resolve + off-axis Kooima (server-side over IPC on
 		// the OOP path, runtime #510/#513) and returns render-ready
 		// XrView{pose, fov}. Identity pose = display plane at the world
@@ -947,8 +947,8 @@ render_frame()
 		                          g_orbit_pitch.load(std::memory_order_relaxed),
 		                          &rig_pose.orientation);
 		rig_pose.position = {0.0f, 0.0f, 0.0f};
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrViewDisplayRawEXT view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
 			display_rig.virtualDisplayHeight = rig_vh;

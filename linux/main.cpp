@@ -10,7 +10,7 @@
  *
  *   * Window arm = HOSTED-NULL. The app passes NO window binding, so the
  *     runtime self-creates a window at native resolution. Desktop Linux
- *     app-provided-window support (XR_EXT_xlib_window_binding, runtime
+ *     app-provided-window support (XR_DXR_xlib_window_binding, runtime
  *     Phase 3a) is intentionally NOT wired here — see TODO(Phase 3) below.
  *     Faithful app-owned windowing + input + HUD is the on-screen pass,
  *     gated on the Linux runtime + a GPU + an X server (build-green only
@@ -32,11 +32,11 @@
 #define XR_USE_GRAPHICS_API_VULKAN
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
-#include <openxr/XR_EXT_display_info.h>
-#include <openxr/XR_EXT_view_rig.h>
+#include <openxr/XR_DXR_display_info.h>
+#include <openxr/XR_DXR_view_rig.h>
 
 // TODO(Phase 3): swap the hosted-NULL window arm for the real desktop-Linux
-// app-provided-window binding — XR_EXT_xlib_window_binding has landed in the
+// app-provided-window binding — XR_DXR_xlib_window_binding has landed in the
 // runtime (Phase 3a, #660) with a working example at
 // test_apps/cube_handle_vk_linux. Faithful ports pass a Display*/Window at
 // xrCreateSession (as the cocoa/win32 legs pass their handles). Until the
@@ -237,7 +237,7 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
 
-    PFN_xrEnumerateDisplayRenderingModesEXT pfnEnumerateDisplayRenderingModesEXT = nullptr;
+    PFN_xrEnumerateDisplayRenderingModesDXR pfnEnumerateDisplayRenderingModesEXT = nullptr;
 
     uint32_t renderingModeCount = 0;
     uint32_t renderingModeViewCounts[8] = {};
@@ -260,15 +260,15 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     bool hasVulkan = false;
     for (const auto& ext : exts) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
-        if (strcmp(ext.extensionName, XR_EXT_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
-        if (strcmp(ext.extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
     }
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
     std::vector<const char*> enabled;
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    if (xr.hasDisplayInfoExt) enabled.push_back(XR_EXT_DISPLAY_INFO_EXTENSION_NAME);
-    if (xr.hasViewRigExt) enabled.push_back(XR_EXT_VIEW_RIG_EXTENSION_NAME);
+    if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
+    if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtLinux",
@@ -290,7 +290,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
 
     if (xr.hasDisplayInfoExt) {
         XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
-        XrDisplayInfoEXT di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_EXT};
+        XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
             xr.displayWidthM = di.displaySizeMeters.width;
@@ -299,7 +299,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
             xr.displayPixelWidth = di.displayPixelWidth;
             xr.displayPixelHeight = di.displayPixelHeight;
         }
-        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesEXT",
+        xrGetInstanceProcAddr(xr.instance, "xrEnumerateDisplayRenderingModesDXR",
             (PFN_xrVoidFunction*)&xr.pfnEnumerateDisplayRenderingModesEXT);
     }
 
@@ -425,8 +425,8 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
         uint32_t modeCount = 0;
         if (XR_SUCCEEDED(xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, 0, &modeCount, nullptr))
             && modeCount > 0) {
-            std::vector<XrDisplayRenderingModeInfoEXT> modes(modeCount);
-            for (auto& m : modes) { m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT; m.next = nullptr; }
+            std::vector<XrDisplayRenderingModeInfoDXR> modes(modeCount);
+            for (auto& m : modes) { m.type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR; m.next = nullptr; }
             if (XR_SUCCEEDED(xr.pfnEnumerateDisplayRenderingModesEXT(xr.session, modeCount, &modeCount, modes.data()))) {
                 xr.renderingModeCount = modeCount > 8 ? 8 : modeCount;
                 LOG_INFO("Display rendering modes (%u):", modeCount);
@@ -684,7 +684,7 @@ int main(int argc, char** argv) {
             locateInfo.displayTime = fs.predictedDisplayTime;
             locateInfo.space = xr.localSpace;
 
-            XrDisplayRigEXT displayRig = {XR_TYPE_DISPLAY_RIG_EXT};
+            XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
             if (useRig) {
                 displayRig.pose = cameraPose;
                 displayRig.virtualDisplayHeight = virtualDisplayHeight;

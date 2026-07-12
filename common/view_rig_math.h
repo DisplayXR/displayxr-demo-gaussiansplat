@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  View/projection builders for the XR_EXT_view_rig consume path (#396 W7)
+ * @brief  View/projection builders for the XR_DXR_view_rig consume path (#396 W7)
  *
  * The runtime owns the off-axis Kooima math and returns render-ready
  * XrView{pose, fov}; the app only needs to turn those into GL-convention
