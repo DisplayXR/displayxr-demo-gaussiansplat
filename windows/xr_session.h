@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 /*!
  * @file
- * @brief  OpenXR session management for Vulkan with XR_EXT_win32_window_binding
+ * @brief  OpenXR session management for Vulkan with XR_DXR_win32_window_binding
  */
 
 #pragma once
@@ -15,12 +15,12 @@
 // Initialize OpenXR instance with Vulkan + win32_window_binding extensions
 bool InitializeOpenXR(XrSessionManager& xr);
 
-// XR_EXT_view_rig (W7 of #396) detected + enabled by InitializeOpenXR. Demo-side
+// XR_DXR_view_rig (W7 of #396) detected + enabled by InitializeOpenXR. Demo-side
 // because displayxr::common's XrSessionManager doesn't carry view-rig state yet.
 bool XrViewRigExtAvailable();
 
 // INV-1.3 / runtime#715: 3D panel top-left in virtual-desktop pixels from
-// XrDisplayDesktopPositionEXT (display_info v16), filled by InitializeOpenXR.
+// XrDisplayDesktopPositionDXR (display_info v16), filled by InitializeOpenXR.
 // (0,0) = primary/unknown (safe default, incl. on older runtimes). Demo-side
 // for the same reason as XrViewRigExtAvailable().
 void GetDisplayDesktopPosition(int32_t& left, int32_t& top);

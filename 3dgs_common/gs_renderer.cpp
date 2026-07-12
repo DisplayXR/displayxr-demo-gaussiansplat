@@ -990,7 +990,7 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
     // center, the cov2d Jacobian, AND the camera controls all consistent.
     //
     // CALLER CONTRACT (W7): the demo passes a plain clean +Y-up-world view
-    // matrix — the render-ready XR_EXT_view_rig XrView pose via
+    // matrix — the render-ready XR_DXR_view_rig XrView pose via
     // mat4_view_from_xr_pose. No Y-mirrored display pose; -R^T·t recovers the
     // true world camera position for the SH evaluation below.
     float vmFlipped[16];

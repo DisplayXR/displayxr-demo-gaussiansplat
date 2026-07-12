@@ -41,7 +41,7 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 When the runtime's MCP capability is enabled (`DISPLAYXR_MCP=1` or the
 Capabilities registry key), the viewer registers its controls as agent
 tools on the runtime-hosted per-process MCP server via
-`XR_EXT_mcp_tools` (macOS build; appId `gaussiansplat`):
+`XR_DXR_mcp_tools` (macOS build; appId `gaussiansplat`):
 `load_splat`, `get_status`, `set_camera`, `orbit`, `reset_camera`,
 `set_auto_orbit`. Agents reach them through the `displayxr-mcp` adapter
 (`--target pid:<PID>`, or namespaced as `gaussiansplat__<tool>` via

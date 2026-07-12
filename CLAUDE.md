@@ -10,7 +10,7 @@ This is a **standalone repo**. It evolves independently — there is no source-m
 
 ## Runtime dependency
 
-Requires the **DisplayXR runtime v1.3.0 or newer**. v1.3.0 ships the Vulkan transparent-window bridge (PR #215) that this demo now relies on unconditionally — the HWND is created with `WS_EX_NOREDIRECTIONBITMAP` and the session with `transparentBackgroundEnabled = XR_TRUE`, so older runtimes will produce a broken/black window. (v1.1.0+ is still required for the `XR_EXT_display_info` v12 rendering-mode fields the demo also queries.)
+Requires the **DisplayXR runtime v1.3.0 or newer**. v1.3.0 ships the Vulkan transparent-window bridge (PR #215) that this demo now relies on unconditionally — the HWND is created with `WS_EX_NOREDIRECTIONBITMAP` and the session with `transparentBackgroundEnabled = XR_TRUE`, so older runtimes will produce a broken/black window. (v1.1.0+ is still required for the `XR_DXR_display_info` v12 rendering-mode fields the demo also queries.)
 
 Install via `DisplayXRSetup-*.exe` from the [`displayxr-runtime` releases page](https://github.com/DisplayXR/displayxr-runtime/releases). The dev-orchestrator (`scripts/setup-displayxr.{sh,bat}`) and the meta-installer bundle ([`displayxr-installer`](https://github.com/DisplayXR/displayxr-installer)) both pin a known-good runtime version via `versions.json` — those installs are the recommended path for users. The shell ([`displayxr-shell-releases`](https://github.com/DisplayXR/displayxr-shell-releases)) is **optional** for this demo — only needed for the spatial workspace shell, which this demo does not use.
 
@@ -63,7 +63,7 @@ The Linux leg (`linux/main.cpp`) is a **hosted-NULL harness**: it passes no
 window binding, so the runtime self-creates a window. Faithful app-owned
 windowing/input and on-screen validation (needs the Linux runtime + a GPU + an
 X server) is a later pass — see the `TODO(Phase 3)` in `linux/main.cpp` for
-wiring `XR_EXT_xlib_window_binding` (runtime Phase 3a). The generic **COMPUTE**
+wiring `XR_DXR_xlib_window_binding` (runtime Phase 3a). The generic **COMPUTE**
 splat renderer (`GsRenderer`) is used on Linux desktop; the Adreno/TBDR
 graphics path (`gs_adreno_renderer`) is Android/Apple-Silicon only. Recipe:
 the runtime repo's `docs/guides/linux-demo-port.md`.
@@ -75,11 +75,11 @@ Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` und
 ## OpenXR + Vulkan integration notes
 
 - Uses `XR_KHR_vulkan_enable` (creates own VkInstance/Device).
-- Uses `XR_EXT_win32_window_binding` for app-owned HWND.
-- Uses `XR_EXT_display_info` (v12+) for display dims + rendering modes.
+- Uses `XR_DXR_win32_window_binding` for app-owned HWND.
+- Uses `XR_DXR_display_info` (v12+) for display dims + rendering modes.
 - Submits a single `XrCompositionLayerProjection` per frame.
 
-The runtime's VK native compositor handles the rest (atlas → display processor → present). The demo doesn't need to know the chroma-key / weave / DComp internals — those happen runtime-side based on the `XR_EXT_win32_window_binding` flags the demo sets at session create.
+The runtime's VK native compositor handles the rest (atlas → display processor → present). The demo doesn't need to know the chroma-key / weave / DComp internals — those happen runtime-side based on the `XR_DXR_win32_window_binding` flags the demo sets at session create.
 
 ## Projection / clip planes
 
@@ -98,7 +98,7 @@ Near/far are **ZDP-anchored and per-eye**. `display3d_compute_view`/`_views` in 
 The DisplayXR runtime since **v1.3.0** (the [v1.3.0 release](https://github.com/DisplayXR/displayxr-runtime/releases/tag/v1.3.0) added it; any current runtime supports it) provides Vulkan transparent-window support via a VK→D3D11 KMT-shared-texture → DComp + flip-model swapchain bridge. App-side contract:
 
 1. HWND created with `WS_EX_NOREDIRECTIONBITMAP` + null background brush.
-2. `XrWin32WindowBindingCreateInfoEXT.transparentBackgroundEnabled = XR_TRUE` and `chromaKeyColor = 0` (DP picks default magenta) at session create.
+2. `XrWin32WindowBindingCreateInfoDXR.transparentBackgroundEnabled = XR_TRUE` and `chromaKeyColor = 0` (DP picks default magenta) at session create.
 3. Scene clears to `RGBA(0,0,0,0)` in regions that should be transparent.
 4. Projection layer in `xrEndFrame` sets `layerFlags |= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`.
 
