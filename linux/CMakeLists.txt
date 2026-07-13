@@ -62,6 +62,23 @@ target_link_libraries(gaussian_splatting_handle_vk_linux PRIVATE
     ${CMAKE_DL_LIBS}
 )
 
+# Splat renderer selection (mirrors windows/CMakeLists.txt, but the Linux leg
+# DEFAULTS TO GRAPHICS). The Linux target is the integrated-Intel-GPU (tile-based
+# Xe) path, where the graphics-pipeline renderer (GsAdrenoRenderer: splat.vert/
+# splat.frag) is the right fit — and the desktop head-to-head showed it also wins
+# on immediate-mode GPUs (cheaper radix sort: sorts N gaussians, not N×8
+# fragments). Note gs_renderer_select.h's own default on desktop x86_64 is
+# COMPUTE, so this GRAPHICS default is what flips the Linux leg to the graphics
+# shaders. Override with -DGS_RENDERER=COMPUTE (legacy) or AUTO (selector default).
+set(GS_RENDERER "GRAPHICS" CACHE STRING "Splat renderer: AUTO | COMPUTE | GRAPHICS (Linux default: GRAPHICS)")
+set_property(CACHE GS_RENDERER PROPERTY STRINGS AUTO COMPUTE GRAPHICS)
+if(GS_RENDERER STREQUAL "GRAPHICS")
+    target_compile_definitions(gaussian_splatting_handle_vk_linux PRIVATE GS_RENDERER_GRAPHICS=1)
+elseif(GS_RENDERER STREQUAL "COMPUTE")
+    target_compile_definitions(gaussian_splatting_handle_vk_linux PRIVATE GS_RENDERER_COMPUTE=1)
+endif()
+message(STATUS "gaussian_splatting_handle_vk_linux splat renderer: ${GS_RENDERER}")
+
 # Copy bundled default scene next to the exe (auto-loaded at startup). Shared
 # with the macОS leg — no need to duplicate the 3.9 MB asset under linux/.
 set(BUNDLED_SCENE "${CMAKE_SOURCE_DIR}/macos/assets/butterfly.spz")

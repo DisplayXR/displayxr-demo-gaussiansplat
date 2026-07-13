@@ -646,8 +646,16 @@ int main(int argc, char** argv) {
       if (g_gsRenderer.loadScene(scene.c_str()))
           LOG_INFO("Loaded scene: %s (%u gaussians)", scene.c_str(), g_gsRenderer.gaussianCount());
       else {
+#if defined(GS_RENDERER_COMPUTE)
+          // Debug-scene fallback exists only on the compute renderer (GsRenderer).
           LOG_WARN("No scene at %s — loading debug splat", scene.c_str());
           g_gsRenderer.loadDebugScene(0.0f, 0.0f, 0.0f, 0.1f);
+#else
+          // Graphics renderer (GsAdrenoRenderer, the Linux default) has no
+          // loadDebugScene — it renders from a loaded .spz/.ply only.
+          LOG_ERROR("No scene at %s and the graphics renderer has no debug-scene "
+                    "fallback — pass a .spz/.ply path or bundle butterfly.spz", scene.c_str());
+#endif
       } }
 
     LOG_INFO("=== Entering main loop (auto-orbit; Ctrl+C to quit) ===");
