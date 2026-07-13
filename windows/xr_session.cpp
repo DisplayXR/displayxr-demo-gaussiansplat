@@ -221,8 +221,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
 
     // XR_DXR_mcp_tools (#66): resolve the agent-tool entry points. Defensive —
-    // any NULL leaves RegisterAgentTools()/PollEventsGs() inert, so the viewer
-    // runs identically when the extension or the MCP capability gate is absent.
+    // any NULL leaves RegisterAgentTools() (and thus the shared PollEvents' MCP
+    // dispatch) inert, so the viewer runs identically when the extension or the
+    // MCP capability gate is absent.
     // (The struct's PFN fields keep their historical EXT-suffixed NAMES; the
     // TYPES + entry-point strings are the current DXR ones.)
     if (xr.hasMcpToolsExt) {
@@ -600,14 +601,13 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
 // per-call dispatch lives in main.cpp (HandleAgentToolCall), where the app's
 // live viewer state — renderer, camera rig, fit pose — is reachable.
 //
-// NOTE ON THE EVENT PUMP: displayxr-common's shared PollEvents() answers the
-// MCP tool-call event with a hardcoded cube tool set (set_spin/get_status) and
-// replies "unhandled tool" for anything else, so this demo cannot route its own
-// tools through it. Instead main.cpp drives PollEventsGs() (below) — a faithful
-// copy of the shared PollEvents that delegates the MCP case to this app's
-// HandleAgentToolCall(). This mirrors the macOS build, which likewise owns its
-// event loop. Re-sync PollEventsGs() if the shared PollEvents event handling
-// changes.
+// NOTE ON THE EVENT PUMP: displayxr-common v2.1.0 (#18) added an app-supplied
+// hook — XrSessionManager::mcpToolHandler — that the shared PollEvents invokes
+// for every XrEventDataMCPToolCallDXR (PollEvents fetches the args and submits
+// the result; the handler just maps name+args -> JSON). RegisterAgentTools()
+// installs HandleAgentToolCall() there, so this demo no longer forks PollEvents
+// (the old PollEventsGs copy is gone) and the main loop drives the shared
+// PollEvents() directly.
 
 // The appId MUST equal the manifest `id` (linter INV-10.1):
 // windows/displayxr/gaussian_splatting_handle_vk_win.displayxr.json → "gaussiansplat".
@@ -693,110 +693,13 @@ void RegisterAgentTools(XrSessionManager& xr) {
         "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"}},"
         "\"required\":[\"enabled\"]}");
 
+    // Install the app's tool-call handler on the shared PollEvents hook
+    // (displayxr-common v2.1.0 / #18). PollEvents fetches args + submits the
+    // result; HandleAgentToolCall only maps (toolName, argsJson) -> resultJson.
+    xr.mcpToolHandler = [&xr](const std::string& toolName,
+                              const std::string& argsJson, bool& success) {
+        return HandleAgentToolCall(xr, toolName, argsJson, success);
+    };
+
     LOG_INFO("Agent tools registered (appId=%s)", kMcpAppId);
-}
-
-bool PollEventsGs(XrSessionManager& xr) {
-    // Faithful copy of displayxr-common PollEvents() with the MCP tool-call case
-    // delegated to this app's HandleAgentToolCall() (see the NOTE above for why
-    // the shared PollEvents cannot be reused for app-specific tools).
-    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
-
-    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
-        switch (event.type) {
-        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
-            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
-            XrSessionState oldState = xr.sessionState;
-            xr.sessionState = stateEvent->state;
-
-            LOG_INFO("Session state changed: %s -> %s",
-                GetSessionStateString(oldState),
-                GetSessionStateString(xr.sessionState));
-
-            switch (xr.sessionState) {
-            case XR_SESSION_STATE_READY: {
-                LOG_INFO("Session READY - calling xrBeginSession...");
-                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
-                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
-                XrResult result = xrBeginSession(xr.session, &beginInfo);
-                LogXrResult("xrBeginSession", result);
-                if (XR_SUCCEEDED(result)) {
-                    xr.sessionRunning = true;
-                    LOG_INFO("Session is now running");
-                }
-                break;
-            }
-            case XR_SESSION_STATE_STOPPING:
-                LOG_INFO("Session STOPPING - calling xrEndSession...");
-                xrEndSession(xr.session);
-                xr.sessionRunning = false;
-                LOG_INFO("Session stopped");
-                break;
-            case XR_SESSION_STATE_EXITING:
-                LOG_INFO("Session EXITING - requesting exit");
-                xr.exitRequested = true;
-                break;
-            case XR_SESSION_STATE_LOSS_PENDING:
-                LOG_WARN("Session LOSS_PENDING - requesting exit");
-                xr.exitRequested = true;
-                break;
-            default:
-                break;
-            }
-            break;
-        }
-        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
-            LOG_WARN("Instance loss pending - requesting exit");
-            xr.exitRequested = true;
-            break;
-        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
-            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
-            LOG_INFO("Rendering mode changed: %u -> %u",
-                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
-            xr.currentModeIndex = modeEvent->currentModeIndex;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
-            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
-            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
-                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
-                (uint32_t)etEvent->activeMode);
-            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
-            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
-            auto* pickEvent = (XrEventDataFilePickerCompleteDXR*)&event;
-            if (pickEvent->requestId == xr.filePickerRequestId) {
-                xr.filePickerLastResult = pickEvent->result;
-                strncpy(xr.filePickerLastPath, pickEvent->path, sizeof(xr.filePickerLastPath) - 1);
-                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
-                xr.filePickerInFlight = false;
-                xr.filePickerHasResult = true;
-                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
-                    (unsigned long long)pickEvent->requestId,
-                    (int)pickEvent->result,
-                    pickEvent->path);
-            } else {
-                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
-                    (unsigned long long)pickEvent->requestId,
-                    (unsigned long long)xr.filePickerRequestId);
-            }
-            break;
-        }
-        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
-            // Agent invoked one of our registered tools — dispatch to the
-            // app-state-aware handler in main.cpp. Only apps that registered
-            // tools ever receive this event.
-            HandleAgentToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
-            break;
-        }
-        default:
-            LOG_DEBUG("Received event type: %d", event.type);
-            break;
-        }
-        event = {XR_TYPE_EVENT_DATA_BUFFER};
-    }
-
-    return true;
 }
