@@ -52,6 +52,7 @@
 #include <string>
 #include <array>
 #include <chrono>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -59,7 +60,7 @@
 #include <limits.h>
 #include <time.h>
 
-#include "gs_renderer_select.h"   // GsActiveRenderer = compute path on desktop x86_64
+#include "gs_runtime_select.h"    // IGsRenderer + runtime GPU-adaptive selection
 
 // ============================================================================
 // Logging
@@ -92,7 +93,9 @@
 // ============================================================================
 
 static volatile bool g_running = true;
-static GsActiveRenderer g_gsRenderer;
+// Chosen at runtime from the compositor's physical device (see main). Compile-
+// time GS_RENDERER_GRAPHICS/COMPUTE, if set, force the choice instead.
+static std::unique_ptr<IGsRenderer> g_gsRenderer;
 
 static void SignalHandler(int sig) {
     (void)sig;
@@ -636,27 +639,46 @@ int main(int argc, char** argv) {
       xrEnumerateSwapchainImages(xr.swapchain.swapchain, count, &count,
           (XrSwapchainImageBaseHeader*)swapchainImages.data()); }
 
-    if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex,
-                           xr.swapchain.width, xr.swapchain.height))
+    // Choose the splat renderer for the GPU the DisplayXR compositor selected
+    // (physDevice came from xrGetVulkanGraphicsDeviceKHR — the device we must
+    // render on, per the external-FD handoff; we do NOT shop for a faster GPU).
+    // A compile-time GS_RENDERER_GRAPHICS/COMPUTE forces the choice (benchmark /
+    // pin); otherwise the policy reads deviceType: discrete → compute, else
+    // integrated/TBDR → graphics.
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(physDevice, &props);
+#if defined(GS_RENDERER_GRAPHICS)
+        GsRendererKind kind = GsRendererKind::Graphics;
+        const char* how = "compile-time override";
+#elif defined(GS_RENDERER_COMPUTE)
+        GsRendererKind kind = GsRendererKind::Compute;
+        const char* how = "compile-time override";
+#else
+        GsRendererKind kind = gsPickRendererForDevice(props);
+        const char* how = "runtime GPU detection";
+#endif
+        g_gsRenderer = gsMakeRenderer(kind);
+        LOG_INFO("Splat renderer: %s (%s) — GPU '%s' deviceType=%d vendorID=0x%04X",
+                 g_gsRenderer->name(), how, props.deviceName,
+                 (int)props.deviceType, props.vendorID);
+    }
+
+    if (!g_gsRenderer->init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex,
+                            xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("3DGS renderer init failed");
 
     // Auto-load bundled butterfly.spz (copied next to the exe by CMake).
     { std::string scene = ExecutableDir() + "/butterfly.spz";
       if (argc > 1) scene = argv[1];
-      if (g_gsRenderer.loadScene(scene.c_str()))
-          LOG_INFO("Loaded scene: %s (%u gaussians)", scene.c_str(), g_gsRenderer.gaussianCount());
-      else {
-#if defined(GS_RENDERER_COMPUTE)
-          // Debug-scene fallback exists only on the compute renderer (GsRenderer).
-          LOG_WARN("No scene at %s — loading debug splat", scene.c_str());
-          g_gsRenderer.loadDebugScene(0.0f, 0.0f, 0.0f, 0.1f);
-#else
-          // Graphics renderer (GsAdrenoRenderer, the Linux default) has no
-          // loadDebugScene — it renders from a loaded .spz/.ply only.
-          LOG_ERROR("No scene at %s and the graphics renderer has no debug-scene "
-                    "fallback — pass a .spz/.ply path or bundle butterfly.spz", scene.c_str());
-#endif
-      } }
+      if (g_gsRenderer->loadScene(scene.c_str()))
+          LOG_INFO("Loaded scene: %s (%u gaussians)", scene.c_str(), g_gsRenderer->gaussianCount());
+      else
+          // Both renderers render from a loaded .spz/.ply only (the compute-only
+          // loadDebugScene fallback is not part of the runtime interface).
+          LOG_ERROR("No scene at %s — pass a .spz/.ply path or bundle butterfly.spz",
+                    scene.c_str());
+    }
 
     LOG_INFO("=== Entering main loop (auto-orbit; Ctrl+C to quit) ===");
 
@@ -767,8 +789,8 @@ int main(int argc, char** argv) {
                         projectionViews[eye].pose = views[srcView].pose;
                         projectionViews[eye].fov = views[srcView].fov;
 
-                        if (g_gsRenderer.hasScene()) {
-                            g_gsRenderer.renderEye(
+                        if (g_gsRenderer->hasScene()) {
+                            g_gsRenderer->renderEye(
                                 targetImage, swapFormat,
                                 xr.swapchain.width, xr.swapchain.height,
                                 vpX, vpY, renderW, renderH,
@@ -790,7 +812,7 @@ int main(int argc, char** argv) {
     LOG_INFO("Shutting down");
     if (xr.session) xrRequestExitSession(xr.session);
     vkDeviceWaitIdle(vkDevice);
-    g_gsRenderer.cleanup();
+    if (g_gsRenderer) g_gsRenderer->cleanup();
     CleanupOpenXR(xr);
     vkDestroyDevice(vkDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
