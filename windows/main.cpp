@@ -211,9 +211,12 @@ static void ApplyAutoFitForLoadedScene_locked() {
 // ============================================================================
 //
 // Windows port of the macOS build's HandleMcpToolCall. RegisterAgentTools()
-// (windows/xr_session.cpp) declares the appId + tools; this runs a registered
-// tool call and answers it. It executes on the render thread (called from
-// PollEventsGs), so it mutates g_inputState under g_inputMutex and touches the
+// (windows/xr_session.cpp) declares the appId + tools and installs this as
+// xr.mcpToolHandler; displayxr-common's shared PollEvents (v2.1.0 / #18) then
+// fetches the call args, invokes this to map (toolName, argsJson) -> resultJson,
+// and submits the result — so this must NOT call xrGetMCPToolCallArgsDXR /
+// xrSubmitMCPToolResultDXR itself. It runs on the render thread (from
+// PollEvents), so it mutates g_inputState under g_inputMutex and touches the
 // renderer/scene state under g_sceneMutex — the same locks the render loop uses.
 // The tool set, descriptions, schemas, and result JSON key shapes are identical
 // to macOS (macos/main.mm).
@@ -359,32 +362,25 @@ static std::string McpCameraJson() {
     return buf;
 }
 
-void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call) {
-    if (!xr.pfnSubmitMCPToolResultEXT) return;
+std::string HandleAgentToolCall(XrSessionManager& xr, const std::string& toolName,
+                                const std::string& argsJson, bool& success) {
+    // PollEvents already fetched the JSON args (empty string == no args) and
+    // will submit whatever we return. A no-arg tool gets ""; the flat-JSON
+    // helpers below simply find no keys, matching the old "{}" default.
+    const char* a = argsJson.c_str();
+    const char* toolName_c = toolName.c_str();
 
-    // Two-call idiom: the event's argsSize is the exact capacity needed
-    // (incl. NUL). A no-arg tool reports argsSize 0 — treat as "{}".
-    std::string args = "{}";
-    if (xr.pfnGetMCPToolCallArgsEXT && call->argsSize > 0) {
-        std::vector<char> buf(call->argsSize, '\0');
-        uint32_t needed = 0;
-        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId,
-                (uint32_t)buf.size(), &needed, buf.data())))
-            args.assign(buf.data());
-    }
-    const char* a = args.c_str();
-
-    XrBool32 ok = XR_TRUE;
+    bool ok = true;
     std::string result;
     char buf[768];
 
-    if (strcmp(call->toolName, "load_splat") == 0) {
+    if (strcmp(toolName_c, "load_splat") == 0) {
         std::string path;
         if (!JsonGetString(a, "path", &path) || path.empty()) {
-            ok = XR_FALSE;
+            ok = false;
             result = "{\"error\":\"missing required string arg 'path'\"}";
         } else if (!ValidateSceneFile(path)) {
-            ok = XR_FALSE;
+            ok = false;
             result = "{\"error\":\"not a readable .ply/.spz scene: '" + JsonEscape(path) + "'\"}";
         } else {
             // On the render thread (same thread that drives per-frame Vulkan
@@ -392,7 +388,7 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             // queued-load block: hold g_sceneMutex across loadScene + auto-fit.
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             if (!g_gsRenderer.loadScene(path.c_str())) {
-                ok = XR_FALSE;
+                ok = false;
                 result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (corrupt or unsupported)\"}";
             } else {
                 g_loadedFileName = GetPlyFilename(path);
@@ -403,7 +399,7 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
                          g_loadedFileName.c_str(), g_gsRenderer.gaussianCount());
             }
         }
-    } else if (strcmp(call->toolName, "get_status") == 0) {
+    } else if (strcmp(toolName_c, "get_status") == 0) {
         const char* modeName = (xr.renderingModeCount > 0 &&
             xr.currentModeIndex < xr.renderingModeCount &&
             xr.renderingModeNames[xr.currentModeIndex][0] != '\0')
@@ -431,7 +427,7 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             orbitingNow ? "true" : "false",
             xr.sessionRunning ? "true" : "false");
         result = "{\"file\":\"" + JsonEscape(g_loadedFileName) + buf;
-    } else if (strcmp(call->toolName, "set_camera") == 0) {
+    } else if (strcmp(toolName_c, "set_camera") == 0) {
         double v;
         bool any = false;
         {
@@ -460,17 +456,17 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             }
         }
         if (!any) {
-            ok = XR_FALSE;
+            ok = false;
             result = "{\"error\":\"no recognized args (position_x/y/z, yaw_deg, pitch_deg, zoom)\"}";
         } else {
             result = "{\"camera\":" + McpCameraJson() + "}";
         }
-    } else if (strcmp(call->toolName, "orbit") == 0) {
+    } else if (strcmp(toolName_c, "orbit") == 0) {
         double az = 0.0, el = 0.0;
         bool hasAz = JsonGetNumber(a, "azimuth_deg", &az);
         bool hasEl = JsonGetNumber(a, "elevation_deg", &el);
         if (!hasAz && !hasEl) {
-            ok = XR_FALSE;
+            ok = false;
             result = "{\"error\":\"need azimuth_deg and/or elevation_deg\"}";
         } else {
             float yawDeg, pitchDeg;
@@ -490,7 +486,7 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             snprintf(buf, sizeof(buf), "{\"yaw_deg\":%.2f,\"pitch_deg\":%.2f}", yawDeg, pitchDeg);
             result = buf;
         }
-    } else if (strcmp(call->toolName, "reset_camera") == 0) {
+    } else if (strcmp(toolName_c, "reset_camera") == 0) {
         {
             std::lock_guard<std::mutex> lock(g_inputMutex);
             g_inputState.resetViewRequested = true;  // applied by the render loop next frame
@@ -506,10 +502,10 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             (fitValid ? g_fitYaw : 0.0f) * kMcpRad2Deg,
             fitValid ? g_fitVHeight : kFallbackVirtualDisplayHeightM);
         result = buf;
-    } else if (strcmp(call->toolName, "set_auto_orbit") == 0) {
+    } else if (strcmp(toolName_c, "set_auto_orbit") == 0) {
         bool enabled = false;
         if (!JsonGetBool(a, "enabled", &enabled)) {
-            ok = XR_FALSE;
+            ok = false;
             result = "{\"error\":\"missing required boolean arg 'enabled'\"}";
         } else {
             {
@@ -521,11 +517,12 @@ void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* 
             result = enabled ? "{\"auto_orbit\":true}" : "{\"auto_orbit\":false}";
         }
     } else {
-        ok = XR_FALSE;
-        result = std::string("{\"error\":\"unhandled tool '") + call->toolName + "'\"}";
+        ok = false;
+        result = std::string("{\"error\":\"unhandled tool '") + toolName + "'\"}";
     }
 
-    xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result.c_str());
+    success = ok;
+    return result;
 }
 
 // Fullscreen state
@@ -635,7 +632,7 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
 //
 // Path A — workspace + Tier 1 picker available:
 //     xrRequestFilePickerDXR fires async. The completion event is drained
-//     by PollEventsGs (windows/xr_session.cpp) into xr.filePickerLast*;
+//     by the shared PollEvents (displayxr-common) into xr.filePickerLast*;
 //     the main loop dispatches to QueueSceneLoad on result arrival.
 //
 // Path B — workspace mode but no controller / no Tier 1 picker, OR running
@@ -1088,12 +1085,13 @@ static void RenderThreadFunc(
             }
         }
 
-        // Demo-owned event pump (mirrors the shared PollEvents but dispatches
-        // this app's XR_DXR_mcp_tools tools via HandleAgentToolCall, #66).
-        PollEventsGs(*xr);
+        // Shared event pump. XR_DXR_mcp_tools calls are dispatched to this
+        // app's HandleAgentToolCall via xr.mcpToolHandler (installed in
+        // RegisterAgentTools; displayxr-common v2.1.0 / #18, #66).
+        PollEvents(*xr);
 
         // #228 Tier 1: drain a spatial-picker result if one arrived this
-        // tick. PollEventsGs wrote the path + result code onto the session
+        // tick. PollEvents wrote the path + result code onto the session
         // manager; we route it through the same QueueSceneLoad path the
         // Win32 GetOpenFileNameA branch uses. The render thread picks the
         // queued path up via g_pendingLoadPath.

@@ -50,19 +50,19 @@ bool CreateVulkanDevice(VkPhysicalDevice physDevice, uint32_t queueFamilyIndex,
 bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice physDevice,
     VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, HWND hwnd);
 
-// XR_DXR_mcp_tools (#66): declare the app's identity + register its agent tools
-// on the per-process MCP server the runtime hosts. Called by CreateSession once
-// the session exists; inert when the extension / MCP capability gate is absent.
+// XR_DXR_mcp_tools (#66): declare the app's identity, register its agent tools
+// on the per-process MCP server the runtime hosts, and install the app's MCP
+// tool-call handler on xr.mcpToolHandler (consumed by displayxr-common's shared
+// PollEvents, v2.1.0 / common #18). Called by CreateSession once the session
+// exists; inert when the extension / MCP capability gate is absent.
 void RegisterAgentTools(XrSessionManager& xr);
 
-// Demo-owned event pump — a faithful copy of displayxr-common's PollEvents that
-// delegates the XR_DXR_mcp_tools tool-call event to HandleAgentToolCall (the
-// shared PollEvents hardcodes the cube tool set and can't dispatch app tools).
-// The main render loop calls this INSTEAD of the shared PollEvents.
-bool PollEventsGs(XrSessionManager& xr);
-
-// Dispatch one agent tool call and answer it. Defined in windows/main.cpp, where
-// the app's live viewer state (renderer, camera rig, fit pose) is reachable.
-// Runs on the render thread (from PollEventsGs), so it touches shared state under
-// the same mutexes the render loop uses.
-void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call);
+// Map one agent tool call (name + JSON args) to its JSON result. Defined in
+// windows/main.cpp, where the app's live viewer state (renderer, camera rig,
+// fit pose) is reachable. Installed as xr.mcpToolHandler by RegisterAgentTools
+// and invoked by the shared PollEvents on the render thread, so it touches
+// shared state under the same mutexes the render loop uses. It must NOT call
+// xrGetMCPToolCallArgsDXR / xrSubmitMCPToolResultDXR — PollEvents does both.
+// Set `success` false to fail the call to the agent; return the result payload.
+std::string HandleAgentToolCall(XrSessionManager& xr, const std::string& toolName,
+                                const std::string& argsJson, bool& success);
