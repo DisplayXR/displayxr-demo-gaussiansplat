@@ -36,8 +36,12 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -136,6 +140,11 @@ static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
 
+// Latest computed frames-per-second, published each frame by the render thread
+// (after UpdatePerformanceStats) so the XR_DXR_mcp_tools get_status handler can
+// report it without reaching into the render thread's local PerformanceStats.
+static std::atomic<float> g_currentFps{0.0f};
+
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
 // new display-rig pose + vHeight on g_inputState. Display orientation is
 // kept identity (forward = world −Z): splats have no canonical front, and
@@ -195,6 +204,328 @@ static void ApplyAutoFitForLoadedScene_locked() {
             high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
         g_inputState.animationActive = false;
     }
+}
+
+// ============================================================================
+// Agent tools (XR_DXR_mcp_tools, #66) — dispatch, wired to the Windows viewer
+// ============================================================================
+//
+// Windows port of the macOS build's HandleMcpToolCall. RegisterAgentTools()
+// (windows/xr_session.cpp) declares the appId + tools; this runs a registered
+// tool call and answers it. It executes on the render thread (called from
+// PollEventsGs), so it mutates g_inputState under g_inputMutex and touches the
+// renderer/scene state under g_sceneMutex — the same locks the render loop uses.
+// The tool set, descriptions, schemas, and result JSON key shapes are identical
+// to macOS (macos/main.mm).
+
+static constexpr float kMcpRad2Deg   = 57.2957795f;
+static constexpr float kMcpDeg2Rad   = 0.0174532925f;
+static constexpr float kMcpMaxPitchRad = 1.5f;  // same clamp as mouse drag
+
+// Find the value position of `"key" :` in a flat JSON object. Returns nullptr if
+// absent. Does not handle keys nested inside sub-objects or string values — the
+// registered schemas keep all arguments top-level.
+static const char* JsonFindValue(const char* json, const char* key) {
+    char quoted[96];
+    snprintf(quoted, sizeof(quoted), "\"%s\"", key);
+    const char* p = json;
+    while ((p = strstr(p, quoted)) != nullptr) {
+        const char* q = p + strlen(quoted);
+        while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+        if (*q == ':') {
+            q++;
+            while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+            return q;
+        }
+        p = q;
+    }
+    return nullptr;
+}
+
+static bool JsonGetNumber(const char* json, const char* key, double* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v) return false;
+    char* end = nullptr;
+    double d = strtod(v, &end);
+    if (end == v) return false;
+    *out = d;
+    return true;
+}
+
+static bool JsonGetBool(const char* json, const char* key, bool* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v) return false;
+    if (strncmp(v, "true", 4) == 0)  { *out = true;  return true; }
+    if (strncmp(v, "false", 5) == 0) { *out = false; return true; }
+    return false;
+}
+
+// Extract + unescape a JSON string value. Handles the standard escapes and BMP
+// \uXXXX (encoded back to UTF-8; surrogate halves degrade to '?').
+static bool JsonGetString(const char* json, const char* key, std::string* out) {
+    const char* v = JsonFindValue(json, key);
+    if (!v || *v != '"') return false;
+    out->clear();
+    for (const char* c = v + 1; *c; c++) {
+        if (*c == '"') return true;
+        if (*c != '\\') { out->push_back(*c); continue; }
+        c++;
+        switch (*c) {
+            case '"':  out->push_back('"');  break;
+            case '\\': out->push_back('\\'); break;
+            case '/':  out->push_back('/');  break;
+            case 'n':  out->push_back('\n'); break;
+            case 't':  out->push_back('\t'); break;
+            case 'r':  out->push_back('\r'); break;
+            case 'b':  out->push_back('\b'); break;
+            case 'f':  out->push_back('\f'); break;
+            case 'u': {
+                unsigned cp = 0;
+                for (int i = 1; i <= 4; i++) {
+                    char h = c[i];
+                    if (!isxdigit((unsigned char)h)) return false;
+                    cp = cp * 16 + (unsigned)(isdigit((unsigned char)h) ? h - '0'
+                                                                        : (tolower(h) - 'a' + 10));
+                }
+                c += 4;
+                if (cp < 0x80) {
+                    out->push_back((char)cp);
+                } else if (cp < 0x800) {
+                    out->push_back((char)(0xC0 | (cp >> 6)));
+                    out->push_back((char)(0x80 | (cp & 0x3F)));
+                } else if (cp >= 0xD800 && cp <= 0xDFFF) {
+                    out->push_back('?'); // unpaired surrogate
+                } else {
+                    out->push_back((char)(0xE0 | (cp >> 12)));
+                    out->push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+                    out->push_back((char)(0x80 | (cp & 0x3F)));
+                }
+                break;
+            }
+            default: return false; // invalid escape
+        }
+    }
+    return false; // unterminated string
+}
+
+static std::string JsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char b[8];
+                    snprintf(b, sizeof(b), "\\u%04x", c);
+                    out += b;
+                } else {
+                    out.push_back((char)c);
+                }
+        }
+    }
+    return out;
+}
+
+// Monotonic wall-clock seconds — matches the idle-timer stamp ApplyAutoFit uses.
+static double McpNowSec() {
+    using namespace std::chrono;
+    return (double)duration_cast<microseconds>(
+        high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
+}
+
+// Camera sub-object shared by get_status and set_camera responses. Locks
+// g_inputMutex (the render loop / message pump both touch g_inputState); do NOT
+// call while already holding it.
+static std::string McpCameraJson() {
+    float px, py, pz, yaw, pitch, zoom;
+    {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        px = g_inputState.cameraPosX;
+        py = g_inputState.cameraPosY;
+        pz = g_inputState.cameraPosZ;
+        yaw = g_inputState.yaw;
+        pitch = g_inputState.pitch;
+        zoom = g_inputState.viewParams.scaleFactor;
+    }
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{\"position\":[%.4f,%.4f,%.4f],\"yaw_deg\":%.2f,\"pitch_deg\":%.2f,\"zoom\":%.3f}",
+        px, py, pz, yaw * kMcpRad2Deg, pitch * kMcpRad2Deg, zoom);
+    return buf;
+}
+
+void HandleAgentToolCall(XrSessionManager& xr, const XrEventDataMCPToolCallDXR* call) {
+    if (!xr.pfnSubmitMCPToolResultEXT) return;
+
+    // Two-call idiom: the event's argsSize is the exact capacity needed
+    // (incl. NUL). A no-arg tool reports argsSize 0 — treat as "{}".
+    std::string args = "{}";
+    if (xr.pfnGetMCPToolCallArgsEXT && call->argsSize > 0) {
+        std::vector<char> buf(call->argsSize, '\0');
+        uint32_t needed = 0;
+        if (XR_SUCCEEDED(xr.pfnGetMCPToolCallArgsEXT(xr.session, call->callId,
+                (uint32_t)buf.size(), &needed, buf.data())))
+            args.assign(buf.data());
+    }
+    const char* a = args.c_str();
+
+    XrBool32 ok = XR_TRUE;
+    std::string result;
+    char buf[768];
+
+    if (strcmp(call->toolName, "load_splat") == 0) {
+        std::string path;
+        if (!JsonGetString(a, "path", &path) || path.empty()) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"missing required string arg 'path'\"}";
+        } else if (!ValidateSceneFile(path)) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"not a readable .ply/.spz scene: '" + JsonEscape(path) + "'\"}";
+        } else {
+            // On the render thread (same thread that drives per-frame Vulkan
+            // submits), so loadScene() is safe here — mirror the render loop's
+            // queued-load block: hold g_sceneMutex across loadScene + auto-fit.
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            if (!g_gsRenderer.loadScene(path.c_str())) {
+                ok = XR_FALSE;
+                result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (corrupt or unsupported)\"}";
+            } else {
+                g_loadedFileName = GetPlyFilename(path);
+                ApplyAutoFitForLoadedScene_locked();
+                snprintf(buf, sizeof(buf), "\",\"splat_count\":%u}", g_gsRenderer.gaussianCount());
+                result = "{\"file\":\"" + JsonEscape(path) + buf;
+                LOG_INFO("Agent loaded scene: %s (%u splats)",
+                         g_loadedFileName.c_str(), g_gsRenderer.gaussianCount());
+            }
+        }
+    } else if (strcmp(call->toolName, "get_status") == 0) {
+        const char* modeName = (xr.renderingModeCount > 0 &&
+            xr.currentModeIndex < xr.renderingModeCount &&
+            xr.renderingModeNames[xr.currentModeIndex][0] != '\0')
+            ? xr.renderingModeNames[xr.currentModeIndex] : "unknown";
+        double fps = (double)g_currentFps.load(std::memory_order_relaxed);
+        std::string cameraJson = McpCameraJson();
+        float vHeight; bool autoOrbit; bool orbitingNow;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            vHeight = g_inputState.viewParams.virtualDisplayHeight;
+            autoOrbit = g_inputState.animateEnabled;
+            orbitingNow = g_inputState.animationActive;
+        }
+        snprintf(buf, sizeof(buf),
+            "\",\"has_scene\":%s,\"splat_count\":%u,\"fps\":%.1f,\"camera\":%s,"
+            "\"virtual_display_height_m\":%.4f,"
+            "\"rendering_mode\":{\"index\":%u,\"name\":\"%s\"},"
+            "\"transparent_background\":%s,\"auto_orbit\":%s,\"orbiting_now\":%s,"
+            "\"session_running\":%s}",
+            g_gsRenderer.hasScene() ? "true" : "false",
+            g_gsRenderer.gaussianCount(), fps, cameraJson.c_str(),
+            vHeight, xr.currentModeIndex, modeName,
+            g_transparentBg.load() ? "true" : "false",
+            autoOrbit ? "true" : "false",
+            orbitingNow ? "true" : "false",
+            xr.sessionRunning ? "true" : "false");
+        result = "{\"file\":\"" + JsonEscape(g_loadedFileName) + buf;
+    } else if (strcmp(call->toolName, "set_camera") == 0) {
+        double v;
+        bool any = false;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            if (JsonGetNumber(a, "position_x", &v)) { g_inputState.cameraPosX = (float)v; any = true; }
+            if (JsonGetNumber(a, "position_y", &v)) { g_inputState.cameraPosY = (float)v; any = true; }
+            if (JsonGetNumber(a, "position_z", &v)) { g_inputState.cameraPosZ = (float)v; any = true; }
+            if (JsonGetNumber(a, "yaw_deg", &v))    { g_inputState.yaw = (float)(v * kMcpDeg2Rad); any = true; }
+            if (JsonGetNumber(a, "pitch_deg", &v)) {
+                float p = (float)(v * kMcpDeg2Rad);
+                if (p > kMcpMaxPitchRad) p = kMcpMaxPitchRad;
+                if (p < -kMcpMaxPitchRad) p = -kMcpMaxPitchRad;
+                g_inputState.pitch = p;
+                any = true;
+            }
+            if (JsonGetNumber(a, "zoom", &v)) {
+                float z = (float)v;
+                if (z < 0.1f) z = 0.1f;
+                g_inputState.viewParams.scaleFactor = z;
+                any = true;
+            }
+            if (any) {
+                g_inputState.transitioning = false;  // agent pose wins over a running focus transition
+                g_inputState.lastInputTimeSec = McpNowSec();  // restart auto-orbit idle countdown
+                g_inputState.animationActive = false;
+            }
+        }
+        if (!any) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"no recognized args (position_x/y/z, yaw_deg, pitch_deg, zoom)\"}";
+        } else {
+            result = "{\"camera\":" + McpCameraJson() + "}";
+        }
+    } else if (strcmp(call->toolName, "orbit") == 0) {
+        double az = 0.0, el = 0.0;
+        bool hasAz = JsonGetNumber(a, "azimuth_deg", &az);
+        bool hasEl = JsonGetNumber(a, "elevation_deg", &el);
+        if (!hasAz && !hasEl) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"need azimuth_deg and/or elevation_deg\"}";
+        } else {
+            float yawDeg, pitchDeg;
+            {
+                std::lock_guard<std::mutex> lock(g_inputMutex);
+                g_inputState.yaw += (float)(az * kMcpDeg2Rad);
+                float p = g_inputState.pitch + (float)(el * kMcpDeg2Rad);
+                if (p > kMcpMaxPitchRad) p = kMcpMaxPitchRad;
+                if (p < -kMcpMaxPitchRad) p = -kMcpMaxPitchRad;
+                g_inputState.pitch = p;
+                g_inputState.transitioning = false;
+                g_inputState.lastInputTimeSec = McpNowSec();
+                g_inputState.animationActive = false;
+                yawDeg = g_inputState.yaw * kMcpRad2Deg;
+                pitchDeg = g_inputState.pitch * kMcpRad2Deg;
+            }
+            snprintf(buf, sizeof(buf), "{\"yaw_deg\":%.2f,\"pitch_deg\":%.2f}", yawDeg, pitchDeg);
+            result = buf;
+        }
+    } else if (strcmp(call->toolName, "reset_camera") == 0) {
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.resetViewRequested = true;  // applied by the render loop next frame
+        }
+        bool fitValid = g_fitValid.load();
+        snprintf(buf, sizeof(buf),
+            "{\"framed\":%s,\"position\":[%.4f,%.4f,%.4f],\"yaw_deg\":%.2f,"
+            "\"virtual_display_height_m\":%.4f}",
+            fitValid ? "true" : "false",
+            fitValid ? g_fitCenter[0] : 0.0f,
+            fitValid ? g_fitCenter[1] : 0.0f,
+            fitValid ? g_fitCenter[2] : 0.0f,
+            (fitValid ? g_fitYaw : 0.0f) * kMcpRad2Deg,
+            fitValid ? g_fitVHeight : kFallbackVirtualDisplayHeightM);
+        result = buf;
+    } else if (strcmp(call->toolName, "set_auto_orbit") == 0) {
+        bool enabled = false;
+        if (!JsonGetBool(a, "enabled", &enabled)) {
+            ok = XR_FALSE;
+            result = "{\"error\":\"missing required boolean arg 'enabled'\"}";
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(g_inputMutex);
+                g_inputState.animateEnabled = enabled;
+                g_inputState.animationActive = false;
+                g_inputState.lastInputTimeSec = McpNowSec(); // don't snap-start on enable
+            }
+            result = enabled ? "{\"auto_orbit\":true}" : "{\"auto_orbit\":false}";
+        }
+    } else {
+        ok = XR_FALSE;
+        result = std::string("{\"error\":\"unhandled tool '") + call->toolName + "'\"}";
+    }
+
+    xr.pfnSubmitMCPToolResultEXT(xr.session, call->callId, ok, result.c_str());
 }
 
 // Fullscreen state
@@ -304,7 +635,7 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
 //
 // Path A — workspace + Tier 1 picker available:
 //     xrRequestFilePickerDXR fires async. The completion event is drained
-//     by PollEvents (common/xr_session_common.cpp) into xr.filePickerLast*;
+//     by PollEventsGs (windows/xr_session.cpp) into xr.filePickerLast*;
 //     the main loop dispatches to QueueSceneLoad on result arrival.
 //
 // Path B — workspace mode but no controller / no Tier 1 picker, OR running
@@ -723,6 +1054,7 @@ static void RenderThreadFunc(
         }
 
         UpdatePerformanceStats(perfStats);
+        g_currentFps.store(perfStats.fps, std::memory_order_relaxed);
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
 
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
@@ -756,10 +1088,12 @@ static void RenderThreadFunc(
             }
         }
 
-        PollEvents(*xr);
+        // Demo-owned event pump (mirrors the shared PollEvents but dispatches
+        // this app's XR_DXR_mcp_tools tools via HandleAgentToolCall, #66).
+        PollEventsGs(*xr);
 
         // #228 Tier 1: drain a spatial-picker result if one arrived this
-        // tick. PollEvents wrote the path + result code onto the session
+        // tick. PollEventsGs wrote the path + result code onto the session
         // manager; we route it through the same QueueSceneLoad path the
         // Win32 GetOpenFileNameA branch uses. The render thread picks the
         // queued path up via g_pendingLoadPath.
