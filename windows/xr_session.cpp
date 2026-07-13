@@ -84,6 +84,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
             s_hasViewRigExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
+            xr.hasMcpToolsExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -92,6 +95,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_workspace_file_dialog: %s", xr.hasFileDialogExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", s_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable extension not available");
@@ -114,6 +118,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (s_hasViewRigExt) {
         enabledExtensions.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    }
+    if (xr.hasMcpToolsExt) {
+        enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
@@ -211,6 +218,26 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         xrGetInstanceProcAddr(xr.instance, "xrCaptureAtlasDXR",
             (PFN_xrVoidFunction*)&xr.pfnCaptureAtlasEXT);
         LOG_INFO("xrCaptureAtlasDXR: %s", xr.pfnCaptureAtlasEXT ? "resolved" : "NULL");
+    }
+
+    // XR_DXR_mcp_tools (#66): resolve the agent-tool entry points. Defensive —
+    // any NULL leaves RegisterAgentTools()/PollEventsGs() inert, so the viewer
+    // runs identically when the extension or the MCP capability gate is absent.
+    // (The struct's PFN fields keep their historical EXT-suffixed NAMES; the
+    // TYPES + entry-point strings are the current DXR ones.)
+    if (xr.hasMcpToolsExt) {
+        xrGetInstanceProcAddr(xr.instance, "xrSetMCPAppInfoDXR",
+            (PFN_xrVoidFunction*)&xr.pfnSetMCPAppInfoEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrRegisterMCPToolDXR",
+            (PFN_xrVoidFunction*)&xr.pfnRegisterMCPToolEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrGetMCPToolCallArgsDXR",
+            (PFN_xrVoidFunction*)&xr.pfnGetMCPToolCallArgsEXT);
+        xrGetInstanceProcAddr(xr.instance, "xrSubmitMCPToolResultDXR",
+            (PFN_xrVoidFunction*)&xr.pfnSubmitMCPToolResultEXT);
+        LOG_INFO("XR_DXR_mcp_tools entry points: %s",
+            (xr.pfnSetMCPAppInfoEXT && xr.pfnRegisterMCPToolEXT &&
+             xr.pfnGetMCPToolCallArgsEXT && xr.pfnSubmitMCPToolResultEXT)
+                ? "resolved" : "NULL");
     }
 
     uint32_t viewCount = 0;
@@ -553,6 +580,222 @@ bool CreateSession(XrSessionManager& xr, VkInstance vkInstance, VkPhysicalDevice
                 }
             }
         }
+    }
+
+    // XR_DXR_mcp_tools (#66): declare app identity + register the agent tools
+    // now that the session exists. Inert (logs + returns) when the extension or
+    // MCP capability gate is absent.
+    RegisterAgentTools(xr);
+
+    return true;
+}
+
+// ============================================================================
+// Agent tools (XR_DXR_mcp_tools, #66) — Windows port of the macOS integration
+// ============================================================================
+//
+// The viewer's controls are registered as MCP tools on the per-process MCP
+// server the runtime hosts; agents reach them via the displayxr-mcp adapter.
+// Registration is declared here (per-app appId + static tool schemas); the
+// per-call dispatch lives in main.cpp (HandleAgentToolCall), where the app's
+// live viewer state — renderer, camera rig, fit pose — is reachable.
+//
+// NOTE ON THE EVENT PUMP: displayxr-common's shared PollEvents() answers the
+// MCP tool-call event with a hardcoded cube tool set (set_spin/get_status) and
+// replies "unhandled tool" for anything else, so this demo cannot route its own
+// tools through it. Instead main.cpp drives PollEventsGs() (below) — a faithful
+// copy of the shared PollEvents that delegates the MCP case to this app's
+// HandleAgentToolCall(). This mirrors the macOS build, which likewise owns its
+// event loop. Re-sync PollEventsGs() if the shared PollEvents event handling
+// changes.
+
+// The appId MUST equal the manifest `id` (linter INV-10.1):
+// windows/displayxr/gaussian_splatting_handle_vk_win.displayxr.json → "gaussiansplat".
+static const char* kMcpAppId = "gaussiansplat";
+
+void RegisterAgentTools(XrSessionManager& xr) {
+    if (!xr.hasMcpToolsExt || !xr.pfnSetMCPAppInfoEXT || !xr.pfnRegisterMCPToolEXT ||
+        !xr.pfnGetMCPToolCallArgsEXT || !xr.pfnSubmitMCPToolResultEXT) {
+        return; // no agent surface — viewer runs identically
+    }
+
+    XrMCPAppInfoDXR appInfo = {XR_TYPE_MCP_APP_INFO_DXR};
+    strncpy(appInfo.appId, kMcpAppId, sizeof(appInfo.appId) - 1);
+    XrResult ar = xr.pfnSetMCPAppInfoEXT(xr.session, &appInfo);
+    if (XR_FAILED(ar)) {
+        // XR_ERROR_FEATURE_UNSUPPORTED = MCP capability gate off — expected.
+        LOG_INFO("xrSetMCPAppInfoDXR('%s'): %d — no agent surface", kMcpAppId, (int)ar);
+        return;
+    }
+
+    auto reg = [&](const char* name, const char* desc, const char* schema) {
+        XrMCPToolInfoDXR tool = {XR_TYPE_MCP_TOOL_INFO_DXR};
+        tool.name = name;
+        tool.description = desc;
+        tool.inputSchemaJson = schema;
+        XrResult tr = xr.pfnRegisterMCPToolEXT(xr.session, &tool);
+        if (XR_FAILED(tr)) LOG_WARN("xrRegisterMCPToolDXR('%s') failed: %d", name, (int)tr);
+    };
+
+    // Descriptions + schemas are copied verbatim from the macOS build so the
+    // agent-facing contract is identical across platforms.
+    reg("load_splat",
+        "Load a Gaussian-splat scene from a file path (.ply or .spz), replacing the "
+        "currently loaded scene and auto-framing the camera on the main object. "
+        "Returns the loaded file and its splat count; an error result if the file "
+        "cannot be read or parsed.",
+        "{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\","
+        "\"description\":\"Path to the .ply or .spz scene file (absolute recommended).\"}},"
+        "\"required\":[\"path\"]}");
+
+    reg("get_status",
+        "Read the viewer's live state: loaded scene file and splat count, frames per "
+        "second, camera pose (world position in meters, yaw/pitch in degrees, zoom), "
+        "virtual display height in meters, active rendering mode, transparent-background "
+        "and auto-orbit flags, and whether the XR session is running. Requires no "
+        "arguments.",
+        "{\"type\":\"object\"}");
+
+    reg("set_camera",
+        "Set camera pose components absolutely; give any subset of the arguments and "
+        "the rest stay unchanged. position_x/y/z move the camera rig in world meters; "
+        "yaw_deg/pitch_deg aim it (pitch clamps to about +/-86 deg); zoom scales the "
+        "scene (1 = default, larger zooms in, minimum 0.1). Takes effect on the next "
+        "frame and is visually verifiable via capture_frame. Returns the applied "
+        "camera state.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"position_x\":{\"type\":\"number\"},"
+        "\"position_y\":{\"type\":\"number\"},"
+        "\"position_z\":{\"type\":\"number\"},"
+        "\"yaw_deg\":{\"type\":\"number\"},"
+        "\"pitch_deg\":{\"type\":\"number\"},"
+        "\"zoom\":{\"type\":\"number\",\"minimum\":0.1}}}");
+
+    reg("orbit",
+        "Rotate the camera by a relative amount: azimuth_deg yaws around the vertical "
+        "axis (positive matches the idle auto-orbit direction); elevation_deg tilts the "
+        "view up (positive) or down, clamped to about +/-86 deg. At least one argument "
+        "is required. Returns the new absolute yaw/pitch in degrees.",
+        "{\"type\":\"object\",\"properties\":{"
+        "\"azimuth_deg\":{\"type\":\"number\",\"description\":\"Relative yaw in degrees.\"},"
+        "\"elevation_deg\":{\"type\":\"number\",\"description\":\"Relative pitch in degrees.\"}}}");
+
+    reg("reset_camera",
+        "Reset the camera to the auto-framed pose of the loaded scene (or the world "
+        "origin if none is loaded): recenters position, levels pitch, restores default "
+        "zoom and depth. Applied on the next frame. Returns the pose being restored.",
+        "{\"type\":\"object\"}");
+
+    reg("set_auto_orbit",
+        "Enable or disable the idle auto-orbit turntable (when enabled, the view slowly "
+        "yaws after 10 seconds without input). Disable it before scripted camera moves "
+        "or captures that must hold still. Returns the new state.",
+        "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"}},"
+        "\"required\":[\"enabled\"]}");
+
+    LOG_INFO("Agent tools registered (appId=%s)", kMcpAppId);
+}
+
+bool PollEventsGs(XrSessionManager& xr) {
+    // Faithful copy of displayxr-common PollEvents() with the MCP tool-call case
+    // delegated to this app's HandleAgentToolCall() (see the NOTE above for why
+    // the shared PollEvents cannot be reused for app-specific tools).
+    XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
+
+    while (xrPollEvent(xr.instance, &event) == XR_SUCCESS) {
+        switch (event.type) {
+        case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+            auto* stateEvent = (XrEventDataSessionStateChanged*)&event;
+            XrSessionState oldState = xr.sessionState;
+            xr.sessionState = stateEvent->state;
+
+            LOG_INFO("Session state changed: %s -> %s",
+                GetSessionStateString(oldState),
+                GetSessionStateString(xr.sessionState));
+
+            switch (xr.sessionState) {
+            case XR_SESSION_STATE_READY: {
+                LOG_INFO("Session READY - calling xrBeginSession...");
+                XrSessionBeginInfo beginInfo = {XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType = xr.viewConfigType;
+                XrResult result = xrBeginSession(xr.session, &beginInfo);
+                LogXrResult("xrBeginSession", result);
+                if (XR_SUCCEEDED(result)) {
+                    xr.sessionRunning = true;
+                    LOG_INFO("Session is now running");
+                }
+                break;
+            }
+            case XR_SESSION_STATE_STOPPING:
+                LOG_INFO("Session STOPPING - calling xrEndSession...");
+                xrEndSession(xr.session);
+                xr.sessionRunning = false;
+                LOG_INFO("Session stopped");
+                break;
+            case XR_SESSION_STATE_EXITING:
+                LOG_INFO("Session EXITING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            case XR_SESSION_STATE_LOSS_PENDING:
+                LOG_WARN("Session LOSS_PENDING - requesting exit");
+                xr.exitRequested = true;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+            LOG_WARN("Instance loss pending - requesting exit");
+            xr.exitRequested = true;
+            break;
+        case (XrStructureType)XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR: {
+            auto* modeEvent = (XrEventDataRenderingModeChangedDXR*)&event;
+            LOG_INFO("Rendering mode changed: %u -> %u",
+                modeEvent->previousModeIndex, modeEvent->currentModeIndex);
+            xr.currentModeIndex = modeEvent->currentModeIndex;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR: {
+            auto* etEvent = (XrEventDataEyeTrackingStateChangedDXR*)&event;
+            LOG_INFO("Eye tracking state changed: isTracking=%s mode=%u",
+                etEvent->isTracking == XR_TRUE ? "YES" : "NO",
+                (uint32_t)etEvent->activeMode);
+            xr.isEyeTracking = (etEvent->isTracking == XR_TRUE);
+            xr.activeEyeTrackingMode = (uint32_t)etEvent->activeMode;
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_FILE_PICKER_COMPLETE_DXR: {
+            auto* pickEvent = (XrEventDataFilePickerCompleteDXR*)&event;
+            if (pickEvent->requestId == xr.filePickerRequestId) {
+                xr.filePickerLastResult = pickEvent->result;
+                strncpy(xr.filePickerLastPath, pickEvent->path, sizeof(xr.filePickerLastPath) - 1);
+                xr.filePickerLastPath[sizeof(xr.filePickerLastPath) - 1] = '\0';
+                xr.filePickerInFlight = false;
+                xr.filePickerHasResult = true;
+                LOG_INFO("[#228] File picker complete: requestId=%llu result=%d path=\"%s\"",
+                    (unsigned long long)pickEvent->requestId,
+                    (int)pickEvent->result,
+                    pickEvent->path);
+            } else {
+                LOG_WARN("[#228] Ignoring file picker event for stale requestId=%llu (current=%llu)",
+                    (unsigned long long)pickEvent->requestId,
+                    (unsigned long long)xr.filePickerRequestId);
+            }
+            break;
+        }
+        case (XrStructureType)XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR: {
+            // Agent invoked one of our registered tools — dispatch to the
+            // app-state-aware handler in main.cpp. Only apps that registered
+            // tools ever receive this event.
+            HandleAgentToolCall(xr, (const XrEventDataMCPToolCallDXR*)&event);
+            break;
+        }
+        default:
+            LOG_DEBUG("Received event type: %d", event.type);
+            break;
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
     }
 
     return true;
