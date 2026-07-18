@@ -218,15 +218,43 @@ bool GsRenderer::init(VkInstance instance,
     tileX_ = (width_ + 15) / 16;
     tileY_ = (height_ + 15) / 16;
 
-    // The 32-bit sort key carries the tile index in its high 16 bits
-    // (preprocess_sort.comp), so the tile grid must stay within 65536 tiles
-    // (= 16.7 Mpx per eye at 16x16 tiles — far above any current canvas).
-    if ((uint64_t)tileX_ * (uint64_t)tileY_ > 65536) {
-        fprintf(stderr,
-                "GsRenderer: %ux%u px = %u tiles exceeds the 16-bit sort tile "
-                "index (max 65536 tiles = 16.7 Mpx/eye)\n",
-                width_, height_, tileX_ * tileY_);
-        return false;
+    // The 32-bit sort key carries the linear tile index in its high 16 bits
+    // (preprocess_sort.comp), so the grid is capped at 65536 tiles (= 16.7 Mpx
+    // at 16x16). When the requested canvas exceeds that — e.g. a native-8K
+    // atlas (7680x4320 = 129600 tiles) on an 8K Leia panel — we DON'T fail.
+    // The renderer only ever rasterizes one view at a time into renderImage_,
+    // then upscale-blits that to the swapchain viewport, so we cap the internal
+    // render target to the largest 16px-aligned box under the budget (keeping
+    // the aspect ratio) and let renderEye() clamp each frame's render dims to
+    // it. Every real per-view viewport (per-eye 3D, or windowed 2D) is well
+    // under the cap and renders natively; only a native-res full-atlas single
+    // view (2D fullscreen at 8K) gets downscaled + upscaled — degraded, not
+    // broken. Previously this path returned false, which killed the whole
+    // renderer on 8K displays and made every scene load fail (issue: 8K panel).
+    constexpr uint32_t kMaxSortTiles = 65536u;
+    if ((uint64_t)tileX_ * (uint64_t)tileY_ > kMaxSortTiles) {
+        const uint32_t reqW = width_, reqH = height_;
+        const uint32_t reqTiles = tileX_ * tileY_;
+        double scale = std::sqrt((double)kMaxSortTiles /
+                                 ((double)tileX_ * (double)tileY_));
+        width_  = (uint32_t)(width_  * scale) & ~15u;
+        height_ = (uint32_t)(height_ * scale) & ~15u;
+        if (width_  < 16u) width_  = 16u;
+        if (height_ < 16u) height_ = 16u;
+        tileX_ = (width_ + 15) / 16;
+        tileY_ = (height_ + 15) / 16;
+        // sqrt rounding can leave us one row/col over budget — trim the longer
+        // side until the grid fits.
+        while ((uint64_t)tileX_ * (uint64_t)tileY_ > kMaxSortTiles) {
+            if (tileX_ >= tileY_ && tileX_ > 1) { tileX_--; width_  = tileX_ * 16; }
+            else if (tileY_ > 1)                { tileY_--; height_ = tileY_ * 16; }
+            else break;
+        }
+        GS_LOGI("GsRenderer: canvas %ux%u = %u tiles exceeds the 16-bit sort "
+                "budget (%u); capping internal render target to %ux%u (%u tiles). "
+                "Oversized views render at reduced res, upscaled to viewport.",
+                reqW, reqH, reqTiles, kMaxSortTiles, width_, height_,
+                tileX_ * tileY_);
     }
 
     // Create command pool
@@ -1090,6 +1118,13 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         rw = (sw < 16u) ? 16u : (sw & ~15u);
         rh = (sh < 16u) ? 16u : (sh & ~15u);
     }
+    // Never exceed the internal render target (renderImage_ and the tile grid
+    // are sized to width_/height_ at init — which init() may have capped below
+    // the viewport to fit the 16-bit sort-tile budget, e.g. a native-8K 2D
+    // view). Rendering at width_/height_ and upscale-blitting to the viewport
+    // is the same reduced-res path as renderScale_, so it stays self-consistent.
+    if (rw > width_)  rw = width_;
+    if (rh > height_) rh = height_;
 
     // Update uniform buffer with this eye's matrices (at the scaled dims)
     updateUniforms(viewMatrix, projMatrix, rw, rh,
