@@ -40,6 +40,12 @@ if "%VULKAN_SDK%"=="" (
     echo        and open a fresh terminal so VULKAN_SDK is exported, then re-run.
     exit /b 1
 )
+REM Put the SDK's Bin on PATH so 3dgs_common's find_program(glslangValidator)
+REM resolves. find_package(Vulkan) locates the compilers via VULKAN_SDK, but the
+REM bare find_program only searches PATH — and some installs (e.g. the winget
+REM Vulkan SDK package) set VULKAN_SDK without adding Bin to PATH, so configure
+REM fails with "glslangValidator required". CI does this in a dedicated step.
+set "PATH=%VULKAN_SDK%\Bin;%PATH%"
 
 REM --- OpenXR loader -------------------------------------------------------------
 REM Auto-provision the prebuilt Khronos loader, pinned to the same spec revision as
