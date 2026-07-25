@@ -21,6 +21,14 @@ on:
       - 'linux'
       - 'linux-**'
       - 'feature/linux-**'
+    # Release tags: the Deb job attaches the demo .deb to the GitHub Release
+    # (the Linux meta-bundle fetches it — runtime #781 Phase 3).
+    tags:
+      - 'v*'
+
+# The Deb job attaches release assets on tags.
+permissions:
+  contents: write
 
 # Cancel any in-progress run for the same PR (or branch) when a new
 # push comes in. Only the latest commit's CI completes.
@@ -114,3 +122,56 @@ jobs:
         run: |
           test -x build/linux/gaussian_splatting_handle_vk_linux || {
             echo "::error::gaussian_splatting_handle_vk_linux was not produced"; exit 1; }
+
+  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
+  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
+  # too (build-only) so a broken package_deb_linux.sh is caught before release.
+  # Single base (ubuntu-latest) on a VM, not the build matrix — one artifact.
+  Deb:
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — skipping .deb build."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          fetch-depth: 0 # git describe needs tags for the .deb version
+
+      - name: Install dependencies
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libvulkan-dev vulkan-validationlayers glslang-tools \
+            zlib1g-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libxxf86vm-dev libxcb-glx0-dev \
+            dpkg-dev fakeroot
+
+      - name: Build + package the demo .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          ./scripts/package_deb_linux.sh
+          ls -lh dist/*.deb
+
+      - name: Upload .deb artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: displayxr-gaussiansplat-deb
+          path: dist/*.deb
+          if-no-files-found: error
+
+      - name: Attach .deb to the GitHub Release (tags only)
+        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.deb
+          fail_on_unmatched_files: true
