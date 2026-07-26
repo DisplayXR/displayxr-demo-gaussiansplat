@@ -767,8 +767,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ToggleFullscreen(hwnd);
             return 0;
         }
-        // L key = load shortcut
-        if (wParam == 'L') {
+        // Ctrl+O = open a scene (uniform across all demos + platforms, incl. the
+        // mediaplayer). Strict: Ctrl must be held. WM_USER+1 runs the picker on
+        // the message loop. (Was bare L — retired for the uniform chord.)
+        if (wParam == 'O' && (GetKeyState(VK_CONTROL) & 0x8000)) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
             return 0;
         }
@@ -999,7 +1001,7 @@ static void RenderThreadFunc(
             windowH = g_windowHeight;
         }
 
-        // Request main thread to open file dialog when L key or Load button was pressed.
+        // Request main thread to open file dialog when Ctrl+O or Load button was pressed.
         if (loadReq) {
             PostMessage(hwnd, WM_USER + 1, 0, 0);
         }
@@ -1603,7 +1605,7 @@ static void RenderThreadFunc(
                                         std::wstring fname(g_loadedFileName.begin(), g_loadedFileName.end());
                                         sceneText += L"\nLoaded: " + fname;
                                     } else {
-                                        sceneText += L"\nNo scene loaded (press L or click Load)";
+                                        sceneText += L"\nNo scene loaded (Ctrl+O or click Load)";
                                     }
                                 }
                                 modeText += sceneText;
@@ -1662,7 +1664,7 @@ static void RenderThreadFunc(
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"
-                                    L"[M] Auto-Orbit | [V] Mode | [L] Load | [Tab] HUD | [ESC] Quit";
+                                    L"[M] Auto-Orbit | [V] Mode | [Ctrl+O] Load | [Tab] HUD | [ESC] Quit";
 
                                 // Top-bar buttons. Translate window-fraction click
                                 // regions into HUD-pixel coords scaled by the

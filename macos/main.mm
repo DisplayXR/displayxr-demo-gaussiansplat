@@ -14,7 +14,7 @@
  * - XR_DXR_display_info: Kooima projection, display metrics
  * - V key cycles rendering modes via xrRequestDisplayRenderingModeDXR
  * - 0-3 keys select rendering mode directly
- * - L key or button click: NSOpenPanel to load .ply/.spz scenes
+ * - Ctrl+O or button click: NSOpenPanel to load .ply/.spz scenes
  * - Tab: toggle HUD overlay, Space: reset camera, ESC: quit
  */
 
@@ -611,6 +611,13 @@ static void OpenLoadDialog() {
     NSString *chars = [event charactersIgnoringModifiers];
     if ([chars length] == 0) return;
     unichar ch = [chars characterAtIndex:0];
+    // Ctrl+O = open a scene. Literal Ctrl (NOT Cmd) on every platform — uniform
+    // with the Win/Linux demos AND the mediaplayer (SDL SDL_KMOD_CTRL). Strict:
+    // Ctrl must be held. (Was bare L — retired for the uniform chord.)
+    if ((ch == 'o' || ch == 'O') && ([event modifierFlags] & NSEventModifierFlagControl)) {
+        g_input.loadRequested = true;
+        return;
+    }
     switch (ch) {
         case 'w': case 'W': g_input.keyW = true; break;
         case 'a': case 'A': g_input.keyA = true; break;
@@ -644,9 +651,7 @@ static void OpenLoadDialog() {
                 g_input.eyeTrackingModeToggleRequested = true;
             }
             break;
-        case 'l': case 'L':
-            g_input.loadRequested = true;
-            break;
+        // (scene open moved to Ctrl+O — see the modifier check above the switch)
         case '-': case '_': {
             // Edit steadyIpdFactor (the ModeSwitch ramp target); seed ipdFactor
             // in lockstep for the idle/non-ramp render path.
@@ -2612,7 +2617,7 @@ int main(int argc, char** argv) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
                     NSString *sceneInfo = g_gsRenderer.hasScene()
                         ? [NSString stringWithFormat:@"Scene: %s", g_loadedFileName.c_str()]
-                        : @"No scene loaded (press L)";
+                        : @"No scene loaded (Ctrl+O)";
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     const char *orbitLabel = g_input.animateEnabled
