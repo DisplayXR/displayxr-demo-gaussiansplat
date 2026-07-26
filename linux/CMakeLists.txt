@@ -6,10 +6,10 @@
 # CMakeLists.txt already added ../common and ../3dgs_common (exposing the
 # sr_common_base and gs_renderer targets) and ../openxr_includes.
 #
-# Build-green scope: compile gaussian_splatting_handle_vk_linux on
-# ubuntu-latest. Window arm is hosted-NULL (the runtime self-creates the
-# window); the app links no windowing toolkit. The generic COMPUTE splat
-# renderer (GsRenderer) is selected on desktop x86_64 by gs_renderer_select.h.
+# Handle app (#76): the app owns a decorated X11 window centered on the 3D
+# panel and passes it via XR_DXR_xlib_window_binding (hosted-NULL fallback when
+# no X server, which keeps the CI runner build-green). Renderer selection via
+# GS_RENDERER below.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -19,6 +19,12 @@ endif()
 
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
+
+# X11 window + Xrandr panel query (handle app).
+find_package(X11 REQUIRED)
+if(NOT X11_Xrandr_LIB)
+    message(FATAL_ERROR "libXrandr not found (apt install libxrandr-dev) — needed for 3D-panel window centering.")
+endif()
 
 # OpenXR loader — CMake package (from CMAKE_PREFIX_PATH, e.g. the from-source
 # loader in scripts/build_linux.sh) → system library → fatal.
@@ -59,6 +65,8 @@ target_link_libraries(gaussian_splatting_handle_vk_linux PRIVATE
     gs_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
+    X11::X11
+    ${X11_Xrandr_LIB}
     ${CMAKE_DL_LIBS}
 )
 
