@@ -33,6 +33,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
+#include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
 
 #include <atomic>
 #include <algorithm>
@@ -1588,8 +1589,7 @@ static void RenderThreadFunc(
                         // visible — the TAB toggle only hides the body backdrop
                         // and text via the `drawBody` flag below.
                         if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages) {
-                            uint32_t hudImageIndex;
-                            if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                            {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
                                 sessionText += L"\nSession: ";
                                 sessionText += FormatSessionState((int)xr->sessionState);
@@ -1720,78 +1720,59 @@ static void RenderThreadFunc(
                                         modeLabel));
                                 }
 
-                                uint32_t srcRowPitch = 0;
-                                const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
-                                    cameraText, stereoText, helpText, buttons,
-                                    /*drawBody=*/inputSnapshot.hudVisible,
-                                    /*bodyAtBottom=*/true);
-                                if (pixels) {
-                                    const uint8_t* src = (const uint8_t*)pixels;
-                                    uint8_t* dst = (uint8_t*)hudStagingMapped;
-                                    for (uint32_t row = 0; row < hudHeight; row++) {
-                                        memcpy(dst + row * hudWidth * 4, src + row * srcRowPitch, hudWidth * 4);
-                                    }
-                                    UnmapHud(*hud);
+                                // #837 overlay kit: rasterize + upload ONLY when the HUD
+                                // content actually changed. Volatile readouts (fps, eye
+                                // positions, camera) refresh on a 250 ms tick folded into
+                                // the hash while the body is visible; body hidden =
+                                // buttons-only, re-uploaded on hover/label changes. The
+                                // upload submits with a fence and never waits — the old
+                                // per-frame vkQueueWaitIdle here drained the whole frame's
+                                // queued GPU work on the single iGPU queue.
+                                static dxr::CachedLayerUploader s_hudUp;
+                                static bool s_hudUpInit = false;
+                                static bool s_hudUploadedOnce = false;
+                                if (!s_hudUpInit) {
+                                    s_hudUpInit = s_hudUp.init(vkDevice, physDevice,
+                                        queueFamilyIndex, hudWidth, hudHeight);
                                 }
 
-                                // Copy staging buffer to HUD swapchain image
-                                VkCommandBufferAllocateInfo cmdAllocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                                cmdAllocInfo.commandPool = hudCmdPool;
-                                cmdAllocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-                                cmdAllocInfo.commandBufferCount = 1;
+                                uint64_t hh = dxr::HashBytes(&inputSnapshot.hudVisible,
+                                    sizeof(inputSnapshot.hudVisible));
+                                auto hashW = [&hh](const std::wstring& s) {
+                                    hh = dxr::HashBytes(s.data(), s.size() * sizeof(wchar_t), hh);
+                                };
+                                hashW(sessionText); hashW(modeText); hashW(dispText); hashW(helpText);
+                                for (const HudButton& b : buttons) {
+                                    hashW(b.label);
+                                    hh = dxr::HashBytes(&b.hovered, sizeof(b.hovered), hh);
+                                }
+                                if (inputSnapshot.hudVisible) {
+                                    // Body visible: fold the volatile text in on a 250 ms
+                                    // bucket so the numbers refresh at 4 Hz.
+                                    const uint64_t bucket = GetTickCount64() / 250;
+                                    hh = dxr::HashBytes(&bucket, sizeof(bucket), hh);
+                                }
 
-                                VkCommandBuffer cmdBuf;
-                                vkAllocateCommandBuffers(vkDevice, &cmdAllocInfo, &cmdBuf);
-
-                                VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-                                beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-                                vkBeginCommandBuffer(cmdBuf, &beginInfo);
-
-                                VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
-
-                                VkImageMemoryBarrier barrier = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-                                barrier.srcAccessMask = 0;
-                                barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                                barrier.image = hudImg;
-                                barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                VkBufferImageCopy region = {};
-                                region.bufferRowLength = hudWidth;
-                                region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-                                region.imageOffset = {0, 0, 0};
-                                region.imageExtent = {hudWidth, hudHeight, 1};
-                                vkCmdCopyBufferToImage(cmdBuf, hudStagingBuffer, hudImg,
-                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-                                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                                barrier.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                                barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                                vkCmdPipelineBarrier(cmdBuf,
-                                    VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                                    0, 0, nullptr, 0, nullptr, 1, &barrier);
-
-                                vkEndCommandBuffer(cmdBuf);
-
-                                VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-                                submitInfo.commandBufferCount = 1;
-                                submitInfo.pCommandBuffers = &cmdBuf;
-                                vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
-                                vkQueueWaitIdle(graphicsQueue);
-
-                                vkFreeCommandBuffers(vkDevice, hudCmdPool, 1, &cmdBuf);
-
-                                ReleaseHudSwapchainImage(*xr);
-                                hudSubmitted = true;
+                                if (s_hudUpInit && s_hudUp.needsUpload(hh)) {
+                                    uint32_t hudImageIndex;
+                                    if (AcquireHudSwapchainImage(*xr, hudImageIndex)) {
+                                        uint32_t srcRowPitch = 0;
+                                        const void* pixels = RenderHudAndMap(*hud, &srcRowPitch, sessionText, modeText, perfText, dispText, eyeText,
+                                            cameraText, stereoText, helpText, buttons,
+                                            /*drawBody=*/inputSnapshot.hudVisible,
+                                            /*bodyAtBottom=*/true);
+                                        if (pixels) {
+                                            VkImage hudImg = (*hudSwapchainImages)[hudImageIndex].image;
+                                            if (s_hudUp.upload(graphicsQueue, hudImg, pixels,
+                                                    srcRowPitch, hudWidth * 4, hudHeight, hh)) {
+                                                s_hudUploadedOnce = true;
+                                            }
+                                            UnmapHud(*hud);
+                                        }
+                                        ReleaseHudSwapchainImage(*xr);
+                                    }
+                                }
+                                hudSubmitted = s_hudUploadedOnce;
                             }
                         }
 
