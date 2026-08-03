@@ -34,6 +34,8 @@
 #include "text_overlay.h"
 #include "atlas_capture.h"
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
+#include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
+#include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
 
 #include <atomic>
 #include <algorithm>
@@ -123,6 +125,15 @@ static std::atomic<bool> g_captureAtlasRequested{false};
 // renderer's output alpha (1 → 1-T) so background-uncovered pixels
 // punch through to the desktop.
 static std::atomic<bool> g_transparentBg{false};
+// #833 punch-through (see docs/architecture/transparency-modes.md in the
+// runtime repo): under baked composition (DXR_PRESENT_OPAQUE) transparent
+// mode must CARVE the uncovered pixels out of the window and go borderless
+// (a shaped NRB window can never paint a frame). kBorderlessMsg runs the
+// style swap on the window-owning thread.
+static const UINT kBorderlessMsg = WM_APP + 0x33;
+static std::atomic<bool> g_borderless{false};
+static dxr::ClickThroughRegion g_punch; // render-thread owned
+static dxr::RmbWindowDrag g_windowDrag; // window-thread owned (WndProc)
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
@@ -703,12 +714,43 @@ static void OpenLoadDialog(HWND hwnd) {
 }
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    // #833: RMB-drag moves the borderless punch-through window (Unity
+    // desktop-avatar convention). Consumed BEFORE the input handler so a
+    // window-drag doesn't double as camera input.
+    if (g_windowDrag.handleMessage(hwnd, msg, wParam, lParam, g_borderless.load())) {
+        return 0;
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
         UpdateInputState(g_inputState, msg, wParam, lParam);
     }
 
     switch (msg) {
+    case WM_NCHITTEST:
+        // Shaped borderless mode: the OS only delivers hits inside the
+        // region; claim them for normal app input.
+        if (g_borderless.load()) return HTCLIENT;
+        break;
+
+    case kBorderlessMsg: {
+        // Ctrl+T style swap on the window-owning thread; client rect
+        // preserved (the avatar recipe). Shaping follows on the render
+        // thread once coverage lands.
+        const bool borderless = wParam != 0;
+        RECT client = {};
+        GetClientRect(hwnd, &client);
+        POINT tl = {0, 0};
+        ClientToScreen(hwnd, &tl);
+        const DWORD style = (borderless ? WS_POPUP : WS_OVERLAPPEDWINDOW) | WS_VISIBLE;
+        SetWindowLong(hwnd, GWL_STYLE, (LONG)style);
+        RECT want = {tl.x, tl.y, tl.x + client.right, tl.y + client.bottom};
+        AdjustWindowRect(&want, style, FALSE);
+        SetWindowPos(hwnd, nullptr, want.left, want.top, want.right - want.left,
+                     want.bottom - want.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        g_borderless.store(borderless);
+        return 0;
+    }
     case WM_LBUTTONDOWN: {
         int mx = LOWORD(lParam);
         int my = HIWORD(lParam);
@@ -991,6 +1033,8 @@ static void RenderThreadFunc(
                 bool now = !g_transparentBg.load();
                 g_transparentBg.store(now);
                 LOG_INFO("Transparent background: %s (Ctrl+T)", now ? "ON" : "OFF");
+                // #833: transparent mode = borderless + region punch-through.
+                PostMessage(hwnd, kBorderlessMsg, now ? 1 : 0, 0);
             }
             g_inputState.animateToggleRequested = false;
             g_inputState.loadRequested = false;
@@ -1579,6 +1623,24 @@ static void RenderThreadFunc(
                                     stereoViews[monoMode ? 0 : eye].fov :
                                     (monoMode ? rawViews[0].fov : rawViews[eye].fov);
                             }
+
+                            // #833 punch-through: while Ctrl+T transparent AND
+                            // borderless, shape the window from view 0's alpha
+                            // (fence-pipelined, ~2-frame lag — no waits). Chrome
+                            // is hidden in transparent mode (product call), so
+                            // no chrome rects are kept.
+                            if (g_transparentBg.load() && g_borderless.load()) {
+                                static bool s_punchInit = false;
+                                if (!s_punchInit) {
+                                    s_punchInit = g_punch.init(vkDevice, physDevice, queueFamilyIndex);
+                                }
+                                if (s_punchInit) {
+                                    g_punch.update(graphicsQueue, (*swapchainVkImages)[imageIndex],
+                                                   renderW, renderH, hwnd, windowW, windowH, nullptr, 0);
+                                }
+                            } else if (g_punch.shaped()) {
+                                g_punch.disable(hwnd);
+                            }
                             ReleaseSwapchainImage(*xr);
                         } else {
                             rendered = false;
@@ -1588,7 +1650,11 @@ static void RenderThreadFunc(
                         // every frame so the chrome buttons (Open / Mode) stay
                         // visible — the TAB toggle only hides the body backdrop
                         // and text via the `drawBody` flag below.
-                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages) {
+                        // #833: chrome (the HUD layer incl. buttons) is HIDDEN in
+                        // transparent/punch-through mode by design — the splats
+                        // float clean over the live desktop.
+                        if (rendered && hud && xr->hasHudSwapchain && hudSwapchainImages &&
+                            !g_transparentBg.load()) {
                             {
                                 std::wstring sessionText(xr->systemName, xr->systemName + strlen(xr->systemName));
                                 sessionText += L"\nSession: ";
