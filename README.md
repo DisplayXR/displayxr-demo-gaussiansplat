@@ -25,8 +25,8 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 | `M` | Auto-orbit: slow turntable rotation when idle for > 10 s |
 | `F` | Flip scene Y-axis (fix for splats trained in the opposite Y convention) |
 | `V` | Cycle rendering modes advertised by the display runtime |
-| `L` or top-bar **Open…** | Load a different `.ply` / `.spz` file |
-| Drag-and-drop (macOS) | Load a `.ply` / `.spz` dropped onto the window |
+| `Ctrl+O` or top-bar **Open…** | Load a different `.ply` / `.spz` file |
+| Drag-and-drop (Windows, macOS) | Load a `.ply` / `.spz` dropped onto the window |
 | Space | Reset pose, zoom, depth, auto-orbit, flip |
 | Tab | Toggle HUD |
 | One-finger drag (Android) | Orbit the splat |
