@@ -15,6 +15,7 @@
 #define _UNICODE
 #include <windows.h>
 #include <commdlg.h>
+#include <shellapi.h>   // DragAcceptFiles / DragQueryFileA / DragFinish (WM_DROPFILES)
 #include <shlwapi.h>
 #include <shlobj.h>
 #pragma comment(lib, "shlwapi.lib")
@@ -788,6 +789,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         OpenLoadDialog(hwnd);
         return 0;
 
+    case WM_DROPFILES: {
+        // Drop a .ply / .spz scene onto the window. macOS has had this since the
+        // Cocoa entry point was written; Windows never wired it. The path goes
+        // through the existing QueueSceneLoad — the same entry Ctrl+O and the
+        // #228 spatial picker use, with its ValidateSceneFile check and the
+        // mutex-guarded handoff to the render thread — so a drop is
+        // indistinguishable downstream.
+        HDROP drop = (HDROP)wParam;
+        const UINT count = DragQueryFileA(drop, 0xFFFFFFFF, nullptr, 0);
+        if (count > 0) {
+            char path[MAX_PATH] = {};
+            if (DragQueryFileA(drop, 0, path, MAX_PATH) > 0) {
+                if (count > 1)
+                    LOG_INFO("Drop: %u files, loading the first (%s)", count, path);
+                QueueSceneLoad(hwnd, std::string(path));
+            }
+        }
+        DragFinish(drop);
+        return 0;
+    }
+
     case dxr_capture::kFlashUserMsg:
         // Render thread requested a capture-flash; start it on this thread
         // (the message-pump thread that owns the HWND).
@@ -885,6 +907,11 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int32_t 
         LOG_ERROR("Failed to create window, error: %lu", GetLastError());
         return nullptr;
     }
+
+    // Accept dropped .ply / .spz scenes (WM_DROPFILES). This sets the
+    // WS_EX_ACCEPTFILES *extended* style, so it survives any later GWL_STYLE
+    // rewrite (borderless/fullscreen swaps touch the plain style only).
+    DragAcceptFiles(hwnd, TRUE);
 
     LOG_INFO("Window created: 0x%p", hwnd);
     return hwnd;
