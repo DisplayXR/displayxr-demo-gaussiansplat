@@ -992,6 +992,35 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
 }
 
+// Standalone (own window) vs. running as a client of the workspace shell's
+// external multi-compositor — signalled by the current rendering mode not being
+// requestable (the shell owns the mode). Same predicate the foreground-clip
+// path uses; kept in one place so the two can't drift.
+static bool IsStandaloneSession(const XrSessionManager* xr) {
+    return (xr->renderingModeCount == 0) ||
+           (xr->currentModeIndex < xr->renderingModeCount &&
+            xr->renderingModeIsRequestable[xr->currentModeIndex]);
+}
+
+// Idle auto-orbit gate. The turntable is a screensaver for a scene sitting in
+// its own opaque window. In standalone transparent mode (Ctrl+T) the scene is
+// punched through onto the user's desktop as a floating object, and a floating
+// object that spins by itself reads as a glitch rather than as an idle
+// screensaver. Under the workspace shell there is no punch-through illusion to
+// break (the app is a framed tile in a composed scene), so the turntable keeps
+// running there.
+//
+// This is a live gate, NOT a state change: 'M' (and the set_auto_orbit MCP
+// tool) still own animateEnabled, and the turntable resumes — after a fresh
+// 10 s idle countdown, since the caller holds lastInputTimeSec at "now" while
+// engaged — as soon as the condition clears.
+//
+// The modelviewer's sibling gate has a second arm for a playing animation clip;
+// splat scenes carry no clips, so there is nothing to hold against here.
+static bool AutoOrbitSuppressed(const XrSessionManager* xr) {
+    return g_transparentBg.load() && IsStandaloneSession(xr);
+}
+
 static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
@@ -1126,6 +1155,18 @@ static void RenderThreadFunc(
 
         UpdatePerformanceStats(perfStats);
         g_currentFps.store(perfStats.fps, std::memory_order_relaxed);
+
+        // Auto-orbit gate (see AutoOrbitSuppressed). Drop the turntable for this
+        // frame without touching the user's 'M' state, and hold the idle clock
+        // at "now" so the 10 s countdown restarts when the gate clears — leaving
+        // it stale would snap the orbit on the instant the user exits
+        // transparent mode.
+        const bool orbitEnabledByUser = inputSnapshot.animateEnabled;
+        const bool orbitSuppressed = orbitEnabledByUser && AutoOrbitSuppressed(xr);
+        if (orbitSuppressed) {
+            inputSnapshot.animateEnabled = false;
+            inputSnapshot.lastInputTimeSec = McpNowSec();
+        }
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
 
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
@@ -1149,6 +1190,9 @@ static void RenderThreadFunc(
             g_inputState.transitioning = inputSnapshot.transitioning;
             g_inputState.transitionT = inputSnapshot.transitionT;
             g_inputState.animationActive = inputSnapshot.animationActive;
+            // Held idle clock (gate above) — persist it, otherwise the shared
+            // state keeps the stale timestamp and the countdown never restarts.
+            if (orbitSuppressed) g_inputState.lastInputTimeSec = inputSnapshot.lastInputTimeSec;
             if (resetRequested) {
                 g_inputState.viewParams = inputSnapshot.viewParams;
                 // Auto-orbit always on; reset only clears the in-flight
@@ -1505,10 +1549,7 @@ static void RenderThreadFunc(
                         // multi-compositor (non-controller workspace session,
                         // where the per-app transparent bridge is bypassed) —
                         // signalled by renderingModeIsRequestable being false.
-                        bool standalone = (xr->renderingModeCount == 0) ||
-                            (xr->currentModeIndex < xr->renderingModeCount &&
-                             xr->renderingModeIsRequestable[xr->currentModeIndex]);
-                        bool foregroundClip = g_transparentBg.load() && standalone;
+                        bool foregroundClip = g_transparentBg.load() && IsStandaloneSession(xr);
 
                         // Soft foreground clip: fade splat opacity over the last
                         // clipFadeFrac of the eye->ZDP distance instead of a hard
@@ -1752,12 +1793,18 @@ static void RenderThreadFunc(
                                     inputSnapshot.viewParams.ipdFactor, inputSnapshot.viewParams.parallaxFactor,
                                     inputSnapshot.viewParams.perspectiveFactor, inputSnapshot.viewParams.scaleFactor);
                                 {
-                                    wchar_t vhBuf[96];
+                                    wchar_t vhBuf[128];  // fits the longest "held:" label
                                     int depthPct = (int)(inputSnapshot.viewParams.ipdFactor * 100.0f + 0.5f);
-                                    const wchar_t* orbitLbl = inputSnapshot.animateEnabled
-                                        ? (inputSnapshot.animationActive ? L"ON (running)" : L"ON (idle countdown)")
-                                        : L"OFF";
-                                    swprintf(vhBuf, 96, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
+                                    // orbitEnabledByUser, not the snapshot flag —
+                                    // the gate clears the latter for the frame, and
+                                    // reporting that as "OFF" would blame the M key
+                                    // for a hold the display mode asked for.
+                                    const wchar_t* orbitLbl =
+                                        !orbitEnabledByUser ? L"OFF"
+                                        : orbitSuppressed ? L"ON (held: transparent)"
+                                        : (inputSnapshot.animationActive ? L"ON (running)"
+                                                                         : L"ON (idle countdown)");
+                                    swprintf(vhBuf, 128, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
                                         inputSnapshot.viewParams.virtualDisplayHeight, hudM2v, depthPct, orbitLbl);
                                     stereoText += vhBuf;
                                 }
