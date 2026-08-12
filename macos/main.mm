@@ -416,11 +416,23 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     if (input.keyQ) { input.cameraPosX -= upX*d;  input.cameraPosY -= upY*d;  input.cameraPosZ -= upZ*d; }
 
     // Auto-orbit: if enabled and user has been idle > 10s, slowly yaw the display.
-    double idleFor = NowSec() - input.lastInputTimeSec;
-    input.animationActive = (input.animateEnabled && idleFor > 10.0);
-    if (input.animationActive) {
-        float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
-        input.yaw += rate * dt;
+    // Held in transparent mode (Ctrl+T): the scene is punched through onto the
+    // user's desktop as a floating object, and a floating object that spins by
+    // itself reads as a glitch rather than as an idle screensaver. Holding the
+    // idle clock at "now" (rather than just skipping the yaw) restarts the 10 s
+    // countdown when the user goes back to opaque, so the turntable doesn't snap
+    // on the instant they hit Ctrl+T again. There is no workspace shell on
+    // macOS, so — unlike the Windows arm — every session is standalone here.
+    if (g_transparentBg) {
+        input.animationActive = false;
+        input.lastInputTimeSec = NowSec();
+    } else {
+        double idleFor = NowSec() - input.lastInputTimeSec;
+        input.animationActive = (input.animateEnabled && idleFor > 10.0);
+        if (input.animationActive) {
+            float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
+            input.yaw += rate * dt;
+        }
     }
 }
 
@@ -2620,8 +2632,13 @@ int main(int argc, char** argv) {
                         : @"No scene loaded (Ctrl+O)";
 
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
+                    // "held" rather than "idle countdown" in transparent mode —
+                    // the countdown is being reset every frame, so it will never
+                    // reach the turntable and saying otherwise is a lie.
                     const char *orbitLabel = g_input.animateEnabled
-                        ? (g_input.animationActive ? "ON (running)" : "ON (idle countdown)")
+                        ? (g_transparentBg ? "ON (held: transparent)"
+                                           : (g_input.animationActive ? "ON (running)"
+                                                                      : "ON (idle countdown)"))
                         : "OFF";
                     uint32_t activeViewCount = (xr.renderingModeCount > 0 && g_input.currentRenderingMode < xr.renderingModeCount)
                         ? xr.renderingModeViewCounts[g_input.currentRenderingMode] : 2u;
