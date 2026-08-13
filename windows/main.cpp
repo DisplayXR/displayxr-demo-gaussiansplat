@@ -747,8 +747,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SetWindowLong(hwnd, GWL_STYLE, (LONG)style);
         RECT want = {tl.x, tl.y, tl.x + client.right, tl.y + client.bottom};
         AdjustWindowRect(&want, style, FALSE);
-        SetWindowPos(hwnd, nullptr, want.left, want.top, want.right - want.left,
-                     want.bottom - want.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_NOACTIVATE);
+        // Transparent mode floats above other apps (the avatar behavior):
+        // clicks punched through to a window behind activate it, but the
+        // scene stays on top. Ctrl+T off returns to the normal z-band.
+        SetWindowPos(hwnd, borderless ? HWND_TOPMOST : HWND_NOTOPMOST, want.left, want.top,
+                     want.right - want.left, want.bottom - want.top,
+                     SWP_FRAMECHANGED | SWP_NOACTIVATE);
         g_borderless.store(borderless);
         return 0;
     }
