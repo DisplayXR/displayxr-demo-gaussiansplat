@@ -800,20 +800,38 @@ load_butterfly(struct android_app *app)
 
 	// Auto-frame (W7): recenter on the robust scene centroid (so the splat
 	// straddles the display plane at the origin) and derive the virtual
-	// display height from the scene's screen-facing extent — the screen
-	// roughly spans the scene with a small margin, mirroring the desktop
-	// auto-fit semantics (vHeight = scene height).
+	// display height so the scene caps at 80% of the view in BOTH axes.
+	// The block below mirrors displayxr-common auto_fit.h AutoFitVHeight
+	// (the desktop legs call the header directly; the Android CMake does not
+	// pull displayxr-common, so the rule is inlined here). Viewport = the
+	// per-view swapchain rect, valid by now (gs_init runs before this and
+	// g_gs_ready gates entry). getRobustSceneBounds bakes NO comfort margin,
+	// so the fill fraction is the shared default 0.80 — unlike the desktop
+	// legs, which compensate getMainObjectBounds' 1.10x bake with 0.88.
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_gs.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
 		// Remember the framed centroid as the long-press reset target.
 		g_scene_center_orig[0] = g_scene_center[0];
 		g_scene_center_orig[1] = g_scene_center[1];
 		g_scene_center_orig[2] = g_scene_center[2];
-		float face = ext[0] > ext[1] ? ext[0] : ext[1];  // width/height extent
-		g_rig_vh.store(face * 1.1f, std::memory_order_relaxed);
-		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) rig_vh=%.2f",
+		const float kFill = 0.8f;
+		const float vp_w = (float)g_views[0].width;
+		const float vp_h = (float)g_views[0].height;
+		float vh = ext[1] / kFill;
+		if (ext[0] > 0.0f && vp_w > 0.0f && vp_h > 0.0f) {
+			const float vh_w = ext[0] / (kFill * (vp_w / vp_h));
+			if (vh_w > vh) {
+				vh = vh_w;
+			}
+		}
+		if (vh > 1e-3f) {
+			g_rig_vh.store(vh, std::memory_order_relaxed);
+		}
+		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) "
+		     "viewport=%ux%u rig_vh=%.2f",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
-		     ext[0], ext[1], ext[2], g_rig_vh.load(std::memory_order_relaxed));
+		     ext[0], ext[1], ext[2], g_views[0].width, g_views[0].height,
+		     g_rig_vh.load(std::memory_order_relaxed));
 	}
 	g_scene_loaded.store(true, std::memory_order_relaxed);
 	return true;

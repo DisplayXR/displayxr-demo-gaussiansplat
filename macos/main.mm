@@ -60,6 +60,7 @@
 #include "gs_renderer_select.h"   // GsActiveRenderer = graphics on Apple Silicon (default)
 #include "gs_scene_loader.h"
 #include "atlas_capture.h"
+#include "auto_fit.h"             // dxr::AutoFitVHeight (shared width-aware load-time framing)
 
 // ============================================================================
 // Logging
@@ -140,10 +141,14 @@ struct InputState {
 // percentile-based extent — see ApplyAutoFitForLoadedScene().
 static constexpr float kDefaultVirtualDisplayHeightM = 1.5f;
 
-// Comfort margin is baked into getMainObjectBounds (which picks a different
-// multiplier for single-object vs scene-with-central-object). Keep this at
-// 1.0 to mean "no extra margin on top of what the bounds method returned".
-static constexpr float kAutoFitVerticalComfort = 1.0f;
+// Fill fraction handed to dxr::AutoFitVHeight. The shared rule's default is
+// 0.80 (asset spans 80% of the viewport on its binding axis), but
+// getMainObjectBounds already bakes a 1.10x comfort margin into all three
+// extent axes, so the extents we pass are 1.10x the true object size. Pass
+// 0.88 = 0.80 x 1.10 to cancel that and net an 80% cap of the TRUE object.
+// (Do not "fix" this by unbaking the comfort in getMainObjectBounds — that
+// multiplier differs single-object vs scene and is shared with other legs.)
+static constexpr float kAutoFitFill = 0.88f;
 
 // Cached auto-fit result for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -1921,6 +1926,24 @@ static bool FileExists(const std::string& p) {
     return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// Viewport the auto-fit width rule frames against: the live content-view
+// bounds when the window exists (g_windowW/H are the drawable size sampled
+// once at startup and never refreshed on resize), else those startup dims.
+// Only the aspect ratio matters to dxr::AutoFitVHeight, so the backing scale
+// factor is irrelevant — it cancels.
+static void GetAutoFitViewport(float& outW, float& outH) {
+    if (g_window) {
+        NSSize cs = [[g_window contentView] bounds].size;
+        if (cs.width > 0.0 && cs.height > 0.0) {
+            outW = (float)cs.width;
+            outH = (float)cs.height;
+            return;
+        }
+    }
+    outW = (float)g_windowW;
+    outH = (float)g_windowH;
+}
+
 // Compute robust scene bounds (5th–95th percentile per axis) and set the
 // display rig pose + vHeight to frame the scene. Display orientation is
 // kept identity (forward = world −Z): splats have no canonical front, and
@@ -1935,7 +1958,13 @@ static void ApplyAutoFitForLoadedScene() {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Shared width-aware rule (displayxr-common common/auto_fit.h):
+        // vHeight = max(H, W / aspect) / fill — the scene caps at `fill` of
+        // the viewport in BOTH axes, so a wide scene no longer overflows
+        // horizontally. See kAutoFitFill for why fill is 0.88, not 0.80.
+        float viewportW = 0.0f, viewportH = 0.0f;
+        GetAutoFitViewport(viewportW, viewportH);
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, kAutoFitFill);
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
 
@@ -1946,9 +1975,14 @@ static void ApplyAutoFitForLoadedScene() {
         g_fitYaw = 0.0f;
 
         g_fitValid = true;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
+        const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
+                 "viewport=%.0fx%.0f aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2],
+                 viewportW, viewportH, aspect, widthBound ? "width" : "height",
+                 kAutoFitFill, vh, g_fitYaw * 57.2957795f);
     } else {
         g_fitValid = false;
     }

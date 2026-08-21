@@ -34,6 +34,7 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
+#include "auto_fit.h"         // dxr::AutoFitVHeight (shared width-aware load-time framing)
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
 #include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
 #include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
@@ -104,6 +105,10 @@ static std::atomic<bool> g_running{true};
 static XrSessionManager* g_xr = nullptr;
 static UINT g_windowWidth = 1280;
 static UINT g_windowHeight = 720;
+// Published once the app window exists so the auto-fit viewport can be read
+// live (GetClientRect) instead of trusting the WM_SIZE-updated statics — the
+// bundled auto-load runs before ShowWindow.
+static HWND g_appWindow = nullptr;
 
 // 3DGS state
 static GsActiveRenderer g_gsRenderer;
@@ -141,10 +146,14 @@ static std::mutex g_sceneMutex;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
-// Comfort margin is baked into getMainObjectBounds (which picks a different
-// multiplier for single-object vs scene-with-central-object). Keep this at
-// 1.0 to mean "no extra margin on top of what the bounds method returned".
-static constexpr float kAutoFitVerticalComfort = 1.0f;
+// Fill fraction handed to dxr::AutoFitVHeight. The shared rule's default is
+// 0.80 (asset spans 80% of the viewport on its binding axis), but
+// getMainObjectBounds already bakes a 1.10x comfort margin into all three
+// extent axes, so the extents we pass are 1.10x the true object size. Pass
+// 0.88 = 0.80 x 1.10 to cancel that and net an 80% cap of the TRUE object.
+// (Do not "fix" this by unbaking the comfort in getMainObjectBounds — that
+// multiplier differs single-object vs scene and is shared with other legs.)
+static constexpr float kAutoFitFill = 0.88f;
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
 // so 'Space' returns to the framed pose rather than world origin.
@@ -157,6 +166,21 @@ static std::atomic<bool> g_fitValid{false};
 // (after UpdatePerformanceStats) so the XR_DXR_mcp_tools get_status handler can
 // report it without reaching into the render thread's local PerformanceStats.
 static std::atomic<float> g_currentFps{0.0f};
+
+// Viewport the auto-fit width rule frames against: the live window client
+// rect when the window exists, else the last WM_SIZE dims. Only the aspect
+// ratio matters to dxr::AutoFitVHeight, so pixels are fine.
+static void GetAutoFitViewport(float& outW, float& outH) {
+    RECT client = {};
+    if (g_appWindow && GetClientRect(g_appWindow, &client) &&
+        client.right > client.left && client.bottom > client.top) {
+        outW = (float)(client.right - client.left);
+        outH = (float)(client.bottom - client.top);
+        return;
+    }
+    outW = (float)g_windowWidth;
+    outH = (float)g_windowHeight;
+}
 
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
 // new display-rig pose + vHeight on g_inputState. Display orientation is
@@ -172,7 +196,13 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitCenter[0] = center[0];
         g_fitCenter[1] = center[1];
         g_fitCenter[2] = center[2];
-        float vh = extent[1] * kAutoFitVerticalComfort;
+        // Shared width-aware rule (displayxr-common common/auto_fit.h):
+        // vHeight = max(H, W / aspect) / fill — the scene caps at `fill` of
+        // the viewport in BOTH axes, so a wide scene no longer overflows
+        // horizontally. See kAutoFitFill for why fill is 0.88, not 0.80.
+        float viewportW = 0.0f, viewportH = 0.0f;
+        GetAutoFitViewport(viewportW, viewportH);
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, kAutoFitFill);
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -183,9 +213,14 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // macOS:1407 — the user can drag with LMB if a particular asset's
         // authored orientation is off.
         g_fitYaw = 0.0f;
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) vHeight=%.3f yaw=%.0fdeg",
+        const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
+        const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
+        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
+                 "viewport=%.0fx%.0f aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2], vh, g_fitYaw * 57.2957795f);
+                 extent[0], extent[1], extent[2],
+                 viewportW, viewportH, aspect, widthBound ? "width" : "height",
+                 kAutoFitFill, vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -2057,6 +2092,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         ShutdownLogging();
         return 1;
     }
+    // Publish for GetAutoFitViewport (the bundled auto-load fits before ShowWindow).
+    g_appWindow = hwnd;
 
     // Try to load sim_display_set_output_mode
     {
