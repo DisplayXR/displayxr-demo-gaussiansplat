@@ -63,6 +63,11 @@ struct GsAdrenoRenderer {
     // Robust scene centroid + per-axis extent (outlier-trimmed): per axis takes
     // the loPct/hiPct quantile positions, center=midpoint, extent=hi-lo. Used by
     // the demo for auto-framing. Returns false if no scene is loaded.
+    //! Full scene AABB over every gaussian CENTRE (no percentile trim).
+    //! Mirrors GsRenderer::getSceneBBox. Used to measure how much the robust
+    //! percentile box under-reports the visible extent.
+    bool getSceneBBox(float outMin[3], float outMax[3]) const;
+
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
 
