@@ -165,6 +165,7 @@ static void mark_user_input() { g_last_input_ms.store(now_ms(), std::memory_orde
 // (the screen roughly spans the scene — desktop auto-fit semantics).
 bool g_has_view_rig = false;
 std::atomic<float> g_rig_vh{1.0f};
+}
 
 // Tablet gesture state (fed via MainActivity.dispatchTouchEvent → nativeOnTouch +
 // a GestureDetector, runtime#499). All applied to the DISPLAY rig pose / vH at
@@ -179,6 +180,136 @@ std::atomic<float> g_rig_vh{1.0f};
 std::atomic<float> g_orbit_yaw{0.0f};   // 1-finger drag, 0.005 rad/px, -= convention
 std::atomic<float> g_orbit_pitch{0.0f}; // clamped ±1.5 rad
 std::atomic<float> g_zoom{1.0f};        // pinch: >1 zooms in (rig_vh = base/g_zoom)
+
+// ── Load-time fit extents, cached so a viewport change can re-derive the base
+// without re-measuring the scene (they are properties of the CONTENT, not of
+// the viewport). 0 = no scene fitted yet.
+float g_fit_ext_w = 0.0f;
+float g_fit_ext_h = 0.0f;
+// Viewport the current base was derived from, so a config change that does not
+// alter the aspect (a resize that keeps proportions) does not retrigger.
+float g_fit_vp_w = 0.0f;
+float g_fit_vp_h = 0.0f;
+
+// ── Base-vHeight transition (rotation refit) ────────────────────────────────
+// Rotation changes the VIEWPORT, not the content and not the user's intent, so
+// the BASE is re-derived while g_zoom / orbit / pivot are left alone. Because
+// the render path already computes rig_vh = base / g_zoom, a pinch stays
+// RELATIVE: 2x of the old fit becomes 2x of the new one, so the subject keeps
+// its apparent size instead of jumping.
+//
+// Scalar mirror of dxr::RigTransition (displayxr-common common/rig_transition.h)
+// with Easing::SmoothStep -- same curve, same "t_ starts landed" convention.
+// Not linked directly: that class lerps whole dxr_rig structs and lives in a
+// .cpp inside displayxr_common_lib, which an Android build cannot link (the
+// same reason auto_fit.h is inlined here).
+constexpr float kRefitDurationS = 0.20f;
+// The live window, published by handle_cmd. Polled each frame rather than
+// keyed off a specific APP_CMD: rotation can surface as CONFIG_CHANGED,
+// WINDOW_RESIZED, or a TERM+INIT pair depending on the device, and polling is
+// correct for all of them. The aspect guard in refit_for_viewport makes the
+// poll cheap and makes "settled" fall out for free -- a mid-rotation
+// intermediate size that lands on the same aspect never retriggers.
+std::atomic<ANativeWindow *> g_native_window{nullptr};
+std::atomic<float> g_vh_from{0.0f};
+std::atomic<float> g_vh_to{0.0f};
+std::atomic<float> g_vh_t{1.0f}; //!< normalized progress; 1 = idle/landed
+
+inline float
+refit_curve(float t)
+{
+	if (t <= 0.0f)
+		return 0.0f;
+	if (t >= 1.0f)
+		return 1.0f;
+	return t * t * (3.0f - 2.0f * t); // SmoothStep, matches RigTransition
+}
+
+//! Seconds since the previous call (monotonic). First call returns 0.
+inline float
+frame_dt_s()
+{
+	static int64_t prev_ns = 0;
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	const int64_t now_ns = (int64_t)ts.tv_sec * 1000000000ll + ts.tv_nsec;
+	if (prev_ns == 0) {
+		prev_ns = now_ns;
+		return 0.0f;
+	}
+	const float dt = (float)(now_ns - prev_ns) * 1e-9f;
+	prev_ns = now_ns;
+	// Clamp: a backgrounded app would otherwise land the lerp instantly on
+	// resume, which is the snap this transition exists to avoid.
+	return (dt > 0.1f) ? 0.1f : dt;
+}
+
+void refit_for_viewport(float vp_w, float vp_h, const char *why);
+
+//! Advance the refit lerp and publish the interpolated base. No-op when landed.
+void
+refit_update(float dt_s)
+{
+	// Poll the window first: a rotation shows up here as a new aspect.
+	if (ANativeWindow *win = g_native_window.load(std::memory_order_relaxed)) {
+		const int32_t ww = ANativeWindow_getWidth(win);
+		const int32_t wh = ANativeWindow_getHeight(win);
+		if (ww > 0 && wh > 0) {
+			refit_for_viewport((float)ww, (float)wh, "viewport change");
+		}
+	}
+
+	float t = g_vh_t.load(std::memory_order_relaxed);
+	if (t >= 1.0f) {
+		return;
+	}
+	t += (kRefitDurationS > 0.0f) ? (dt_s / kRefitDurationS) : 1.0f;
+	if (t > 1.0f) {
+		t = 1.0f;
+	}
+	g_vh_t.store(t, std::memory_order_relaxed);
+	const float a = g_vh_from.load(std::memory_order_relaxed);
+	const float b = g_vh_to.load(std::memory_order_relaxed);
+	g_rig_vh.store(a + (b - a) * refit_curve(t), std::memory_order_relaxed);
+}
+
+//! Re-derive the base vHeight for a new viewport and start the transition.
+//! Retargets in flight rather than restarting, so a rotation that settles in
+//! two steps does not snap back to the old value mid-lerp.
+void
+refit_for_viewport(float vp_w, float vp_h, const char *why)
+{
+	if (!(g_fit_ext_w > 0.0f) || !(g_fit_ext_h > 0.0f)) {
+		return; // nothing fitted yet
+	}
+	if (!(vp_w > 0.0f) || !(vp_h > 0.0f)) {
+		return;
+	}
+	// Only the ASPECT moves the fit; ignore a resize that keeps proportions.
+	const float a_new = vp_w / vp_h;
+	const float a_old = (g_fit_vp_h > 0.0f) ? (g_fit_vp_w / g_fit_vp_h) : -1.0f;
+	if (a_old > 0.0f && std::fabs(a_new - a_old) < 1e-3f) {
+		return;
+	}
+	constexpr float kFill = 0.8f;
+	float vh = g_fit_ext_h / kFill;
+	const float vh_w = g_fit_ext_w / (kFill * a_new);
+	if (vh_w > vh) {
+		vh = vh_w;
+	}
+	if (!(vh > 1e-3f)) {
+		return;
+	}
+	g_fit_vp_w = vp_w;
+	g_fit_vp_h = vp_h;
+	g_vh_from.store(g_rig_vh.load(std::memory_order_relaxed),
+	                std::memory_order_relaxed);
+	g_vh_to.store(vh, std::memory_order_relaxed);
+	g_vh_t.store(0.0f, std::memory_order_relaxed);
+	LOGI("refit (%s): viewport=%.0fx%.0f aspect=%.3f base %.2f -> %.2f "
+	     "(zoom %.2fx preserved)",
+	     why, vp_w, vp_h, a_new, g_vh_from.load(std::memory_order_relaxed), vh,
+	     g_zoom.load(std::memory_order_relaxed));
 
 // Double-tap focus / long-press reset: the UI thread sets a pending tap NDC (or a
 // reset request); the render loop raycasts it (needs the located views) and
@@ -962,6 +1093,14 @@ load_butterfly(struct android_app *app)
 		}
 		if (vh > 1e-3f) {
 			g_rig_vh.store(vh, std::memory_order_relaxed);
+			// Cache for the rotation refit: the extents are CONTENT
+			// properties, so a viewport change re-derives the base from
+			// these without re-measuring the scene.
+			g_fit_ext_w = fit_w;
+			g_fit_ext_h = fit_h;
+			g_fit_vp_w = vp_w;
+			g_fit_vp_h = vp_h;
+			g_vh_t.store(1.0f, std::memory_order_relaxed); // landed
 		}
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) "
 		     "fit=(%.2f,%.2f) viewport=%.0fx%.0f aspect=%.3f src=%s "
@@ -1097,6 +1236,10 @@ render_frame()
 		// 2-finger drag → pan (rig position in its view plane), 1-finger drag →
 		// orbit (rig orientation). The runtime resolves the off-axis Kooima around
 		// this pose (server-side over IPC on the OOP path).
+		// Advance the rotation refit, then apply the user's pinch on top: the
+		// zoom is RELATIVE to whatever the current base is, so a 2x pinch stays
+		// 2x across a rotation instead of the subject changing size.
+		refit_update(frame_dt_s());
 		const float rig_vh = g_rig_vh.load(std::memory_order_relaxed) /
 		                     g_zoom.load(std::memory_order_relaxed);
 		XrPosef rig_pose = {};
@@ -1374,6 +1517,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 	switch (cmd) {
 	case APP_CMD_INIT_WINDOW:
 		LOGI("APP_CMD_INIT_WINDOW (window=%p)", app->window);
+		g_native_window.store(app->window, std::memory_order_relaxed);
 		if (g_instance == XR_NULL_HANDLE) {
 			bool ok =
 			    create_instance(app) &&
@@ -1389,8 +1533,14 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
 		}
 		break;
+	case APP_CMD_TERM_WINDOW:
+		// Stop polling a window that is going away.
+		LOGI("APP_CMD_TERM_WINDOW");
+		g_native_window.store(nullptr, std::memory_order_relaxed);
+		break;
 	case APP_CMD_DESTROY:
 		LOGI("APP_CMD_DESTROY");
+		g_native_window.store(nullptr, std::memory_order_relaxed);
 		destroy_all();
 		break;
 	default:
