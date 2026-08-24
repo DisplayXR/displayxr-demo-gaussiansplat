@@ -35,6 +35,21 @@
         <intent>
             <action android:name="org.freedesktop.monado.ipc.CONNECT" />
         </intent>
+        <!--
+            ARCHITECTURE A (in-process, ADR-036 D2 / ADR-025): the vendor display
+            processor runs in THIS process; its CNSDK core loader calls
+            PackageManager.getPackageInfo() on the on-device vendor services to
+            bind display config + face tracking. Package visibility is enforced
+            per CALLING UID, so declaring them in the runtime APK is not enough —
+            without these two lines the loader gets a NameNotFoundException it
+            never clears and the next JNI call trips CheckJNI, aborting the app
+            during head-tracking bring-up (in-process only; the OOP path binds
+            them in the runtime process). This is the last vendor-specific thing
+            in a client APK; it goes away once the vendor services advertise a
+            neutral intent action (ADR-036 D5 / vendor ask L7).
+        -->
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
     </queries>
 
     <uses-feature
