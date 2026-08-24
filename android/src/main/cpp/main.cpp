@@ -865,29 +865,34 @@ load_butterfly(struct android_app *app)
 	// which compensate getMainObjectBounds' 1.10x bake with 0.88.
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_gs.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
-		// DIAGNOSTIC: the [5%,95%] box under-reports what is actually drawn.
-		// It trims 10% of gaussians AND is computed over CENTRES only, so it
-		// ignores every splat's rendered footprint. Fitting it to 80% therefore
-		// draws the VISIBLE asset larger than 80%. Log the wider boxes so the
-		// real ratio is measured rather than guessed at.
-		{
-			float c99[3], e99[3], bmin[3], bmax[3];
-			const bool ok99 =
-			    g_gs.getRobustSceneBounds(0.01f, 0.99f, c99, e99);
-			const bool okbb = g_gs.getSceneBBox(bmin, bmax);
-			LOGI("fitbox: p05_95=(%.3f,%.3f) p01_99=(%.3f,%.3f) full=(%.3f,%.3f) "
-			     "ratio_w p99/p95=%.3f full/p95=%.3f",
-			     ext[0], ext[1],
-			     ok99 ? e99[0] : -1.0f, ok99 ? e99[1] : -1.0f,
-			     okbb ? (bmax[0] - bmin[0]) : -1.0f,
-			     okbb ? (bmax[1] - bmin[1]) : -1.0f,
-			     (ok99 && ext[0] > 0.0f) ? e99[0] / ext[0] : -1.0f,
-			     (okbb && ext[0] > 0.0f) ? (bmax[0] - bmin[0]) / ext[0] : -1.0f);
-		}
 		// Remember the framed centroid as the long-press reset target.
 		g_scene_center_orig[0] = g_scene_center[0];
 		g_scene_center_orig[1] = g_scene_center[1];
 		g_scene_center_orig[2] = g_scene_center[2];
+		// The bounds are percentiles over gaussian CENTRES, so they under-report
+		// what is actually drawn and the asset renders larger than `kFill`.
+		// Measured on device for the bundled scene:
+		//
+		//   p05_95 width 1.474   (what this used to fit)
+		//   p01_99 width 1.715   = 1.164x   -- the percentile trim
+		//   visible             ~= 1.25x    -- from "the asset fits the width
+		//                                      exactly" when 0.80 was asked for
+		//
+		// So the trim explains ~1.16x and the remaining ~1.07x is the splat
+		// FOOTPRINT: a percentile over centres cannot see how far each blob
+		// extends past its own centre, and the per-gaussian scales live GPU-side
+		// so the CPU cannot measure it here.
+		//
+		// Fix the BOX, not the fill: `kFill` keeps the shared rule's meaning
+		// (the asset occupies 80% of the viewport), and the box is corrected to
+		// approximate the asset. Widen to [1%,99%] -- still trims true floaters
+		// -- then inflate by the footprint term.
+		//
+		// kSplatFootprint is calibrated against ONE asset and ONE visual
+		// judgement, so treat it as an estimate, not a constant of nature. The
+		// desktop legs do the same kind of correction in the other direction:
+		// their bounds bake a 1.10x margin and they use fill 0.88 to cancel it.
+		constexpr float kSplatFootprint = 1.07f;
 		const float kFill = 0.8f;
 		// Viewport = the PANEL. This app is fullscreen, so window == panel;
 		// XR_DXR_display_info reports it directly.
@@ -933,9 +938,24 @@ load_butterfly(struct android_app *app)
 				vp_src = "window (ANativeWindow)";
 			}
 		}
-		float vh = ext[1] / kFill;
-		if (ext[0] > 0.0f && vp_w > 0.0f && vp_h > 0.0f) {
-			const float vh_w = ext[0] / (kFill * (vp_w / vp_h));
+		// Fit extents: widened percentile x footprint. The CENTROID above stays
+		// the robust [5%,95%] one -- a centre should not chase floaters.
+		float fit_w = ext[0];
+		float fit_h = ext[1];
+		{
+			float c99[3], e99[3];
+			if (g_gs.getRobustSceneBounds(0.01f, 0.99f, c99, e99) &&
+			    e99[0] > 0.0f && e99[1] > 0.0f) {
+				fit_w = e99[0];
+				fit_h = e99[1];
+			}
+		}
+		fit_w *= kSplatFootprint;
+		fit_h *= kSplatFootprint;
+
+		float vh = fit_h / kFill;
+		if (fit_w > 0.0f && vp_w > 0.0f && vp_h > 0.0f) {
+			const float vh_w = fit_w / (kFill * (vp_w / vp_h));
 			if (vh_w > vh) {
 				vh = vh_w;
 			}
@@ -944,9 +964,10 @@ load_butterfly(struct android_app *app)
 			g_rig_vh.store(vh, std::memory_order_relaxed);
 		}
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) "
-		     "viewport=%.0fx%.0f aspect=%.3f src=%s (%ux%u per view) rig_vh=%.2f",
+		     "fit=(%.2f,%.2f) viewport=%.0fx%.0f aspect=%.3f src=%s "
+		     "(%ux%u per view) rig_vh=%.2f",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
-		     ext[0], ext[1], ext[2], vp_w, vp_h,
+		     ext[0], ext[1], ext[2], fit_w, fit_h, vp_w, vp_h,
 		     (vp_h > 0.0f ? vp_w / vp_h : 0.0f), vp_src,
 		     g_views[0].width, g_views[0].height,
 		     g_rig_vh.load(std::memory_order_relaxed));
