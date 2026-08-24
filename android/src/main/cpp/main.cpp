@@ -165,7 +165,6 @@ static void mark_user_input() { g_last_input_ms.store(now_ms(), std::memory_orde
 // (the screen roughly spans the scene — desktop auto-fit semantics).
 bool g_has_view_rig = false;
 std::atomic<float> g_rig_vh{1.0f};
-}
 
 // Tablet gesture state (fed via MainActivity.dispatchTouchEvent → nativeOnTouch +
 // a GestureDetector, runtime#499). All applied to the DISPLAY rig pose / vH at
@@ -310,6 +309,7 @@ refit_for_viewport(float vp_w, float vp_h, const char *why)
 	     "(zoom %.2fx preserved)",
 	     why, vp_w, vp_h, a_new, g_vh_from.load(std::memory_order_relaxed), vh,
 	     g_zoom.load(std::memory_order_relaxed));
+}
 
 // Double-tap focus / long-press reset: the UI thread sets a pending tap NDC (or a
 // reset request); the render loop raycasts it (needs the located views) and
