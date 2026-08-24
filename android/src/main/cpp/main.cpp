@@ -43,6 +43,7 @@
 // XR_DXR_display_info: the panel pixel size, so the load-time auto-fit
 // can use the real viewport instead of reconstructing one.
 #include <openxr/XR_DXR_display_info.h>
+#include <android/native_window.h>
 
 #define LOG_TAG "gausssplat_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -887,13 +888,31 @@ load_butterfly(struct android_app *app)
 		// (both current modes: 2D 1.0x1.0, LeiaSR 0.75x0.75) and merely
 		// approximate for a hypothetical anamorphic one -- still far closer
 		// than the tile reconstruction it replaces.
+		//
+		// PRIORITY: the app's own WINDOW, then the panel, then the per-view
+		// aspect. The window is the only source that tracks ORIENTATION. The
+		// panel from display_info is the NATIVE (landscape) 2560x1600 whatever
+		// way up the device is held, so on a portrait launch it reports aspect
+		// 1.600 where the viewport is really 1600x2560 = 0.625 -- and the fit
+		// then stays height-bound and the asset overflows sideways. Measured:
+		// a 1.47x1.18 scene wants rig_vh 1.47 under 1.600 (height-bound) but
+		// 2.94 under 0.625 (width-bound), i.e. twice as small.
 		float vp_w = (float)g_views[0].width;
 		float vp_h = (float)g_views[0].height;
-		const char *vp_src = "per-view aspect (display_info absent)";
+		const char *vp_src = "per-view aspect (no window, no display_info)";
 		if (g_panel_px_w > 0 && g_panel_px_h > 0) {
 			vp_w = (float)g_panel_px_w;
 			vp_h = (float)g_panel_px_h;
-			vp_src = "panel (display_info)";
+			vp_src = "panel (display_info, orientation-blind)";
+		}
+		if (app != nullptr && app->window != nullptr) {
+			const int32_t win_w = ANativeWindow_getWidth(app->window);
+			const int32_t win_h = ANativeWindow_getHeight(app->window);
+			if (win_w > 0 && win_h > 0) {
+				vp_w = (float)win_w;
+				vp_h = (float)win_h;
+				vp_src = "window (ANativeWindow)";
+			}
 		}
 		float vh = ext[1] / kFill;
 		if (ext[0] > 0.0f && vp_w > 0.0f && vp_h > 0.0f) {
