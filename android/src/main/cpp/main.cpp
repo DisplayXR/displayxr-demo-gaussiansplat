@@ -40,6 +40,9 @@
 
 // XR_DXR_view_rig (#396 W7): vendored DisplayXR extension header.
 #include <openxr/XR_DXR_view_rig.h>
+// XR_DXR_display_info: the panel pixel size, so the load-time auto-fit
+// can use the real viewport instead of reconstructing one.
+#include <openxr/XR_DXR_display_info.h>
 
 #define LOG_TAG "gausssplat_vk_android"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -87,6 +90,13 @@ log_xr_result(const char *what, XrResult r)
 
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSystemId g_system_id = XR_NULL_SYSTEM_ID;
+// Panel pixels from XR_DXR_display_info (0 = unavailable). This is the
+// viewport the auto-fit rule wants: the window, which on this fullscreen
+// app is the whole panel. See apply_auto_fit for why it must not be
+// reconstructed from the tile grid.
+bool g_has_display_info = false;
+uint32_t g_panel_px_w = 0;
+uint32_t g_panel_px_h = 0;
 XrVersion g_required_vk_version = XR_MAKE_VERSION(1, 1, 0);
 
 VkInstance g_vk_instance = VK_NULL_HANDLE;
@@ -374,7 +384,10 @@ create_instance(struct android_app *app)
 					if (std::strcmp(props[i].extensionName,
 					                XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 						g_has_view_rig = true;
-						break;
+					}
+					if (std::strcmp(props[i].extensionName,
+					                XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) {
+						g_has_display_info = true;
 					}
 				}
 			}
@@ -386,13 +399,16 @@ create_instance(struct android_app *app)
 		     "(fixed device FOV, no server-side Kooima; expect degraded 3D)");
 	}
 
-	const char *extensions[4] = {
+	const char *extensions[5] = {
 	    XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 	    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
 	};
 	uint32_t extension_count = 2;
 	if (g_has_view_rig) {
 		extensions[extension_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
+	}
+	if (g_has_display_info) {
+		extensions[extension_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 	}
 	XrInstanceCreateInfoAndroidKHR android_info = {};
 	android_info.type = XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR;
@@ -447,6 +463,37 @@ query_system_and_graphics_reqs()
 		log_xr_result("xrGetSystem(HANDHELD)", res);
 		if (res != XR_SUCCESS) {
 			return false;
+		}
+	}
+
+	// Panel pixels for the load-time auto-fit. XR_DXR_display_info reports the
+	// native panel directly, which is the viewport the fit rule wants (this app
+	// is fullscreen, so window == panel). Falls back to per-view / view_scale,
+	// the same recovery dxr::PanelPixelsFromView performs.
+	if (g_has_display_info) {
+		XrDisplayInfoDXR di = {};
+		di.type = XR_TYPE_DISPLAY_INFO_DXR;
+		XrSystemProperties sysprops = {};
+		sysprops.type = XR_TYPE_SYSTEM_PROPERTIES;
+		sysprops.next = &di;
+		if (xrGetSystemProperties(g_instance, g_system_id, &sysprops) ==
+		    XR_SUCCESS) {
+			if (di.displayPixelWidth > 0 && di.displayPixelHeight > 0) {
+				g_panel_px_w = di.displayPixelWidth;
+				g_panel_px_h = di.displayPixelHeight;
+			} else if (di.recommendedViewScaleX > 0.0f &&
+			           di.recommendedViewScaleY > 0.0f) {
+				// No panel size reported — recover it from the recommended
+				// view scale, which is recommended_px / display_px.
+				g_panel_px_w = 0; // filled in create_swapchains once views exist
+				g_panel_px_h = 0;
+			}
+			LOGI("display_info: panel=%ux%u view_scale=(%.3f,%.3f)",
+			     di.displayPixelWidth, di.displayPixelHeight,
+			     di.recommendedViewScaleX, di.recommendedViewScaleY);
+		} else {
+			LOGW("xrGetSystemProperties(XrDisplayInfoDXR) failed — auto-fit "
+			     "falls back to the per-view aspect");
 		}
 	}
 
@@ -822,8 +869,32 @@ load_butterfly(struct android_app *app)
 		g_scene_center_orig[1] = g_scene_center[1];
 		g_scene_center_orig[2] = g_scene_center[2];
 		const float kFill = 0.8f;
-		const float vp_w = (float)(g_views[0].width * kViewCount);
-		const float vp_h = (float)g_views[0].height;
+		// Viewport = the PANEL. This app is fullscreen, so window == panel;
+		// XR_DXR_display_info reports it directly.
+		//
+		// It used to be reconstructed as per-view width x kViewCount. That
+		// reconstructs the ATLAS, not the panel, and the two agree only when
+		// view_scale == 1/tile_count. This panel breaks that: 2x1 tiles at
+		// scale 0.750x0.750 on 2560x1600 gives a 1920x1200 per-view rect, so
+		// the multiply reported 3840x1200 -- aspect 3.200 where the panel is
+		// 1.600. The runtime's own DP log agrees: "HW_GEO: view=1920x1200
+		// (aspect 1.600) tiles=2x1 atlas=3840x1200". A 2x-too-wide aspect
+		// halves the vh_w term below, so the width cap stopped binding and
+		// this fit silently degraded to height-only.
+		//
+		// Fallback when display_info is absent: the per-view rect's OWN
+		// aspect, no multiply. That is exact for an isotropically-scaled mode
+		// (both current modes: 2D 1.0x1.0, LeiaSR 0.75x0.75) and merely
+		// approximate for a hypothetical anamorphic one -- still far closer
+		// than the tile reconstruction it replaces.
+		float vp_w = (float)g_views[0].width;
+		float vp_h = (float)g_views[0].height;
+		const char *vp_src = "per-view aspect (display_info absent)";
+		if (g_panel_px_w > 0 && g_panel_px_h > 0) {
+			vp_w = (float)g_panel_px_w;
+			vp_h = (float)g_panel_px_h;
+			vp_src = "panel (display_info)";
+		}
 		float vh = ext[1] / kFill;
 		if (ext[0] > 0.0f && vp_w > 0.0f && vp_h > 0.0f) {
 			const float vh_w = ext[0] / (kFill * (vp_w / vp_h));
@@ -835,9 +906,10 @@ load_butterfly(struct android_app *app)
 			g_rig_vh.store(vh, std::memory_order_relaxed);
 		}
 		LOGI("scene center=(%.2f,%.2f,%.2f) extent=(%.2f,%.2f,%.2f) "
-		     "viewport=%.0fx%.0f (panel, %ux%u per view) rig_vh=%.2f",
+		     "viewport=%.0fx%.0f aspect=%.3f src=%s (%ux%u per view) rig_vh=%.2f",
 		     g_scene_center[0], g_scene_center[1], g_scene_center[2],
 		     ext[0], ext[1], ext[2], vp_w, vp_h,
+		     (vp_h > 0.0f ? vp_w / vp_h : 0.0f), vp_src,
 		     g_views[0].width, g_views[0].height,
 		     g_rig_vh.load(std::memory_order_relaxed));
 	}
