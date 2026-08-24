@@ -865,6 +865,25 @@ load_butterfly(struct android_app *app)
 	// which compensate getMainObjectBounds' 1.10x bake with 0.88.
 	float ext[3] = {1.0f, 1.0f, 1.0f};
 	if (g_gs.getRobustSceneBounds(0.05f, 0.95f, g_scene_center, ext)) {
+		// DIAGNOSTIC: the [5%,95%] box under-reports what is actually drawn.
+		// It trims 10% of gaussians AND is computed over CENTRES only, so it
+		// ignores every splat's rendered footprint. Fitting it to 80% therefore
+		// draws the VISIBLE asset larger than 80%. Log the wider boxes so the
+		// real ratio is measured rather than guessed at.
+		{
+			float c99[3], e99[3], bmin[3], bmax[3];
+			const bool ok99 =
+			    g_gs.getRobustSceneBounds(0.01f, 0.99f, c99, e99);
+			const bool okbb = g_gs.getSceneBBox(bmin, bmax);
+			LOGI("fitbox: p05_95=(%.3f,%.3f) p01_99=(%.3f,%.3f) full=(%.3f,%.3f) "
+			     "ratio_w p99/p95=%.3f full/p95=%.3f",
+			     ext[0], ext[1],
+			     ok99 ? e99[0] : -1.0f, ok99 ? e99[1] : -1.0f,
+			     okbb ? (bmax[0] - bmin[0]) : -1.0f,
+			     okbb ? (bmax[1] - bmin[1]) : -1.0f,
+			     (ok99 && ext[0] > 0.0f) ? e99[0] / ext[0] : -1.0f,
+			     (okbb && ext[0] > 0.0f) ? (bmax[0] - bmin[0]) / ext[0] : -1.0f);
+		}
 		// Remember the framed centroid as the long-press reset target.
 		g_scene_center_orig[0] = g_scene_center[0];
 		g_scene_center_orig[1] = g_scene_center[1];

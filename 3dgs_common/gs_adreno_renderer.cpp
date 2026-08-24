@@ -796,6 +796,15 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
 
 // ═══════════════════════════ getRobustSceneBounds ═══════════════════════════
 
+bool GsAdrenoRenderer::getSceneBBox(float outMin[3], float outMax[3]) const {
+    if (!sceneBBoxValid_) return false;
+    for (int a = 0; a < 3; a++) {
+        outMin[a] = sceneBBoxMin_[a];
+        outMax[a] = sceneBBoxMax_[a];
+    }
+    return true;
+}
+
 bool GsAdrenoRenderer::getRobustSceneBounds(float loPct, float hiPct,
                                             float outCenter[3], float outExtent[3]) const {
     if (numGaussians_ == 0) return false;
