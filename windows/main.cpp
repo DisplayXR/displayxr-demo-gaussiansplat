@@ -34,7 +34,8 @@
 #include "hud_renderer.h"
 #include "text_overlay.h"
 #include "atlas_capture.h"
-#include "auto_fit.h"         // dxr::AutoFitVHeight (shared width-aware load-time framing)
+#include "auto_fit.h"         // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
+#include "auto_fit_canvas.h"  // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
 #include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
 #include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
@@ -162,24 +163,50 @@ static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
 static std::atomic<bool> g_fitValid{false};
 
+// Refit state (displayxr-common common/auto_fit_canvas.h). vHeight is a
+// function of (content, viewport), so the CONTENT half is cached here and the
+// viewport half is re-read every frame — see RefitForViewport below for why
+// the load-time fit alone is not enough under the shell.
+static std::atomic<float> g_fitExtentW{0.0f};  //!< content — survives viewport changes
+static std::atomic<float> g_fitExtentH{0.0f};
+static std::atomic<float> g_fitAspect{0.0f};   //!< viewport the current base was derived for
+static dxr::AutoFitCanvas g_autoFitCanvas;     //!< runtime-resolved canvas, published post-locate
+static dxr::FitTransition g_fitTransition;     //!< render-thread only
+
 // Latest computed frames-per-second, published each frame by the render thread
 // (after UpdatePerformanceStats) so the XR_DXR_mcp_tools get_status handler can
 // report it without reaching into the render thread's local PerformanceStats.
 static std::atomic<float> g_currentFps{0.0f};
 
-// Viewport the auto-fit width rule frames against: the live window client
-// rect when the window exists, else the last WM_SIZE dims. Only the aspect
-// ratio matters to dxr::AutoFitVHeight, so pixels are fine.
-static void GetAutoFitViewport(float& outW, float& outH) {
+// Viewport the auto-fit width rule frames against. Only the aspect ratio
+// matters to dxr::AutoFitVHeight, so pixels and meters mix freely.
+//
+// The app's own client rect is NOT the viewport under the shell. A
+// shell-launched app is composed into a 3D window tile the shell owns; this
+// window is hidden (SW_HIDE) and is never what the user sees, and the runtime
+// only resizes it to the tile later — deferred and async, once the client is
+// placed. The bundled scene auto-loads during init, long before that, so this
+// used to fit the 1280x720 CREATION size on every run, shell or not (the
+// "viewport=1280x720 aspect=1.778" in every log). In a square tile the
+// butterfly then came out ~15% oversized and overflowed the sides.
+//
+// So: prefer the canvas the runtime RESOLVED (XR_DXR_view_rig's raw channel —
+// the shell tile under a workspace, this window's client rect standalone), and
+// keep the client rect only as the bootstrap for the fit that runs before the
+// first locate. RefitForViewport re-derives once the real canvas arrives.
+// Returns true when the dims came from the runtime canvas (metres) rather than
+// the client-rect bootstrap (pixels) — the two are not comparable numbers, only
+// their aspects are, so anything logging them must say which it got.
+static bool GetAutoFitViewport(float& outW, float& outH) {
+    float fallbackW = (float)g_windowWidth;
+    float fallbackH = (float)g_windowHeight;
     RECT client = {};
     if (g_appWindow && GetClientRect(g_appWindow, &client) &&
         client.right > client.left && client.bottom > client.top) {
-        outW = (float)(client.right - client.left);
-        outH = (float)(client.bottom - client.top);
-        return;
+        fallbackW = (float)(client.right - client.left);
+        fallbackH = (float)(client.bottom - client.top);
     }
-    outW = (float)g_windowWidth;
-    outH = (float)g_windowHeight;
+    return g_autoFitCanvas.Viewport(fallbackW, fallbackH, outW, outH);
 }
 
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
@@ -201,12 +228,22 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // the viewport in BOTH axes, so a wide scene no longer overflows
         // horizontally. See kAutoFitFill for why fill is 0.88, not 0.80.
         float viewportW = 0.0f, viewportH = 0.0f;
-        GetAutoFitViewport(viewportW, viewportH);
+        const bool fromCanvas = GetAutoFitViewport(viewportW, viewportH);
         float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, kAutoFitFill);
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
         g_fitVHeight = vh;
+        // Cache the CONTENT half of the fit (extents are scene properties) and
+        // the viewport this base was derived for, so RefitForViewport can
+        // re-derive on an aspect change without re-measuring the splats.
+        g_fitExtentW.store(extent[0], std::memory_order_relaxed);
+        g_fitExtentH.store(extent[1], std::memory_order_relaxed);
+        g_fitAspect.store((viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f,
+                          std::memory_order_relaxed);
+        // A load lands the base immediately — the framing IS the load's result,
+        // so there is nothing to animate away from.
+        g_fitTransition.start(vh, vh, 0.0f);
         // Anchor at yaw=0 and trust the loader's RUB convention (PLY loader
         // converts RDF+X-mirror → RUB at load time; SPZ is RUB-native and
         // SuperSplat-authored scenes already face −Z at yaw=0). Matches
@@ -216,10 +253,11 @@ static void ApplyAutoFitForLoadedScene_locked() {
         const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
         const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
         LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "viewport=%.0fx%.0f aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
+                 "viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
                  extent[0], extent[1], extent[2],
-                 viewportW, viewportH, aspect, widthBound ? "width" : "height",
+                 viewportW, viewportH, fromCanvas ? "runtime canvas, m" : "client rect, px",
+                 aspect, widthBound ? "width" : "height",
                  kAutoFitFill, vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
@@ -251,6 +289,58 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_inputState.lastInputTimeSec = (double)duration_cast<microseconds>(
             high_resolution_clock::now().time_since_epoch()).count() * 1e-6;
         g_inputState.animationActive = false;
+    }
+}
+
+// Re-derive the base vHeight when the viewport's ASPECT changes, and animate
+// the move. Render thread only.
+//
+// This is what makes the load-time fit correct under the shell. The scene
+// auto-loads during init, before the first xrLocateViews, so the only viewport
+// available then is this window's own client rect — which under a workspace is
+// the hidden creation-size window, not the tile the user sees. The first
+// located frame publishes the real canvas, the aspect gate sees it differ from
+// the bootstrap one, and the fit lands on the tile. The same path handles a
+// live 3D-window resize, which mis-framed identically before.
+//
+// Only the BASE moves: the render path computes rigVH = virtualDisplayHeight /
+// scaleFactor, so the user's zoom stays relative (2x of the old fit becomes 2x
+// of the new one) and orbit/pivot are untouched. A viewport change is not a
+// request to undo deliberate user state — recentring belongs on Space.
+static void RefitForViewport(float dtSeconds) {
+    if (!g_fitValid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    const float extW = g_fitExtentW.load(std::memory_order_relaxed);
+    const float extH = g_fitExtentH.load(std::memory_order_relaxed);
+    if (!(extH > 0.0f)) {
+        return;
+    }
+
+    float vpW = 0.0f, vpH = 0.0f;
+    const bool fromCanvas = GetAutoFitViewport(vpW, vpH);
+    const float aspect = (vpH > 0.0f) ? (vpW / vpH) : 0.0f;
+    if (dxr::AutoFitAspectChanged(g_fitAspect.load(std::memory_order_relaxed), aspect)) {
+        const float vh = dxr::AutoFitVHeight(extW, extH, vpW, vpH, kAutoFitFill);
+        if (vh > 1e-3f) {
+            // Retarget rather than restart: a resize that settles in two steps
+            // must not snap back to where it started.
+            g_fitTransition.start(g_fitTransition.value(), vh);
+            const float prev = g_fitVHeight;
+            g_fitAspect.store(aspect, std::memory_order_relaxed);
+            g_fitVHeight = vh;  // Space-reset target follows the live viewport
+            LOG_INFO("Auto-fit refit: viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s "
+                     "base %.3f -> %.3f (zoom preserved)",
+                     vpW, vpH, fromCanvas ? "runtime canvas, m" : "client rect, px", aspect,
+                     (aspect > 0.0f && extW / aspect > extH) ? "width" : "height",
+                     prev, vh);
+        }
+    }
+
+    float animated = 0.0f;
+    if (g_fitTransition.update(dtSeconds, &animated)) {
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_inputState.viewParams.virtualDisplayHeight = animated;
     }
 }
 
@@ -1208,6 +1298,16 @@ static void RenderThreadFunc(
         }
         UpdateCameraMovement(inputSnapshot, perfStats.deltaTime, xr->displayHeightM);
 
+        // Re-derive the base against the viewport the runtime actually resolved
+        // (published from the previous frame's locate) and advance the move.
+        // Runs before the reset block so a Space in the same frame wins.
+        RefitForViewport(perfStats.deltaTime);
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            inputSnapshot.viewParams.virtualDisplayHeight =
+                g_inputState.viewParams.virtualDisplayHeight;
+        }
+
         // On Space-reset: shared UpdateCameraMovement returns to (0,0,0) + default
         // vHeight. For the splat demo, restore the per-scene auto-fit pose instead.
         if (resetRequested && g_fitValid.load()) {
@@ -1216,6 +1316,9 @@ static void RenderThreadFunc(
             inputSnapshot.cameraPosZ = g_fitCenter[2];
             inputSnapshot.yaw = g_fitYaw;
             inputSnapshot.viewParams.virtualDisplayHeight = g_fitVHeight;
+            // Land any in-flight refit on the reset target so the animation
+            // cannot drag the base back off it over the next frames.
+            g_fitTransition.start(g_fitVHeight, g_fitVHeight, 0.0f);
         }
 
         {
@@ -1364,6 +1467,20 @@ static void RenderThreadFunc(
                                 xr->eyePositions[v][1] = viewRigRaw.rawEyes[v].y;
                                 xr->eyePositions[v][2] = viewRigRaw.rawEyes[v].z;
                             }
+                        }
+
+                        // The same raw channel carries the canvas the runtime
+                        // RESOLVED for this locate — the shell's 3D window tile
+                        // under a workspace, this window's client rect
+                        // standalone. That, not our own (hidden, creation-size)
+                        // window, is the viewport the auto-fit must frame
+                        // against; RefitForViewport picks it up next tick.
+                        if (useRig) {
+                            g_autoFitCanvas.PublishFromRaw(
+                                viewRigRaw.canvasSizeMeters.width,
+                                viewRigRaw.canvasSizeMeters.height,
+                                viewRigRaw.canvasRectPx.extent.width,
+                                viewRigRaw.canvasRectPx.extent.height);
                         }
 
                         bool monoMode = (xr->renderingModeCount > 0 && !xr->renderingModeDisplay3D[xr->currentModeIndex]);
