@@ -1583,17 +1583,50 @@ process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1,
 		// intentionally dropped — it competed with the pinch; lateral navigation is
 		// via double-tap focus instead.
 		drag_valid = false;
+		/*
+		 * Exactly two pointers, please. This panel delivers PHANTOM contacts
+		 * during an ordinary one-finger swipe — measured on an NP02J, with
+		 * count reported as 2 AND 3 while the user used one finger, p0 frozen
+		 * at ~(1171,1319) and p1 jumping 629 -> 949 -> 320 -> 285 between
+		 * samples. With count >= 3 the "second finger" at index 1 is whichever
+		 * phantom the platform happened to order there, so there is no pinch to
+		 * measure and we must not guess one.
+		 */
+		if (count != 2) {
+			two_finger = false;
+			pinch_last = 0.0f;
+			return;
+		}
 		const float ex = x0 - x1, ey = y0 - y1;
 		const float dist = sqrtf(ex * ex + ey * ey);
+		/*
+		 * A pinch STARTS on ACTION_POINTER_DOWN and only then. It used to start
+		 * on any count >= 2 event including a MOVE, so a phantom contact
+		 * appearing mid-swipe opened a pinch against a distance that was never
+		 * a real finger separation.
+		 */
+		if (action == AMOTION_EVENT_ACTION_POINTER_DOWN) {
+			pinch_last = dist;
+			two_finger = true;
+			return;
+		}
 		if (two_finger && pinch_last > 1.0f) {
-			// Pinch: scale zoom by the finger-distance ratio (clamped 0.2×–8×).
-			float z = g_zoom.load(std::memory_order_relaxed) * (dist / pinch_last);
+			/*
+			 * Clamp the PER-EVENT ratio. Real fingers change separation
+			 * smoothly at touch-sample rate; the erratic samples above produced
+			 * ratios like 998/370 = 2.7x in a single event, which is what made
+			 * the model lurch in saccades. The 0.2x-8x clamp below only bounds
+			 * the ACCUMULATED zoom, so it never caught this.
+			 */
+			float ratio = dist / pinch_last;
+			if (ratio < 0.9f) ratio = 0.9f;
+			if (ratio > 1.111f) ratio = 1.111f;
+			float z = g_zoom.load(std::memory_order_relaxed) * ratio;
 			if (z < 0.2f) z = 0.2f;
 			if (z > 8.0f) z = 8.0f;
 			g_zoom.store(z, std::memory_order_relaxed);
 		}
 		pinch_last = dist;
-		two_finger = true;
 		return;
 	}
 
