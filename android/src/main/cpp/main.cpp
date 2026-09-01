@@ -1198,7 +1198,20 @@ render_frame()
 	XrFrameBeginInfo begin_info = {};
 	begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
 	res = xrBeginFrame(g_session, &begin_info);
-	if (res != XR_SUCCESS) {
+	/*
+	 * XR_FRAME_DISCARDED is a SUCCESS code (+9), not an error. Testing
+	 * `!= XR_SUCCESS` bailed here WITHOUT calling xrEndFrame — and the runtime
+	 * clears its `frame_started` flag ONLY in xrEndFrame. So one discarded
+	 * frame latched the session permanently: every later xrBeginFrame returned
+	 * XR_FRAME_DISCARDED, this branch skipped xrEndFrame again, and the loop
+	 * spun at ~375 calls/sec pegging a core with nothing reaching the screen.
+	 * Observed on an NP02J as a hard "app froze" with no crash and no error.
+	 *
+	 * XR_FAILED() tests result < 0, so a discard now falls through and we still
+	 * reach xrEndFrame, which is what lets the runtime recover. Rendering is
+	 * separately gated on frame_state.shouldRender.
+	 */
+	if (XR_FAILED(res)) {
 		log_xr_result("xrBeginFrame", res);
 		return false;
 	}
