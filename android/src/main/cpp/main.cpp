@@ -1574,20 +1574,9 @@ process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1,
 {
 	mark_user_input(); // any touch holds the auto-spin idle timer
 	static float last_x = 0.0f, last_y = 0.0f;            // 1-finger orbit anchor
-	static float down_x = 0.0f, down_y = 0.0f;            // where this gesture started
 	static float pinch_last = 0.0f;                        // last 2-finger distance
 	static bool two_finger = false;                        // a 2-finger gesture is active
 	static bool drag_valid = false;                        // a clean 1-finger drag
-	static bool dragging = false;                          // slop exceeded -> orbit is live
-	/*
-	 * Orbit does not start until the finger travels this far from where it went
-	 * down. It MUST be >= Android's ViewConfiguration touch slop (8dp, ~16-22 px
-	 * on this panel), because GestureDetector cancels onLongPress once the
-	 * finger moves past slop — and long-press is how the view is reset. Without
-	 * a dead zone every MOVE orbited, however tiny, so holding for a reset drifted
-	 * the model AND risked cancelling the very gesture the user was making.
-	 */
-	constexpr float kDragSlopPx = 24.0f;
 
 	if (count >= 2) {
 		// ── two fingers: pinch-to-zoom ── (suppresses orbit). Two-finger pan was
@@ -1612,46 +1601,15 @@ process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1,
 	pinch_last = 0.0f;
 	switch (action) {
 	case AMOTION_EVENT_ACTION_DOWN:
-		last_x = down_x = x0;
-		last_y = down_y = y0;
+		last_x = x0;
+		last_y = y0;
 		drag_valid = true;
-		dragging = false;
 		two_finger = false;
 		break;
 	case AMOTION_EVENT_ACTION_MOVE:
-		/*
-		 * Re-arm mid-gesture rather than waiting for a fresh ACTION_DOWN.
-		 * `drag_valid` is cleared by ANY event reporting count >= 2, so one
-		 * transient two-pointer report during a one-finger drag (a palm graze,
-		 * a thumb edge, a single spurious contact) used to kill the gesture
-		 * permanently — the user had to lift and touch again.
-		 */
-		if (!drag_valid) {
-			last_x = down_x = x0;
-			last_y = down_y = y0;
-			drag_valid = true;
-			dragging = false; // must clear slop again before orbiting
-			break;            // consume without applying a delta
-		}
-		/*
-		 * The old `!two_finger` guard (suppress orbit until ALL fingers lift)
-		 * is gone. It existed so releasing one finger of a pinch would not snap
-		 * the orbit — but the snap came from reusing a STALE anchor, not from
-		 * orbiting per se. Re-seeding the anchor removes the cause, and the slop
-		 * dead zone below means a pinch release still cannot orbit until the
-		 * remaining finger deliberately travels 24 px. That preserves the intent
-		 * without leaving the gesture inert until every finger lifts.
-		 */
-		if (!dragging) {
-			const float mx = x0 - down_x, my = y0 - down_y;
-			if (mx * mx + my * my < kDragSlopPx * kDragSlopPx) {
-				break; // still a tap/hold — leave long-press alone
-			}
-			dragging = true;
-			last_x = x0; // re-seed so the first orbit step has no jump
-			last_y = y0;
-		}
-		{
+		// Suppress orbit while/after a 2-finger gesture (until all fingers lift) so
+		// lifting one finger of a pinch doesn't snap the orbit.
+		if (drag_valid && !two_finger) {
 			const float dx = x0 - last_x;
 			const float dy = y0 - last_y;
 			last_x = x0;
@@ -1669,7 +1627,6 @@ process_touch_event(int32_t action, int32_t count, float x0, float y0, float x1,
 	case AMOTION_EVENT_ACTION_UP:
 	case AMOTION_EVENT_ACTION_CANCEL:
 		drag_valid = false;
-		dragging = false;
 		two_finger = false;
 		break;
 	default:
