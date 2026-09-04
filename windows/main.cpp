@@ -654,6 +654,23 @@ std::string HandleAgentToolCall(XrSessionManager& xr, const std::string& toolNam
             }
             result = enabled ? "{\"auto_orbit\":true}" : "{\"auto_orbit\":false}";
         }
+    } else if (strcmp(toolName_c, "set_transparent_background") == 0) {
+        // Same code path as Ctrl+T: raise the shared input handler's request
+        // flag and let the render loop stay the single place that flips
+        // g_transparentBg, logs, and posts kBorderlessMsg. Omitting 'enabled'
+        // toggles; passing it makes the call idempotent — the flag is raised
+        // only when the target differs from the live state.
+        const bool current = g_transparentBg.load();
+        bool want = !current;                 // no 'enabled' -> toggle, like Ctrl+T
+        JsonGetBool(a, "enabled", &want);     // absent/non-boolean keeps the toggle target
+        const bool changing = (want != current);
+        if (changing) {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            g_inputState.transparentBgToggleRequested = true;
+        }
+        snprintf(buf, sizeof(buf), "{\"transparent_background\":%s,\"changed\":%s}",
+                 want ? "true" : "false", changing ? "true" : "false");
+        result = buf;
     } else {
         ok = false;
         result = std::string("{\"error\":\"unhandled tool '") + toolName + "'\"}";
