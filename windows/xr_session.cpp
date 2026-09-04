@@ -626,6 +626,18 @@ void RegisterAgentTools(XrSessionManager& xr) {
         "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\"}},"
         "\"required\":[\"enabled\"]}");
 
+    // Windows-only (the transparent-background path is the DComp punch-through
+    // one behind Ctrl+T); the macOS tool list is unchanged.
+    reg("set_transparent_background",
+        "Turn the transparent background on or off - the agent equivalent of Ctrl+T: "
+        "with it on, the splats are composited over the desktop instead of the "
+        "viewer's opaque background, and the window goes borderless. Omit 'enabled' "
+        "to toggle the current state. The flip is applied by the render thread on the "
+        "next frame, so the returned value is the REQUESTED state - read the settled "
+        "one back with get_status.",
+        "{\"type\":\"object\",\"properties\":{\"enabled\":{\"type\":\"boolean\","
+        "\"description\":\"Target state; omit to toggle.\"}}}");
+
     // Install the app's tool-call handler on the shared PollEvents hook
     // (displayxr-common v2.1.0 / #18). PollEvents fetches args + submits the
     // result; HandleAgentToolCall only maps (toolName, argsJson) -> resultJson.

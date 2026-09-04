@@ -43,7 +43,8 @@ Capabilities registry key), the viewer registers its controls as agent
 tools on the runtime-hosted per-process MCP server via
 `XR_DXR_mcp_tools` (macOS build; appId `gaussiansplat`):
 `load_splat`, `get_status`, `set_camera`, `orbit`, `reset_camera`,
-`set_auto_orbit`. Agents reach them through the `displayxr-mcp` adapter
+`set_auto_orbit`, plus `set_transparent_background` on Windows (the agent
+equivalent of Ctrl+T). Agents reach them through the `displayxr-mcp` adapter
 (`--target pid:<PID>`, or namespaced as `gaussiansplat__<tool>` via
 `--target workspace`) and can verify camera moves with the runtime's
 `capture_frame` tool. With the gate off (the default) the tools are
