@@ -329,6 +329,34 @@ Section "Uninstall"
     ; Don't RMDir $SMPROGRAMS\DisplayXR — the runtime's own shortcuts may
     ; still live there.
 
+    ; The displayxr-view: protocol association (the "undock" launch contract).
+    ; It is written by the VIEWER at launch, not here — this installer runs
+    ; elevated, so an HKCU write would land in the elevating admin's hive rather
+    ; than the logged-in user's. So there is nothing to install; there is only
+    ; something to clean up, and ONLY if this viewer still owns it.
+    ;
+    ; Every DisplayXR viewer registers the same scheme, last writer wins. If the
+    ; model viewer (or any sibling) owns it now, deleting the key would break a
+    ; product the user did NOT uninstall. Hence the guard: delete only while the
+    ; registered command still points inside $INSTDIR.
+    ; The viewer writes exactly one command form (view_protocol.h CommandFor:
+    ; `"<exe>" "%1"`), so an equality test IS the "still points into $INSTDIR"
+    ; check, and it cannot misfire on a sibling whose path merely contains a
+    ; similar substring. NSIS `==` is case-insensitive, so path casing is fine.
+    ;
+    ; Best-effort by nature: an uninstaller elevated by a DIFFERENT user reads
+    ; that admin's HKCU, not the logged-in user's. Leaving the key behind is
+    ; harmless — EnsureViewProtocolRegistered rewrites any association whose
+    ; command names an executable that no longer exists.
+    ReadRegStr $0 HKCU "Software\Classes\displayxr-view\shell\open\command" ""
+    StrCpy $1 '"$INSTDIR\gaussian_splatting_handle_vk_win.exe" "%1"'
+    ${If} $0 == $1
+        DetailPrint "Removing displayxr-view protocol association (owned by this viewer)"
+        DeleteRegKey HKCU "Software\Classes\displayxr-view"
+    ${ElseIf} $0 != ""
+        DetailPrint "Leaving displayxr-view protocol association alone (owned by another viewer)"
+    ${EndIf}
+
     DeleteRegKey HKLM "Software\DisplayXR\Demos\GaussianSplat"
     DeleteRegKey /ifempty HKLM "Software\DisplayXR\Demos"
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\DisplayXRGaussianSplat"
