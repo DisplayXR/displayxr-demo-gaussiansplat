@@ -2637,6 +2637,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // inherits the browser's environment (XRT_FORCE_MODE=ipc), which would make this
     // process an IPC client that is not the panel owner: 2D whenever the browser holds
     // the panel, no drag phase-snap. Must run before xrCreateInstance loads the runtime.
+    // Inherited IPC routing cannot be overridden in place (the runtime DLL's dynamic CRT
+    // snapshots the environment at process start), so re-launch once with a scrubbed
+    // block and let the child run. The in-place override below stays as the fallback.
+    if (dxr::ReexecWithCleanRuntimeEnvIfNeeded(g_launch)) {
+        LOG_WARN("launch: inherited IPC routing -> re-launched with a clean environment; this instance exits");
+        ShutdownLogging();
+        return 0;
+    }
     if (dxr::ForceInProcessRuntimeForUndock(g_launch))
         LOG_WARN("launch: inherited IPC routing overridden -> XRT_FORCE_MODE=native (undock is standalone)");
     if (!g_launch.ok()) {
