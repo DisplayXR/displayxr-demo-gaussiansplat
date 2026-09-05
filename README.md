@@ -36,6 +36,88 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 | Ctrl+T | Toggle transparent background (desktop see-through; Windows only, requires runtime ≥ v1.3.0) |
 | Esc | Quit |
 
+## Command line and the `displayxr-view:` protocol (Windows)
+
+A web page — or a native app such as a CAD tool "undocking" a part — can spawn
+this viewer as a floating, transparent, click-through-shaped window over the
+desktop, already showing a given scene at a given screen rect. There is no
+Ctrl+T step and no style change after the window exists: `--transparent` makes
+the window borderless and topmost **from creation**, which is what a shaped
+`WS_EX_NOREDIRECTIONBITMAP` window requires.
+
+```bat
+gaussian_splatting_handle_vk_win.exe C:\scenes\butterfly.spz
+gaussian_splatting_handle_vk_win.exe --transparent --rect=300,300,800,800 --vh=0.2 C:\scenes\butterfly.spz
+gaussian_splatting_handle_vk_win.exe --transparent --src=https://host/scene.spz
+```
+
+| Flag | Meaning |
+|---|---|
+| *(positional)* | Scene path, `.ply` or `.spz`. Replaces the bundled `butterfly.spz` auto-load. |
+| `--transparent` | Borderless + topmost + click-through-shaped from the first frame. Ctrl+T still toggles it later. |
+| `--rect=X,Y,W,H` | Window rect in **physical** virtual-screen pixels. Clamped into the 3D panel's monitor when the runtime confirms which monitor that is; never snapped. |
+| `--src=<url\|path>` | Scene to load. An `http(s)` URL is downloaded into the cache below; a local path loads directly. |
+| `--vh=<metres>` | Virtual display height the scene was authored at. Overrides the auto-fit guess and does not follow viewport changes. |
+| `--title=<text>` | **Appended** to the window title; never replaces it. |
+| `--type=model\|splat` | Routing hint. `model` is forwarded to the DisplayXR 3D Model Viewer. |
+| `--dpr=<float>` | The launching page's `devicePixelRatio`. Logged only. |
+| `--max-bytes=<n>` | Download cap. Default 256 MiB. |
+| `--no-cache` | Re-download even on a cache hit (dev aid). |
+| `--allow-local` | Native callers only: permit a `file:`/local `src` inside a protocol URL. A web page cannot set this — it is an argv flag, not a URL field. |
+
+Flags are `--key=value`, never `--key value`. `--` ends flag parsing.
+
+### Protocol URLs
+
+The same fields arrive as a query string on the `displayxr-view:` scheme:
+
+```
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&v=1
+```
+
+`open` is the verb; `v=1` lets this viewer reject a future grammar loudly rather
+than half-honour it. Every value is percent-encoded by the sender
+(`encodeURIComponent`); only `%XX` is decoded — `+` is **not** a space.
+
+The viewer registers `HKCU\Software\Classes\displayxr-view` for itself at
+launch, not from the installer (the installer runs elevated, so its `HKCU`
+writes would land in the elevating admin's hive). Every DisplayXR viewer
+registers the same scheme so the browser only asks the user once; whichever one
+the OS starts forwards a URL whose `type=` belongs to a sibling, looked up via
+`HKLM\Software\DisplayXR\Demos\<Viewer>\InstallPath`. A second launch does not
+open a second window — it hands its URL to the running instance over
+`WM_COPYDATA`, which re-applies the rect, the vH and the scene.
+
+### The policy, in two sentences
+
+The browser's one-time "Open this app?" dialog is the only consent gate on the
+protocol path and it is sticky per origin, so from then on **any** page on that
+origin can drive this parser — which means the viewer has to be safe against a
+hostile URL on its own merits. Therefore a protocol launch accepts `src` only
+over `https:` (any host) or `http:` on loopback, refuses `file:`, UNC and bare
+local paths outright, re-applies that same check to the URL a redirect chain
+actually lands on, and bounds every length and rect; `--allow-local` lifts the
+local-path restriction for native callers only, because a web page cannot pass
+an argv flag.
+
+A refused launch logs the reason, shows a message box and exits with code **2**
+(**3** when the URL belongs to a sibling viewer that is not installed). Set
+`DXR_LAUNCH_QUIET=1` in the process environment to suppress those launch-time
+message boxes and rely on the log line plus the exit code — the modal is right
+for a human-initiated launch but makes automated checks hang. Note that a
+percent-encoded URL must **not** be passed through `cmd /c "set VAR=1 && app ..."`:
+`cmd` expands `%XX%` inside it and hands the app a different string.
+
+### Download cache
+
+URL scenes land in `%LOCALAPPDATA%\DisplayXR\GaussianSplat\cache`, named by the
+SHA-1 of the requested URL (never by anything in the URL's path, so a hostile
+`src=.../../../x` has no traversal surface). A cache hit skips the network
+entirely, which is what makes the second undock of the same scene instant.
+
+Only `.ply` and `.spz` are loadable. **`.sog` is not supported** — a `.sog` URL
+is refused at the extension check, not half-loaded.
+
 ## Agent tools (MCP)
 
 When the runtime's MCP capability is enabled (`DISPLAYXR_MCP=1` or the
