@@ -22,9 +22,31 @@ set(GS_COMMON "${REPO_ROOT}/3dgs_common")
 
 # ── Niantic SPZ format support (FetchContent; zlib comes from the NDK) ────
 include(FetchContent)
+
+# zstd — required since SPZ header version 4 (the NGSP container stores each
+# attribute as its own ZSTD stream). The NDK sysroot ships zlib but NOT zstd,
+# so it is built from source here, exactly as the desktop leg does in
+# 3dgs_common/CMakeLists.txt. Plain C, no platform assumptions —
+# ZSTD_DISABLE_ASM drops the x86-64 .S so every ABI (arm64-v8a included) uses
+# the C decoder.
+FetchContent_Declare(zstd
+    URL      https://github.com/facebook/zstd/releases/download/v1.5.6/zstd-1.5.6.tar.gz
+    URL_HASH SHA256=8c29e06cf42aacc1eafc4077ae2ec6c6fcb96a626157e0593d5e82a34fd403c1
+    SOURCE_SUBDIR _skip)
+FetchContent_MakeAvailable(zstd)
+file(GLOB _ZSTD_SRCS
+    "${zstd_SOURCE_DIR}/lib/common/*.c"
+    "${zstd_SOURCE_DIR}/lib/compress/*.c"
+    "${zstd_SOURCE_DIR}/lib/decompress/*.c")
+add_library(zstd_lib STATIC ${_ZSTD_SRCS})
+target_include_directories(zstd_lib PUBLIC "${zstd_SOURCE_DIR}/lib")
+target_compile_definitions(zstd_lib PRIVATE ZSTD_DISABLE_ASM=1 XXH_NAMESPACE=ZSTD_)
+
+# Pinned to upstream main, NOT a tag — v4 landed after v3.0.0. Keep this SHA
+# identical to 3dgs_common/CMakeLists.txt.
 FetchContent_Declare(spz
     GIT_REPOSITORY https://github.com/nianticlabs/spz.git
-    GIT_TAG        v1.1.0
+    GIT_TAG        affd0ecea7fbb4c265ee119475af7ee5b2997482
     SOURCE_SUBDIR  _skip)
 FetchContent_MakeAvailable(spz)
 
@@ -33,7 +55,7 @@ add_library(spz_lib STATIC
     ${spz_SOURCE_DIR}/src/cc/splat-c-types.cc
     ${spz_SOURCE_DIR}/src/cc/splat-types.cc)
 target_include_directories(spz_lib PUBLIC ${spz_SOURCE_DIR}/src/cc)
-target_link_libraries(spz_lib PRIVATE z)    # NDK sysroot zlib
+target_link_libraries(spz_lib PRIVATE z zstd_lib)    # NDK sysroot zlib + fetched zstd
 
 # ── 3DGS compute shaders → SPIR-V header arrays ───────────────────────────
 # Compiled from the SHARED 3dgs_common/shaders. var name = <name>_comp_data,
@@ -95,6 +117,7 @@ set_target_properties(gausssplat_vk_android PROPERTIES
 target_link_libraries(gausssplat_vk_android
     native_app_glue
     spz_lib
+    z                                           # gs_spz_loader peels gzip itself
     OpenXR::openxr_loader
     vulkan
     android
