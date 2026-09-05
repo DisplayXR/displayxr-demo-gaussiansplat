@@ -29,7 +29,9 @@
 #include "gs_scene_loader.h"
 #include "display3d_view.h"
 #include "view_rig_math.h"
+#include "clip_policy.h"   // dxr::ResolveClipPlanes / ChainRearDepthBudget / RearDepthBudgetStateName (#100)
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_depth_budget.h>
 
 #include "hud_renderer.h"
 #include "text_overlay.h"
@@ -1996,6 +1998,20 @@ static void RenderThreadFunc(
                             viewState.next = &viewRigRaw;
                         }
 
+                        // XR_DXR_depth_budget (#100): chain the runtime's advisory rear
+                        // depth budget onto the SAME viewState.next chain, appended after
+                        // view_rig via dxr::ChainRearDepthBudget so both structs survive.
+                        // Only chained when the app enabled the extension (older/absent
+                        // runtimes never see it, and the app-side fallback below covers
+                        // them). depthBudget.type stays XR_TYPE_VIEW_STATE's zero-init
+                        // sentinel (0) unless a runtime that recognizes the struct fills
+                        // it in, which is how "filled" is told from "not".
+                        const bool hasDepthBudgetExt = XrDepthBudgetExtAvailable();
+                        XrRearDepthBudgetDXR depthBudget{};
+                        if (hasDepthBudgetExt) {
+                            dxr::ChainRearDepthBudget(viewState, depthBudget);
+                        }
+
                         // Over-allocate to the runtime's max possible view_count (sim_display
                         // reports 4 for Quad mode; LeiaSR reports 2). Hardcoding 2 here used
                         // to fail with XR_ERROR_SIZE_INSUFFICIENT under sim_display.
@@ -2003,6 +2019,15 @@ static void RenderThreadFunc(
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+
+                        const XrRearDepthBudgetDXR* depthBudgetPtr =
+                            (hasDepthBudgetExt && depthBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR)
+                                ? &depthBudget : nullptr;
+
+                        // #100: computed once per frame — feeds both the per-eye render
+                        // clip below and the double-click pick's visibility window, so
+                        // the two can never disagree (see IsStandaloneSession's own doc).
+                        const bool standaloneSession = IsStandaloneSession(xr);
 
                         // HUD eye readout. Under the rig, rawViews[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
@@ -2071,15 +2096,19 @@ static void RenderThreadFunc(
 
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included); the
-                        // app keeps only the clip policy (fov is clip-independent). near =
-                        // ez - vH, far = ez + far_offset, where ez = rig-local eye Z
-                        // (RigLocalEyeZ == the display-space eye Z display3d used to resolve).
-                        // Transparent-bg (Ctrl+T) clamps far to the ZDP (foreground-only);
-                        // opaque pushes it to ~infinity (1000·vH). The view matrix is the
-                        // plain clean-frame mat4_view_from_xr_pose — GsRenderer owns the
-                        // Vulkan Y-down flip at the raster stage. stereoViews[] is just a
-                        // per-view container so the render loops below stay unchanged.
+                        // app keeps only the clip policy (fov is clip-independent). near/far/
+                        // clipFar are now resolved by dxr::ResolveClipPlanes (#100) from the
+                        // runtime's advisory rear depth budget (or, absent it, the same
+                        // near=ez-vH / far=(transparent?ez:ez+1000vH) rule this used to
+                        // hand-roll here). The view matrix is the plain clean-frame
+                        // mat4_view_from_xr_pose — GsRenderer owns the Vulkan Y-down flip at
+                        // the raster stage. stereoViews[] is just a per-view container so the
+                        // render loops below stay unchanged.
                         Display3DView stereoViews[8];
+                        // Per-eye hard far-cull distance for preprocess.comp (0 = no cull).
+                        // Kept OUTSIDE Display3DView (a displayxr-common struct this repo
+                        // doesn't own) rather than growing it.
+                        float stereoClipFar[8] = {0};
                         bool useAppProjection = useRig;
                         if (useRig) {
                             // Mono: collapse the active views to their centroid (pose + fov).
@@ -2113,17 +2142,20 @@ static void RenderThreadFunc(
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
                                 float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                                float far_z  = g_transparentBg.load() ? ez : (ez + 1000.0f * rigVH);
-                                if (far_z < near_z + 1.0e-4f) far_z = near_z + 1.0e-4f;
+                                // #100: the ONE place that turns the rear depth budget (or its
+                                // absence) into near/far/clipFar — see clip_policy.h. budget
+                                // == nullptr reproduces the pre-#100 rule bit-for-bit.
+                                const dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
+                                    ez, rigVH, depthBudgetPtr, g_transparentBg.load(), standaloneSession);
                                 mat4_view_from_xr_pose(stereoViews[eye].view_matrix, sv.pose);
-                                mat4_from_xr_fov(stereoViews[eye].projection_matrix, sv.fov, near_z, far_z);
+                                mat4_from_xr_fov(stereoViews[eye].projection_matrix, sv.fov, clip.near_z, clip.far_z);
                                 stereoViews[eye].fov = sv.fov;
                                 stereoViews[eye].eye_world = sv.pose.position;
                                 stereoViews[eye].orientation = sv.pose.orientation;
                                 stereoViews[eye].eye_display = {0.0f, 0.0f, ez};  // ZDP depth (pick/transparent)
-                                stereoViews[eye].near_z = near_z;
-                                stereoViews[eye].far_z = far_z;
+                                stereoViews[eye].near_z = clip.near_z;
+                                stereoViews[eye].far_z = clip.far_z;
+                                stereoClipFar[eye] = clip.clipFar;
                             }
                         }
 
@@ -2138,9 +2170,11 @@ static void RenderThreadFunc(
                             // center frustum in the clean +Y-up world frame the splats live
                             // in (no Y flip — the pick ray must match the world, not the
                             // Vulkan raster). A well-conditioned near/far (the ray is a full
-                            // line). pickClipFar in transparent mode is the ZDP = rig-local
-                            // center eye Z, matching the old centerView.eye_display.z. NDC Y
-                            // was already adjusted above for Win32's top-left mouse origin.
+                            // line) — pickFar stays wide-open (ez + 1000vH) regardless of the
+                            // depth budget: it only conditions the UNPROJECTION frustum, the
+                            // ray it produces is a full line, so clipping it here would just
+                            // make off-axis rays wrong. NDC Y was already adjusted above for
+                            // Win32's top-left mouse origin.
                             XrVector3f cpos = {0, 0, 0};
                             XrFovf cfov = {0, 0, 0, 0};
                             for (int e = 0; e < eyeCount; e++) {
@@ -2159,7 +2193,13 @@ static void RenderThreadFunc(
                             cfov = {cfov.angleLeft * invE, cfov.angleRight * invE,
                                     cfov.angleUp * invE, cfov.angleDown * invE};
                             float ez = RigLocalEyeZ(cameraPose, cpose.position);
-                            float pickNear = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                            // #100: pickNear/pickClipFar mirror the SAME dxr::ResolveClipPlanes
+                            // call the renderer uses, so a splat clipped from view can never be
+                            // recentered onto. pickFar (the unprojection frustum) is deliberately
+                            // NOT this call's far_z — see the comment above.
+                            const dxr::ClipPlanes pickClip = dxr::ResolveClipPlanes(
+                                ez, rigVH, depthBudgetPtr, g_transparentBg.load(), standaloneSession);
+                            float pickNear = pickClip.near_z;
                             float pickFar = ez + 1000.0f * rigVH;
                             float pickView[16], pickProj[16];
                             mat4_view_from_xr_pose(pickView, cpose);
@@ -2173,11 +2213,11 @@ static void RenderThreadFunc(
                             float rayDir[3]    = {rayDirV.x,    rayDirV.y,    rayDirV.z};
                             float hitPos[3];
                             // Only recenter on splats that are actually visible: reject any
-                            // in front of the near plane (pickNear), and — in transparent/
-                            // foreground mode — behind the ZDP (ez). Opaque mode shows
-                            // everything behind the display, so no far reject there. A full
-                            // miss returns false -> no recenter, the existing behavior.
-                            float pickClipFar = g_transparentBg.load() ? ez : 0.0f;
+                            // in front of the near plane (pickNear), and — in the same
+                            // foreground-clip window the renderer applies — behind the resolved
+                            // far plane. A full miss returns false -> no recenter, the existing
+                            // behavior.
+                            float pickClipFar = pickClip.clipFar;
                             std::lock_guard<std::mutex> sceneLock(g_sceneMutex);
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos, 100.0f,
                                                           pickView,
@@ -2246,14 +2286,6 @@ static void RenderThreadFunc(
                             }
                         }
 
-                        // Foreground-only clip: in transparent mode, cull splats
-                        // behind the virtual display plane so only popping-out
-                        // content shows. Suppressed under the shell's external
-                        // multi-compositor (non-controller workspace session,
-                        // where the per-app transparent bridge is bypassed) —
-                        // signalled by renderingModeIsRequestable being false.
-                        bool foregroundClip = g_transparentBg.load() && IsStandaloneSession(xr);
-
                         // Soft foreground clip: fade splat opacity over the last
                         // clipFadeFrac of the eye->ZDP distance instead of a hard
                         // discard at the plane, so splat centers crossing the ZDP
@@ -2270,17 +2302,16 @@ static void RenderThreadFunc(
                                 int srcEye = monoMode ? 0 : eye;
                                 memcpy(viewMat[eye], stereoViews[srcEye].view_matrix, sizeof(float) * 16);
                                 memcpy(projMat[eye], stereoViews[srcEye].projection_matrix, sizeof(float) * 16);
-                                // near_z/far_z are the resolved per-eye view-space planes
-                                // (ez - near_offset / ez + far_offset), in the same units as
-                                // the shader's p_view.z. They drive the explicit geometric
-                                // culls — the projection-matrix planes do NOT clip splats.
+                                // near_z is the resolved per-eye view-space near plane
+                                // (ez - near_offset), in the same units as the shader's
+                                // p_view.z — it drives the explicit geometric near cull (the
+                                // projection-matrix planes do NOT clip splats). clipFar (#100)
+                                // is dxr::ResolveClipPlanes' hard far-cull distance, already 0
+                                // whenever the budget/fallback says "unrestricted" (opaque, or
+                                // transparent-under-a-workspace), so no separate foreground-
+                                // clip gate is needed here any more.
                                 clipNear[eye] = stereoViews[srcEye].near_z;
-                                // Far cull stays gated on foreground (transparent + standalone)
-                                // mode; in opaque mode far_z = ez + 1000*vH is effectively
-                                // infinite anyway, so this just keeps the shell path untouched.
-                                if (foregroundClip) {
-                                    clipFar[eye] = stereoViews[srcEye].far_z;
-                                }
+                                clipFar[eye] = stereoClipFar[srcEye];
                             } else {
                                 // Fallback: use DirectXMath mono matrices, store as column-major
                                 XMMATRIX v = monoMode ? monoViewMatrix :
@@ -2529,6 +2560,19 @@ static void RenderThreadFunc(
                                     swprintf(vhBuf, 128, L"\nvHeight: %.3f  m2v: %.3f\nDepth/IPD: %d%%  Auto-Orbit: %s",
                                         inputSnapshot.viewParams.virtualDisplayHeight, hudM2v, depthPct, orbitLbl);
                                     stereoText += vhBuf;
+                                }
+                                // #100: rear depth budget readout — only meaningful when the
+                                // extension is enabled; depthBudgetPtr is null on a runtime
+                                // that hasn't filled it yet (same locate), which reads as the
+                                // conservative CLIPPED_NO_SOURCE/0vH default.
+                                if (hasDepthBudgetExt) {
+                                    const float rbFarOffsetVH = depthBudgetPtr ? depthBudgetPtr->farOffsetVH : 0.0f;
+                                    const XrRearDepthBudgetStateDXR rbState = depthBudgetPtr
+                                        ? depthBudgetPtr->state : XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR;
+                                    wchar_t rbBuf[96];
+                                    swprintf(rbBuf, 96, L"\nrear: %hs %.2fvH",
+                                        dxr::RearDepthBudgetStateName(rbState), rbFarOffsetVH);
+                                    stereoText += rbBuf;
                                 }
                                 std::wstring helpText = L"[WASDEQ] Move | [LMB-drag] Rotate | [Scroll] Zoom\n"
                                     L"[DblClick] Focus | [-/=] Depth | [Space] Reset\n"

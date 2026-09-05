@@ -19,6 +19,14 @@ bool InitializeOpenXR(XrSessionManager& xr);
 // because displayxr::common's XrSessionManager doesn't carry view-rig state yet.
 bool XrViewRigExtAvailable();
 
+// XR_DXR_depth_budget (#100) detected + enabled by InitializeOpenXR, same
+// demo-side-static pattern as XrViewRigExtAvailable (the extension predates
+// displayxr::common's XrSessionManager carrying its own state for it). Older
+// runtimes simply don't advertise it — the caller must chain
+// XrRearDepthBudgetDXR only when this is true, and fall back to today's
+// hand-rolled clip rule otherwise (dxr::ResolveClipPlanes(budget=nullptr, ...)).
+bool XrDepthBudgetExtAvailable();
+
 // INV-1.3 / runtime#715: 3D panel top-left in virtual-desktop pixels from
 // XrDisplayDesktopPositionDXR (display_info v16), filled by InitializeOpenXR.
 // (0,0) = primary/unknown (safe default, incl. on older runtimes). Demo-side

@@ -8,6 +8,7 @@
 #include "xr_session.h"
 #include "logging.h"
 #include <openxr/XR_DXR_view_rig.h>
+#include <openxr/XR_DXR_depth_budget.h>
 #include <cstring>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima math and
@@ -18,6 +19,11 @@
 static bool s_hasViewRigExt = false;
 
 bool XrViewRigExtAvailable() { return s_hasViewRigExt; }
+
+// XR_DXR_depth_budget (#100): same demo-side-static reasoning as above.
+static bool s_hasDepthBudgetExt = false;
+
+bool XrDepthBudgetExtAvailable() { return s_hasDepthBudgetExt; }
 
 // INV-1.3 / runtime#715: 3D panel top-left in OS virtual-desktop pixels
 // (top-down, origin = primary monitor top-left), from
@@ -96,6 +102,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) {
             xr.hasMcpToolsExt = true;
         }
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+            s_hasDepthBudgetExt = true;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -105,6 +114,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", s_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s", s_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND");
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
@@ -135,6 +145,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (xr.hasMcpToolsExt) {
         enabledExtensions.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
+    }
+    if (s_hasDepthBudgetExt) {
+        enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};
