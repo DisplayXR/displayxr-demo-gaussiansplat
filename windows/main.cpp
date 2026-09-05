@@ -39,8 +39,15 @@
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
 #include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
 #include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
+// The "undock" launch contract (displayxr-common): one grammar + one security
+// policy shared by every DisplayXR viewer a web page or a CAD app can spawn.
+#include "launch_args.h"    // dxr::ParseLaunchArgsFromCommandLine -> dxr::LaunchArgs
+#include "url_fetch.h"      // dxr::FetchUrlToCache — --src=<url> into the per-user cache
+#include "view_protocol.h"  // displayxr-view: registration, sibling forward, single instance
+#include "toast.h"          // dxr::ToastState — the only UI a shaped, chrome-free window has
 
 #include <atomic>
+#include <cstdarg>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -141,6 +148,89 @@ static const UINT kBorderlessMsg = WM_APP + 0x33;
 static std::atomic<bool> g_borderless{false};
 static dxr::ClickThroughRegion g_punch; // render-thread owned
 static dxr::RmbWindowDrag g_windowDrag; // window-thread owned (WndProc)
+
+// ── Undock launch contract state ─────────────────────────────────────────────
+// Parsed once at the top of WinMain and then read-only. A second launch does
+// NOT mutate it: WM_COPYDATA parses its own LaunchArgs and applies it live, so
+// there is no shared mutable launch state to lock. Everything the render thread
+// needs out of the launch is mirrored into an atomic below.
+static dxr::LaunchArgs g_launch;
+// Held for the process lifetime when this is the instance that owns the
+// protocol scheme; releasing it would let a second launch open a rival window.
+static HANDLE g_singleInstanceMutex = nullptr;
+// A --src (local or URL) replaces the bundled butterfly.spz. For a URL the
+// scene arrives seconds later on the fetch thread, so the auto-load must be
+// suppressed rather than raced.
+static std::atomic<bool> g_suppressBundledAutoLoad{false};
+// --vh pins the virtual display height the asset was authored at. It is the
+// launcher's statement about the ASSET, so it outranks the auto-fit rule (which
+// only guesses from bounds) — but not the user's own zoom, which is a separate
+// multiplier.
+static std::atomic<bool> g_vhPinned{false};
+static std::atomic<float> g_vhPinnedValue{0.0f};
+// One download at a time; a second URL arriving over WM_COPYDATA while one is
+// in flight is refused with a toast rather than queued.
+static std::atomic<bool> g_fetchInFlight{false};
+
+// The only UI a --transparent window has: chrome is hidden by design in
+// transparent mode (#833), so a download that reported nothing would be a
+// window that sits empty for 20 seconds with no explanation.
+static dxr::ToastState g_toast;
+// ASCII in / wide out — every message this app produces is ASCII, so %hs
+// widening avoids a locale dependency (same helper as the avatar demo).
+static void ToastF(const char* fmt, ...) {
+    char buf[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    wchar_t w[224];
+    swprintf(w, 224, L"%hs", buf);
+    g_toast.Show(w);
+}
+
+/*!
+ * DXR_LAUNCH_QUIET=1 suppresses every launch-time MessageBoxW (a refused URL,
+ * a missing sibling viewer) and leaves the log line + the process exit code as
+ * the whole report.
+ *
+ * A refusal is MODAL: the process sits there until a human clicks OK. That is
+ * the right behaviour for a browser-initiated launch — nothing appeared, and
+ * the user deserves to know why — but it makes the negative cases untestable
+ * without a person, and an automated run that trips one leaves a dialog sitting
+ * on the panel. GetEnvironmentVariableW, not getenv: the CRT's environment
+ * snapshot is not the one a `set VAR=1 && app.exe` parent handed us.
+ *
+ * Exit codes are the machine-readable half and do not change: 2 = the launch
+ * was refused, 3 = the URL belongs to a sibling viewer that is not installed.
+ */
+static bool LaunchQuiet() {
+    wchar_t buf[16] = {};
+    const DWORD n = GetEnvironmentVariableW(L"DXR_LAUNCH_QUIET", buf, 16);
+    return n > 0 && n < 16 && buf[0] != L'\0' && buf[0] != L'0';
+}
+
+static void LaunchMessageBox(const std::wstring& text, UINT icon) {
+    if (LaunchQuiet()) {
+        LOG_WARN("DXR_LAUNCH_QUIET=1 - dialog suppressed: %ls", text.c_str());
+        return;
+    }
+    MessageBoxW(nullptr, text.c_str(), L"DisplayXR Gaussian Splat Viewer", MB_OK | icon);
+}
+
+// Toast window-space layer resources (render-thread owned after creation).
+// Sized to the chip, NOT the main HUD: RenderToastStandalone fills its whole
+// texture with one pill.
+static const uint32_t TOAST_TEX_W = 768;
+static const uint32_t TOAST_TEX_H = 96;
+static const uint32_t TOAST_FONT_BASE = TOAST_TEX_H * 11;  // ~45px glyphs in a 96px pill
+static const float    TOAST_SIZE_FRACTION = 0.60f;         // of the shorter window side
+static const float    TOAST_Y_FRACTION = 0.84f;
+static SwapchainInfo  g_toastSwapchain;
+static bool           g_hasToastSwapchain = false;
+static HudRenderer    g_toastHud = {};
+static bool           g_toastReady = false;
+static std::vector<XrSwapchainImageVulkanKHR> g_toastSwapImages;
 static std::string g_loadedFileName;
 static std::mutex g_sceneMutex;
 
@@ -233,6 +323,17 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+        // --vh wins over the guess. The launcher knows the metres the asset was
+        // authored at; auto-fit only infers them from the bounding box, so
+        // letting the fit overwrite an explicit --vh would silently discard the
+        // one number the caller actually knew.
+        if (g_vhPinned.load(std::memory_order_relaxed)) {
+            const float pinned = g_vhPinnedValue.load(std::memory_order_relaxed);
+            if (pinned > 1e-3f) {
+                LOG_INFO("Auto-fit vHeight %.3f overridden by --vh=%.3f", vh, pinned);
+                vh = pinned;
+            }
+        }
         g_fitVHeight = vh;
         // Cache the CONTENT half of the fit (extents are scene properties) and
         // the viewport this base was derived for, so RefitForViewport can
@@ -309,6 +410,12 @@ static void ApplyAutoFitForLoadedScene_locked() {
 // request to undo deliberate user state — recentring belongs on Space.
 static void RefitForViewport(float dtSeconds) {
     if (!g_fitValid.load(std::memory_order_relaxed)) {
+        return;
+    }
+    // A pinned --vh is an absolute statement in metres, so it does not follow
+    // the viewport. Returning before the transition update also leaves the
+    // load-time value in place rather than animating away from it.
+    if (g_vhPinned.load(std::memory_order_relaxed)) {
         return;
     }
     const float extW = g_fitExtentW.load(std::memory_order_relaxed);
@@ -749,8 +856,38 @@ static bool IsClickOnModeButton(int mouseX, int mouseY, int windowW, int windowH
 // common/atlas_capture* — see dxr_capture::MakeCaptureAtlasPrefix /
 // TriggerCaptureFlash / PostFlashRequest.
 
+// Load a scene on the CALLING thread. Only valid before the render thread
+// starts (the startup path); every later load must go through QueueSceneLoad,
+// because GsRenderer::loadScene submits on the graphics queue that the render
+// thread otherwise owns exclusively.
+static bool LoadSceneAtStartup(const std::string& path, const char* why) {
+    if (!PathFileExistsA(path.c_str())) {
+        LOG_WARN("%s: no file at %s", why, path.c_str());
+        return false;
+    }
+    if (!ValidateSceneFile(path)) return false;
+    LOG_INFO("%s: %s", why, path.c_str());
+    std::lock_guard<std::mutex> lock(g_sceneMutex);
+    if (g_gsRenderer.loadScene(path.c_str())) {
+        g_loadedFileName = GetPlyFilename(path);
+        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+        ApplyAutoFitForLoadedScene_locked();
+        return true;
+    }
+    LOG_WARN("%s: load failed for %s", why, path.c_str());
+    return false;
+}
+
 // Attempt to auto-load butterfly.spz from next to the exe.
 static void TryAutoLoadBundledScene() {
+    // A launch that named its own asset (positional path, --src, or a protocol
+    // URL) must not flash the bundled butterfly first — and for a URL the real
+    // scene only arrives once the fetch thread lands, so the slot has to stay
+    // empty rather than be raced.
+    if (g_suppressBundledAutoLoad.load(std::memory_order_relaxed)) {
+        LOG_INFO("Bundled auto-load skipped: the launch named its own asset");
+        return;
+    }
     char exePath[MAX_PATH] = {0};
     if (!GetModuleFileNameA(nullptr, exePath, MAX_PATH)) return;
     // Strip basename
@@ -763,16 +900,7 @@ static void TryAutoLoadBundledScene() {
         LOG_INFO("No bundled scene at %s (skipping auto-load)", path.c_str());
         return;
     }
-    if (!ValidateSceneFile(path)) return;
-    LOG_INFO("Auto-loading bundled scene: %s", path.c_str());
-    std::lock_guard<std::mutex> lock(g_sceneMutex);
-    if (g_gsRenderer.loadScene(path.c_str())) {
-        g_loadedFileName = GetPlyFilename(path);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
-        ApplyAutoFitForLoadedScene_locked();
-    } else {
-        LOG_WARN("Auto-load failed for %s", path.c_str());
-    }
+    LoadSceneAtStartup(path, "Auto-loading bundled scene");
 }
 
 // Hand a picked path off to the render thread for scene load. Validates the
@@ -791,6 +919,152 @@ static bool QueueSceneLoad(HWND hwnd, const std::string& path) {
     g_loadRequested.store(true, std::memory_order_release);
     LOG_INFO("Queued 3DGS scene load: %s", path.c_str());
     return true;
+}
+
+// ── --src=<url>: fetch on a worker thread, load on the render thread ─────────
+
+// Percent-encode everything outside the unreserved set, so the re-check below
+// parses the FINAL url through exactly the same grammar the requested one went
+// through (rather than a hand-rolled second opinion that could drift from it).
+static std::string PercentEncodeAll(const std::string& s) {
+    static const char* kHex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size() * 3);
+    for (unsigned char c : s) {
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' ||
+                                c == '.' || c == '~';
+        if (unreserved) {
+            out.push_back((char)c);
+        } else {
+            out.push_back('%');
+            out.push_back(kHex[c >> 4]);
+            out.push_back(kHex[c & 0xF]);
+        }
+    }
+    return out;
+}
+
+// Policy re-check for the URL a redirect chain actually landed on. A hostile
+// page cannot get a `file:` or off-loopback `http:` src past launch_args.h, but
+// nothing stops an https host it IS allowed to name from 302-ing somewhere
+// else — so the final URL is re-parsed AS IF it had arrived over the protocol,
+// which is the strictest of the two policies and needs no second implementation.
+static bool LaunchPolicyAllowsFinalUrl(const std::string& finalUrl) {
+    const std::string probe =
+        "displayxr-view://open?src=" + PercentEncodeAll(finalUrl) + "&v=1";
+    const dxr::LaunchArgs a = dxr::ParseLaunchArgs({probe});
+    const bool allowed = a.ok() && a.srcKind == dxr::LaunchSrcKind::Url;
+    if (!allowed) {
+        LOG_WARN("Redirect target refused by launch policy: %s", finalUrl.c_str());
+    }
+    return allowed;
+}
+
+// Kick a detached download. Synchronous inside the thread (FetchUrlToCache
+// blocks); progress lands on the toast, the finished file goes through the same
+// cross-thread queue Ctrl+O uses. NEVER loads from this thread.
+static void StartUrlFetch(HWND hwnd, const std::string& url, uint64_t maxBytes, bool noCache) {
+    bool expected = false;
+    if (!g_fetchInFlight.compare_exchange_strong(expected, true)) {
+        ToastF("Busy - a download is already running");
+        LOG_WARN("Download refused, one already in flight: %s", url.c_str());
+        return;
+    }
+    LOG_INFO("Fetching --src URL: %s (maxBytes=%llu noCache=%d)",
+             url.c_str(), (unsigned long long)maxBytes, noCache ? 1 : 0);
+    ToastF("Downloading...");
+    std::thread([hwnd, url, maxBytes, noCache]() {
+        dxr::UrlFetchOptions opts;
+        opts.cacheDir = dxr::DefaultCacheDir(L"GaussianSplat");
+        opts.allowedExtensions = {".ply", ".spz"};  // .sog is not a loadable format here
+        opts.maxBytes = maxBytes;
+        opts.noCache = noCache;
+        opts.urlAllowed = &LaunchPolicyAllowsFinalUrl;
+        opts.progress = [](uint64_t done, uint64_t total) {
+            // Throttled: the toast replaces its own message, and re-rasterizing
+            // a chip per network chunk would be pure waste.
+            static uint64_t s_lastTick = 0;
+            const uint64_t now = GetTickCount64();
+            if (now - s_lastTick < 300) return;
+            s_lastTick = now;
+            if (total > 0) {
+                ToastF("Downloading  %llu%%  (%.1f / %.1f MB)",
+                       (unsigned long long)(done * 100ull / total),
+                       (double)done / (1024.0 * 1024.0),
+                       (double)total / (1024.0 * 1024.0));
+            } else {
+                ToastF("Downloading  %.1f MB", (double)done / (1024.0 * 1024.0));
+            }
+        };
+        const dxr::UrlFetchResult r = dxr::FetchUrlToCache(url, opts);
+        g_fetchInFlight.store(false);
+        if (!r.ok) {
+            LOG_ERROR("Download failed for %s: %s", url.c_str(), r.error.c_str());
+            ToastF("Download failed - %s", r.error.c_str());
+            return;
+        }
+        const std::string path = dxr::NarrowPathForFopen(dxr::Utf8FromWide(r.path));
+        LOG_INFO("Downloaded %llu bytes%s -> %s",
+                 (unsigned long long)r.bytes, r.fromCache ? " (cache hit)" : "", path.c_str());
+        if (!ValidateSceneFile(path)) {
+            // Unreachable while allowedExtensions is {.ply,.spz}; toast rather
+            // than MessageBox because this is not the UI thread.
+            ToastF("Unsupported scene file");
+            LOG_ERROR("Fetched file rejected by ValidateSceneFile: %s", path.c_str());
+            return;
+        }
+        ToastF(r.fromCache ? "Loading (cached)" : "Loading");
+        QueueSceneLoad(hwnd, path);
+    }).detach();
+}
+
+// Nudge a requested --rect back INSIDE the panel monitor, and only that: a
+// launcher that deliberately straddles two monitors keeps its geometry, we just
+// refuse to place the window entirely off the panel. Never snaps to the panel
+// origin, and does nothing at all when the runtime did not confirm the panel
+// (sim_display, or a platform whose panel-origin plumbing is still open) or
+// reported an all-zero rect — an unconfirmed rect is a valid monitor, but not
+// evidence that the 3D panel is there.
+static void ClampRectIntoPanel(int32_t& x, int32_t& y, int32_t w, int32_t h) {
+    if (!g_displayPanelConfirmed) return;
+    const XrRect2Di& p = g_displayDesktopRect;
+    if (p.extent.width <= 0 || p.extent.height <= 0) return;
+    const int32_t right = p.offset.x + p.extent.width;
+    const int32_t bottom = p.offset.y + p.extent.height;
+    if (x + w > right)  x = right - w;
+    if (y + h > bottom) y = bottom - h;
+    if (x < p.offset.x) x = p.offset.x;
+    if (y < p.offset.y) y = p.offset.y;
+}
+
+// Apply a SECOND launch's arguments to this running instance (the WM_COPYDATA
+// hand-off from view_protocol.h's single-instance path). Deliberately narrower
+// than the startup path: geometry moves with SetWindowPos ONLY. A style change
+// on a shaped window is the one thing transparency Rule 2 forbids, and the
+// second launch has no way to know whether this window is currently shaped.
+static void ApplyLaunchArgsLive(HWND hwnd, const dxr::LaunchArgs& a) {
+    if (a.hasRect) {
+        int32_t x = a.rectX, y = a.rectY;
+        ClampRectIntoPanel(x, y, a.rectW, a.rectH);
+        SetWindowPos(hwnd, nullptr, x, y, a.rectW, a.rectH, SWP_NOZORDER | SWP_NOACTIVATE);
+        LOG_INFO("WM_COPYDATA rect: requested (%d,%d %dx%d) -> final (%d,%d %dx%d)",
+                 a.rectX, a.rectY, a.rectW, a.rectH, x, y, a.rectW, a.rectH);
+    }
+    if (a.hasVh) {
+        g_vhPinned.store(true, std::memory_order_relaxed);
+        g_vhPinnedValue.store(a.vh, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> lock(g_inputMutex);
+        g_inputState.viewParams.virtualDisplayHeight = a.vh;
+        LOG_INFO("WM_COPYDATA vh: %.3f m", a.vh);
+    }
+    if (a.srcKind == dxr::LaunchSrcKind::Url) {
+        StartUrlFetch(hwnd, a.src, a.maxBytes, a.noCache);
+    } else if (a.srcKind == dxr::LaunchSrcKind::LocalPath) {
+        QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.src));
+    } else if (!a.positionalPath.empty()) {
+        QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.positionalPath));
+    }
 }
 
 // Open a file dialog and load a .ply or .spz scene (called from main thread).
@@ -880,6 +1154,31 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     switch (msg) {
+    case WM_COPYDATA: {
+        // A second launch of this viewer handed us its URL instead of opening a
+        // rival window (view_protocol.h AcquireSingleInstanceOrForward). The
+        // payload is attacker-influenced text, so it goes through the SAME
+        // parser + policy as argv — never straight to a loader.
+        const COPYDATASTRUCT* cds = reinterpret_cast<const COPYDATASTRUCT*>(lParam);
+        if (!cds || cds->dwData != dxr::kViewProtocolCopyDataId || !cds->lpData ||
+            cds->cbData == 0) {
+            break;
+        }
+        // Length-bounded: trust cbData, not a NUL the sender may have omitted.
+        const char* raw = static_cast<const char*>(cds->lpData);
+        size_t n = strnlen(raw, cds->cbData);
+        const std::string url(raw, n);
+        LOG_INFO("WM_COPYDATA launch URL received (%zu bytes)", n);
+        const dxr::LaunchArgs a = dxr::ParseLaunchArgs({url});
+        for (const std::string& w : a.warnings) LOG_WARN("launch: %s", w.c_str());
+        if (!a.ok()) {
+            for (const std::string& e : a.errors) LOG_ERROR("launch: %s", e.c_str());
+            ToastF("Refused: %s", a.errors.empty() ? "bad launch URL" : a.errors[0].c_str());
+            return TRUE;
+        }
+        ApplyLaunchArgsLive(hwnd, a);
+        return TRUE;
+    }
     case WM_NCHITTEST:
         // Shaped borderless mode: the OS only delivers hits inside the
         // region; claim them for normal app input.
@@ -1033,8 +1332,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
-static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int32_t screenLeft, int32_t screenTop) {
-    LOG_INFO("Creating application window (%dx%d) at (%d, %d)", width, height, screenLeft, screenTop);
+/*!
+ * Create the app window.
+ *
+ * `borderless` is the --transparent launch: the window is born WS_POPUP +
+ * WS_EX_TOPMOST and stays that way. This is transparency Rule 2 — a shaped
+ * WS_EX_NOREDIRECTIONBITMAP window can never paint an OS frame, so the style
+ * must be right from creation rather than swapped afterwards (the Ctrl+T
+ * kBorderlessMsg path exists for the interactive toggle, and posting it at
+ * startup would produce exactly the flip this contract promises not to do).
+ * `titleSuffix` is APPENDED to WINDOW_TITLE — a launcher can label its window,
+ * never impersonate a different app.
+ */
+static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int32_t screenLeft, int32_t screenTop,
+                            bool borderless, const std::wstring& titleSuffix) {
+    LOG_INFO("Creating application window (%dx%d) at (%d, %d) style=%s", width, height,
+             screenLeft, screenTop, borderless ? "WS_POPUP (transparent launch)" : "WS_OVERLAPPEDWINDOW");
 
     WNDCLASSEX wc = {};
     wc.cbSize = sizeof(WNDCLASSEX);
@@ -1057,15 +1370,26 @@ static HWND CreateAppWindow(HINSTANCE hInstance, int width, int height, int32_t 
         }
     }
 
+    // Borderless has no non-client area, so AdjustWindowRect would inflate the
+    // window past the rect the launcher asked for. Skip it: for WS_POPUP the
+    // window rect IS the client rect.
     RECT rect = { 0, 0, width, height };
-    AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+    if (!borderless) AdjustWindowRect(&rect, WS_OVERLAPPEDWINDOW, FALSE);
+
+    std::wstring title = WINDOW_TITLE;
+    if (!titleSuffix.empty()) title += L" - " + titleSuffix;
 
     // INV-1.3: open on the 3D panel (runtime#715 — handle apps otherwise open
     // on the primary monitor on multi-monitor boxes). (screenLeft, screenTop)
     // is the panel top-left in virtual-desktop pixels from
     // XrDisplayDesktopPositionDXR; (0,0) = primary/unknown, a safe default.
-    HWND hwnd = CreateWindowEx(WS_EX_NOREDIRECTIONBITMAP, WINDOW_CLASS, WINDOW_TITLE,
-        WS_OVERLAPPEDWINDOW,
+    // WS_EX_TOPMOST on the transparent launch matches the avatar: a click
+    // punched through to a window behind activates it, but the scene stays on
+    // top instead of disappearing under the app the user just clicked.
+    const DWORD exStyle = WS_EX_NOREDIRECTIONBITMAP | (borderless ? WS_EX_TOPMOST : 0u);
+    const DWORD style = borderless ? (WS_POPUP | WS_VISIBLE) : WS_OVERLAPPEDWINDOW;
+    HWND hwnd = CreateWindowEx(exStyle, WINDOW_CLASS, title.c_str(),
+        style,
         screenLeft, screenTop,
         rect.right - rect.left, rect.bottom - rect.top,
         nullptr, nullptr, hInstance, nullptr);
@@ -1897,12 +2221,31 @@ static void RenderThreadFunc(
                                     s_punchInit = g_punch.init(vkDevice, physDevice, queueFamilyIndex);
                                 }
                                 if (s_punchInit) {
+                                    // The toast is the ONE piece of chrome that must
+                                    // survive shaping. Everything else is hidden in
+                                    // transparent mode, so a --src download on an
+                                    // empty window would otherwise be carved away
+                                    // entirely — a blank silhouette reporting nothing.
+                                    RECT chrome[1];
+                                    uint32_t chromeCount = 0;
+                                    if (g_toast.Active() && windowW > 0 && windowH > 0) {
+                                        const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
+                                            windowW, windowH,
+                                            (float)TOAST_TEX_W / (float)TOAST_TEX_H,
+                                            TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
+                                        chrome[0].left   = (LONG)(tr.x * (float)windowW);
+                                        chrome[0].top    = (LONG)(tr.y * (float)windowH);
+                                        chrome[0].right  = (LONG)((tr.x + tr.width) * (float)windowW);
+                                        chrome[0].bottom = (LONG)((tr.y + tr.height) * (float)windowH);
+                                        chromeCount = 1;
+                                    }
                                     // Union the LAST view's tile too — a view-0-only
                                     // region clips the other views' parallax edges
                                     // once content moves off ZDP (butterfly bug).
                                     const uint32_t lastV = (uint32_t)(eyeCount - 1);
                                     g_punch.update(graphicsQueue, (*swapchainVkImages)[imageIndex],
-                                                   renderW, renderH, hwnd, windowW, windowH, nullptr, 0,
+                                                   renderW, renderH, hwnd, windowW, windowH,
+                                                   chromeCount ? chrome : nullptr, chromeCount,
                                                    (lastV % cols) * renderW, (lastV / cols) * renderH,
                                                    eyeCount > 1);
                                 }
@@ -2119,11 +2462,81 @@ static void RenderThreadFunc(
                     }
                 }
 
+                // ── Toast layer ─────────────────────────────────────────────
+                // Built and submitted only on the frames dxr::ToastState says a
+                // message is live; once it expires the layer is simply absent
+                // (a true toggle, not a transparent layer). Its own swapchain,
+                // so it survives the transparent-mode chrome blackout above.
+                XrCompositionLayerWindowSpaceDXR toastLayer = {};
+                bool toastLayerReady = false;
+                if (rendered && g_toastReady && g_hasToastSwapchain) {
+                    std::wstring toastText;
+                    float toastAlpha = 1.0f;
+                    if (g_toast.Snapshot(toastText, toastAlpha)) {
+                        static dxr::CachedLayerUploader s_toastUp;
+                        static bool s_toastUpInit = false;
+                        static bool s_toastUploadedOnce = false;
+                        if (!s_toastUpInit) {
+                            s_toastUpInit = s_toastUp.init(vkDevice, physDevice, queueFamilyIndex,
+                                                           TOAST_TEX_W, TOAST_TEX_H);
+                        }
+                        // Alpha is quantised into the hash so the fade-out
+                        // re-rasterizes, but a steady message does not.
+                        const uint32_t alphaQ = (uint32_t)(toastAlpha * 32.0f);
+                        uint64_t th = dxr::HashBytes(toastText.data(),
+                                                     toastText.size() * sizeof(wchar_t));
+                        th = dxr::HashBytes(&alphaQ, sizeof(alphaQ), th);
+                        if (s_toastUpInit && s_toastUp.needsUpload(th)) {
+                            uint32_t pitch = 0;
+                            const void* px = RenderToastStandalone(g_toastHud, &pitch,
+                                                                   toastText, toastAlpha);
+                            uint32_t idx = 0;
+                            if (px && AcquireWindowSpaceImage(g_toastSwapchain, idx)) {
+                                if (s_toastUp.upload(graphicsQueue, g_toastSwapImages[idx].image,
+                                                     px, pitch, TOAST_TEX_W * 4, TOAST_TEX_H, th)) {
+                                    s_toastUploadedOnce = true;
+                                }
+                                ReleaseWindowSpaceImage(g_toastSwapchain);
+                            }
+                            if (px) UnmapHud(g_toastHud);
+                        }
+                        if (s_toastUploadedOnce) {
+                            const dxr::ToastLayerRect tr = dxr::ComputeToastLayerRect(
+                                windowW, windowH, (float)TOAST_TEX_W / (float)TOAST_TEX_H,
+                                TOAST_SIZE_FRACTION, TOAST_Y_FRACTION);
+                            toastLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+                            toastLayer.next = nullptr;
+                            toastLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+                            toastLayer.subImage.swapchain = g_toastSwapchain.swapchain;
+                            toastLayer.subImage.imageRect.offset = {0, 0};
+                            toastLayer.subImage.imageRect.extent = {(int32_t)TOAST_TEX_W,
+                                                                    (int32_t)TOAST_TEX_H};
+                            toastLayer.subImage.imageArrayIndex = 0;
+                            toastLayer.x = tr.x;
+                            toastLayer.y = tr.y;
+                            toastLayer.width = tr.width;
+                            toastLayer.height = tr.height;
+                            toastLayer.disparity = 0.0f;
+                            toastLayerReady = true;
+                            // One-shot (never per-frame): proves the layer
+                            // actually reached xrEndFrame, which is otherwise
+                            // only checkable by eye on the panel.
+                            static bool s_toastLoggedOnce = false;
+                            if (!s_toastLoggedOnce) {
+                                s_toastLoggedOnce = true;
+                                LOG_INFO("Toast layer submitted: rect=(%.3f,%.3f %.3fx%.3f) "
+                                         "of a %ux%u window",
+                                         tr.x, tr.y, tr.width, tr.height, windowW, windowH);
+                            }
+                        }
+                    }
+                }
+
                 // Submit frame
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
-                if (rendered && hudSubmitted) {
+                if (rendered && (hudSubmitted || toastLayerReady)) {
                     // Layer footprint sized per-frame to match the HUD
                     // swapchain's aspect (computed above as layerFracW ×
                     // layerFracH), so the runtime's swapchain→layer rect
@@ -2137,9 +2550,16 @@ static void RenderThreadFunc(
                     // this demo passes the bit explicitly (its vendored copy
                     // used to hardcode it) — required for the Ctrl+T
                     // transparent-background path; a no-op when opaque.
-                    EndFrameWithWindowSpaceHud(*xr, frameState.predictedDisplayTime, projectionViews,
+                    //
+                    // The toast rides as an extra window-space layer with its
+                    // own swapchain, so it composites on top of the HUD and
+                    // shows even on the frames where `submitHud` is false
+                    // (transparent mode hides all other chrome).
+                    EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
+                        toastLayerReady ? &toastLayer : nullptr, toastLayerReady ? 1u : 0u,
                         0, 0, -1, -1,
+                        /*submitHud=*/hudSubmitted,
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT);
                 } else if (rendered) {
                     EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount,
@@ -2197,6 +2617,90 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     LOG_INFO("=== SR 3DGS OpenXR Ext Vulkan Application ===");
 
+    // ── The undock launch contract ──────────────────────────────────────────
+    // GetCommandLineW, not WinMain's ANSI lpCmdLine, so a non-ASCII path
+    // survives. One parse, one policy — see displayxr-common/common/launch_args.h.
+    g_launch = dxr::ParseLaunchArgsFromCommandLine();
+    LOG_INFO("Launch: transparent=%d rect=%d(%d,%d %dx%d) src=%s(%s) positional='%s' "
+             "vh=%d(%.3f) dpr=%d(%.2f) type='%s' title='%s' protocol=%d maxBytes=%llu noCache=%d",
+             g_launch.transparent ? 1 : 0, g_launch.hasRect ? 1 : 0,
+             g_launch.rectX, g_launch.rectY, g_launch.rectW, g_launch.rectH,
+             g_launch.src.c_str(),
+             g_launch.srcKind == dxr::LaunchSrcKind::Url ? "url"
+                 : g_launch.srcKind == dxr::LaunchSrcKind::LocalPath ? "path" : "none",
+             g_launch.positionalPath.c_str(),
+             g_launch.hasVh ? 1 : 0, g_launch.vh, g_launch.hasDpr ? 1 : 0, g_launch.dpr,
+             g_launch.type.c_str(), g_launch.title.c_str(), g_launch.fromProtocol ? 1 : 0,
+             (unsigned long long)g_launch.maxBytes, g_launch.noCache ? 1 : 0);
+    for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+    if (!g_launch.ok()) {
+        for (const std::string& e : g_launch.errors) LOG_ERROR("launch: %s", e.c_str());
+        // A protocol launch has no console to read the error from, and the
+        // browser already asked the user to open this app — say why nothing
+        // appeared. A CLI launch gets the log and a non-zero exit code.
+        if (g_launch.fromProtocol) {
+            LaunchMessageBox(dxr::WideFromUtf8(g_launch.errors[0]), MB_ICONERROR);
+        }
+        ShutdownLogging();
+        return 2;
+    }
+
+    // Register HKCU\Software\Classes\displayxr-view -> this exe. Done by the
+    // VIEWER, not the installer: the NSIS installers run elevated, so their HKCU
+    // writes land in the elevating admin's hive. Idempotent; a LIVE sibling that
+    // already owns the scheme is left alone (type forwarding covers that).
+    {
+        const bool reg = dxr::EnsureViewProtocolRegistered(
+            dxr::ThisExePath(), L"DisplayXR Gaussian Splat Viewer");
+        LOG_INFO("displayxr-view protocol association: %s", reg ? "usable" : "FAILED");
+    }
+
+    if (g_launch.fromProtocol) {
+        // (a) Wrong viewer for this asset. One scheme serves every viewer so the
+        // browser only asks once; whoever the OS launched forwards by type.
+        if (!g_launch.type.empty() && g_launch.type != "splat") {
+            const std::wstring sibling =
+                dxr::FindSiblingViewer(L"ModelViewer", L"model_viewer_handle_vk_win.exe");
+            if (sibling.empty()) {
+                LOG_ERROR("type='%s' is not ours and the model viewer is not installed",
+                          g_launch.type.c_str());
+                LaunchMessageBox(
+                    L"This link opens a 3D model, which needs the DisplayXR 3D Model Viewer.\n\n"
+                    L"Please install the DisplayXR 3D Model Viewer and try again.",
+                    MB_ICONINFORMATION);
+                ShutdownLogging();
+                return 3;
+            }
+            const bool launched = dxr::LaunchViewerWithUrl(
+                sibling, dxr::WideFromUtf8(g_launch.protocolUrl));
+            LOG_INFO("Forwarded type='%s' to %ls: %s", g_launch.type.c_str(), sibling.c_str(),
+                     launched ? "ok" : "FAILED");
+            ShutdownLogging();
+            return launched ? 0 : 3;
+        }
+        // (b) Already running? Hand the URL to that instance and exit, so a page
+        // that undocks twice retargets one window instead of stacking viewers.
+        g_singleInstanceMutex = dxr::AcquireSingleInstanceOrForward(
+            L"Local\\DisplayXR.GaussianSplat.Undock", WINDOW_CLASS, g_launch.protocolUrl);
+        if (g_singleInstanceMutex == nullptr) {
+            LOG_INFO("Forwarded the URL to the running instance; exiting");
+            ShutdownLogging();
+            return 0;
+        }
+    }
+
+    // Mirror the launch into the render-thread-visible flags before anything
+    // that reads them (the bundled auto-load runs during init, below).
+    if (g_launch.hasVh) {
+        g_vhPinned.store(true, std::memory_order_relaxed);
+        g_vhPinnedValue.store(g_launch.vh, std::memory_order_relaxed);
+    }
+    if (g_launch.srcKind != dxr::LaunchSrcKind::None || !g_launch.positionalPath.empty()) {
+        g_suppressBundledAutoLoad.store(true, std::memory_order_relaxed);
+    }
+    g_transparentBg.store(g_launch.transparent);
+    g_borderless.store(g_launch.transparent);
+
     // Drift guard: assert the view/unproject/orientation conventions are
     // self-consistent (round-trip + +NDC->+world). A non-zero result means the
     // render-vs-pick frame math has drifted — fail loud rather than ship a
@@ -2239,7 +2743,26 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // Create the app window on the 3D panel
     int32_t panelLeft = 0, panelTop = 0;
     GetDisplayDesktopPosition(panelLeft, panelTop);
-    HWND hwnd = CreateAppWindow(hInstance, g_windowWidth, g_windowHeight, panelLeft, panelTop);
+    // --rect=X,Y,W,H replaces the default placement. Physical virtual-screen
+    // pixels (this exe declares PerMonitorV2, so no DPI virtualisation).
+    if (g_launch.hasRect) {
+        int32_t rx = g_launch.rectX, ry = g_launch.rectY;
+        ClampRectIntoPanel(rx, ry, g_launch.rectW, g_launch.rectH);
+        LOG_INFO("Launch rect: requested (%d,%d %dx%d) -> final (%d,%d %dx%d) "
+                 "panel=(%d,%d %dx%d) confirmed=%d dpr=%.2f",
+                 g_launch.rectX, g_launch.rectY, g_launch.rectW, g_launch.rectH,
+                 rx, ry, g_launch.rectW, g_launch.rectH,
+                 g_displayDesktopRect.offset.x, g_displayDesktopRect.offset.y,
+                 g_displayDesktopRect.extent.width, g_displayDesktopRect.extent.height,
+                 g_displayPanelConfirmed ? 1 : 0, g_launch.hasDpr ? g_launch.dpr : 0.0f);
+        panelLeft = rx;
+        panelTop = ry;
+        g_windowWidth = (UINT)g_launch.rectW;
+        g_windowHeight = (UINT)g_launch.rectH;
+    }
+    HWND hwnd = CreateAppWindow(hInstance, (int)g_windowWidth, (int)g_windowHeight,
+                                panelLeft, panelTop, g_launch.transparent,
+                                dxr::WideFromUtf8(g_launch.title));
     if (!hwnd) {
         LOG_ERROR("Failed to create window");
         CleanupOpenXR(xr);
@@ -2360,6 +2883,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                queueFamilyIndex, renderW, renderH)) {
             LOG_WARN("3DGS renderer init failed - scene rendering will not be available");
         } else {
+            // Startup scene selection. A local asset named on the command line
+            // loads here, synchronously, exactly where the bundled sample would
+            // have — the render thread does not exist yet, so this is the one
+            // moment loadScene may run off it. A URL cannot: it is kicked after
+            // the render thread is up, so the toast can report it.
+            if (g_launch.srcKind == dxr::LaunchSrcKind::LocalPath) {
+                LoadSceneAtStartup(dxr::NarrowPathForFopen(g_launch.src), "Loading --src");
+            } else if (!g_launch.positionalPath.empty()) {
+                LoadSceneAtStartup(dxr::NarrowPathForFopen(g_launch.positionalPath),
+                                   "Loading command-line scene");
+            }
             TryAutoLoadBundledScene();
         }
     }
@@ -2453,7 +2987,29 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         }
     }
 
-    ShowWindow(hwnd, nCmdShow);
+    // ── Toast window-space layer ────────────────────────────────────────────
+    // Its own small swapchain rather than a corner of the HUD, because the HUD
+    // (and every other piece of chrome) is HIDDEN in transparent mode by design
+    // — which is precisely when a download most needs to say something. Failure
+    // is non-fatal: the log still carries the progress.
+    {
+        if (InitializeHudRenderer(g_toastHud, TOAST_TEX_W, TOAST_TEX_H, TOAST_FONT_BASE) &&
+            CreateWindowSpaceSwapchain(xr, g_toastSwapchain, TOAST_TEX_W, TOAST_TEX_H)) {
+            uint32_t c = g_toastSwapchain.imageCount;
+            g_toastSwapImages.resize(c, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR});
+            xrEnumerateSwapchainImages(g_toastSwapchain.swapchain, c, &c,
+                (XrSwapchainImageBaseHeader*)g_toastSwapImages.data());
+            g_hasToastSwapchain = true;
+            g_toastReady = true;
+            LOG_INFO("Toast swapchain: %ux%u, %u images", TOAST_TEX_W, TOAST_TEX_H, c);
+        } else {
+            LOG_WARN("Toast layer unavailable - progress will only reach the log");
+        }
+    }
+
+    // A --transparent launch must not steal focus: it is a floating overlay a
+    // page spawned, not a window the user asked to switch to.
+    ShowWindow(hwnd, g_launch.transparent ? SW_SHOWNOACTIVATE : nCmdShow);
     UpdateWindow(hwnd);
 
     LOG_INFO("");
@@ -2463,7 +3019,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     LOG_INFO("          L=Load  Tab=HUD  F11=Fullscreen  ESC=Quit");
     LOG_INFO("");
 
-    g_inputState.viewParams.virtualDisplayHeight = kFallbackVirtualDisplayHeightM;
+    // --vh seeds the fallback: with a URL src there is no scene yet, so this is
+    // the value the first frames actually render at.
+    g_inputState.viewParams.virtualDisplayHeight =
+        g_vhPinned.load(std::memory_order_relaxed) ? g_vhPinnedValue.load(std::memory_order_relaxed)
+                                                   : kFallbackVirtualDisplayHeightM;
     g_inputState.renderingModeCount = xr.renderingModeCount;
     // Align runtime active rendering mode with app's default (mode 1 = first 3D mode).
     // The main loop's dispatch picks this up on the first frame and calls
@@ -2485,6 +3045,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         hudOk ? &hudSwapImages : nullptr,
         (VkCommandPool)VK_NULL_HANDLE, (std::vector<XrSwapchainImageVulkanKHR>*)nullptr,
         (uint32_t)0, (uint32_t)0);
+
+    // --src=<url>: start the download now that the render thread (and with it
+    // the toast) is alive, so progress is visible from the first byte.
+    if (g_launch.srcKind == dxr::LaunchSrcKind::Url) {
+        StartUrlFetch(hwnd, g_launch.src, g_launch.maxBytes, g_launch.noCache);
+    }
 
     MSG msg = {};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
@@ -2510,6 +3076,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (hudStagingMemory != VK_NULL_HANDLE) vkFreeMemory(vkDevice, hudStagingMemory, nullptr);
     if (hudOk) CleanupHudRenderer(hudRenderer);
 
+    // Toast layer — destroy the swapchain before CleanupOpenXR tears the
+    // session down under it.
+    if (g_toastReady) CleanupHudRenderer(g_toastHud);
+    if (g_toastSwapchain.swapchain != XR_NULL_HANDLE) {
+        xrDestroySwapchain(g_toastSwapchain.swapchain);
+        g_toastSwapchain.swapchain = XR_NULL_HANDLE;
+        g_hasToastSwapchain = false;
+    }
+
     g_xr = nullptr;
     CleanupOpenXR(xr);
     vkDestroyDevice(vkDevice, nullptr);
@@ -2517,6 +3092,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     DestroyWindow(hwnd);
     UnregisterClass(WINDOW_CLASS, hInstance);
+
+    // Released last: while this handle is open we are THE instance, and a
+    // second launch forwards to us instead of opening a rival window.
+    if (g_singleInstanceMutex) {
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+    }
 
     LOG_INFO("Application shutdown complete");
     ShutdownLogging();
