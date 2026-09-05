@@ -72,12 +72,15 @@ Flags are `--key=value`, never `--key value`. `--` ends flag parsing.
 The same fields arrive as a query string on the `displayxr-view:` scheme:
 
 ```
-displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&v=1
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&transparent=1&v=1
 ```
 
 `open` is the verb; `v=1` lets this viewer reject a future grammar loudly rather
 than half-honour it. Every value is percent-encoded by the sender
-(`encodeURIComponent`); only `%XX` is decoded — `+` is **not** a space.
+(`encodeURIComponent`); only `%XX` is decoded — `+` is **not** a space. A
+protocol launch is **transparent by default** (displayxr-common >= v2.9.1);
+`transparent=0` opts out for a framed window. `--transparent` on the command
+line stays opt-in.
 
 The viewer registers `HKCU\Software\Classes\displayxr-view` for itself at
 launch, not from the installer (the installer runs elevated, so its `HKCU`
