@@ -34,6 +34,15 @@ void GetDisplayDesktopPosition(int32_t& left, int32_t& top)
     top = s_displayDesktopTop;
 }
 
+// #1301 / display_info v18: the panel monitor's FULL desktop rect + the
+// runtime's own "this really is the panel" confidence flag. A SEPARATE chained
+// struct from XrDisplayDesktopPositionDXR (the runtime writes chained output
+// with its own layout, so the v16 struct could not simply grow). Zero-init means
+// an older runtime that ignores the unknown chain entry leaves it all-zero,
+// which is exactly the "geometry unknown" sentinel the header specifies.
+XrRect2Di g_displayDesktopRect = {};
+bool      g_displayPanelConfirmed = false;
+
 #define XR_CHECK(call) \
     do { \
         XrResult result = (call); \
@@ -163,6 +172,11 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         // consumed by CreateAppWindow so the window opens on the 3D panel.
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // display_info v18 (#1301): the full panel rect, for --rect clamping.
+        // Additive and separately chained — an older runtime just leaves it zero.
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopPos.next = &desktopInfo;
         eyeCaps.next = &desktopPos;
         displayInfo.next = &eyeCaps;
         sysProps.next = &displayInfo;
@@ -181,7 +195,13 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             xr.defaultEyeTrackingMode = (uint32_t)eyeCaps.defaultMode;
             s_displayDesktopLeft = desktopPos.left;
             s_displayDesktopTop = desktopPos.top;
+            g_displayDesktopRect = desktopInfo.desktopRect;
+            g_displayPanelConfirmed = (desktopInfo.isPanelConfirmed == XR_TRUE);
             LOG_INFO("Display desktop position: (%d, %d)", s_displayDesktopLeft, s_displayDesktopTop);
+            LOG_INFO("Display desktop rect: (%d, %d) %dx%d  panelConfirmed=%s  device='%s'",
+                g_displayDesktopRect.offset.x, g_displayDesktopRect.offset.y,
+                g_displayDesktopRect.extent.width, g_displayDesktopRect.extent.height,
+                g_displayPanelConfirmed ? "yes" : "no", desktopInfo.deviceName);
             LOG_INFO("Display info: scale=%.3fx%.3f, size=%.3fx%.3fm, pixels=%ux%u, nominal=(%.0f,%.0f,%.0f)mm",
                 xr.recommendedViewScaleX, xr.recommendedViewScaleY,
                 xr.displayWidthM, xr.displayHeightM,

@@ -25,6 +25,17 @@ bool XrViewRigExtAvailable();
 // for the same reason as XrViewRigExtAvailable().
 void GetDisplayDesktopPosition(int32_t& left, int32_t& top);
 
+// #1301 / display_info v18: the FULL desktop rect of the monitor the 3D panel
+// is on, in the same coordinate space the OS places windows in (Windows:
+// physical virtual-screen pixels, which is why this exe declares PerMonitorV2 —
+// a DPI-virtualised process reads a scaled rect and mis-places the window).
+// An all-zero rect means "runtime could not resolve it": treat the geometry as
+// unknown and do NOT clamp against it. g_displayPanelConfirmed is the runtime's
+// own confidence flag — a --rect is clamped INTO the panel only when both the
+// flag is set and the rect is non-zero, and it is never snapped.
+extern XrRect2Di g_displayDesktopRect;
+extern bool      g_displayPanelConfirmed;
+
 // Get Vulkan graphics requirements and set up Vulkan instance/device per OpenXR spec
 bool GetVulkanGraphicsRequirements(XrSessionManager& xr);
 
