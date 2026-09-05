@@ -686,6 +686,7 @@ bool GsRenderer::loadScene(const char* plyPath)
 
     // Clean up previous scene if any
     cleanupScene();
+    lastLoadError_.clear();
 
     // Auto-detect format by extension and parse scene file
     std::vector<GsVertex> vertices;
@@ -693,15 +694,22 @@ bool GsRenderer::loadScene(const char* plyPath)
     std::string ext = scenePath.substr(scenePath.find_last_of('.'));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
+    // A parse failure is a RETURN, never an exception and never a crash: an
+    // unsupported or corrupt file must leave the window up with a message.
     bool parseOk;
     if (ext == ".spz") {
-        parseOk = ParseSpzFile(scenePath, vertices);
+        SpzFileInfo info;
+        parseOk = ParseSpzFile(scenePath, vertices, &info);
+        if (!parseOk) lastLoadError_ = info.error;
     } else {
         parseOk = ParsePlyFile(scenePath, vertices);
+        if (!parseOk) lastLoadError_ = "not a readable PLY scene (corrupt or unsupported)";
     }
 
     if (!parseOk || vertices.empty()) {
-        fprintf(stderr, "GsRenderer: failed to parse scene file: %s\n", plyPath);
+        if (lastLoadError_.empty()) lastLoadError_ = "scene file contains no gaussians";
+        fprintf(stderr, "GsRenderer: failed to parse scene file: %s - %s\n",
+                plyPath, lastLoadError_.c_str());
         return false;
     }
 

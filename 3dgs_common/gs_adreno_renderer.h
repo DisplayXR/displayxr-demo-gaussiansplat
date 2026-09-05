@@ -58,6 +58,12 @@ struct GsAdrenoRenderer {
 
     bool hasScene() const { return sceneLoaded_; }
     const std::string& scenePath() const { return loadedScenePath_; }
+
+    //! One-line reason the last loadScene() returned false (empty after a
+    //! success). Never a crash substitute for logging: the caller is expected
+    //! to surface this to the user, since a chrome-free transparent window has
+    //! no other way to say why nothing appeared.
+    const std::string& lastLoadError() const { return lastLoadError_; }
     uint32_t gaussianCount() const { return numGaussians_; }
 
     // Robust scene centroid + per-axis extent (outlier-trimmed): per axis takes
@@ -127,6 +133,7 @@ private:
     bool initialized_ = false;
     bool sceneLoaded_ = false;
     std::string loadedScenePath_;
+    std::string lastLoadError_;
     uint32_t numGaussians_ = 0;
 
     // Internal render scale (1.0 = full res). Default 0.6 on Android — the

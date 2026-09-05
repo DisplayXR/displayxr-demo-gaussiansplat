@@ -226,13 +226,26 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
 bool GsAdrenoRenderer::loadScene(const char* scenePath) {
     if (!initialized_) { GS_LOGE("GsAdreno: not initialized"); return false; }
     cleanupScene();
+    lastLoadError_.clear();
 
     std::vector<GsVertex> verts;
     std::string path(scenePath);
     std::string ext = path.substr(path.find_last_of('.'));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    bool ok = (ext == ".spz") ? ParseSpzFile(path, verts) : ParsePlyFile(path, verts);
-    if (!ok || verts.empty()) { GS_LOGE("GsAdreno: parse failed: %s", scenePath); return false; }
+    bool ok;
+    if (ext == ".spz") {
+        SpzFileInfo info;
+        ok = ParseSpzFile(path, verts, &info);
+        if (!ok) lastLoadError_ = info.error;
+    } else {
+        ok = ParsePlyFile(path, verts);
+        if (!ok) lastLoadError_ = "not a readable PLY scene (corrupt or unsupported)";
+    }
+    if (!ok || verts.empty()) {
+        if (lastLoadError_.empty()) lastLoadError_ = "scene file contains no gaussians";
+        GS_LOGE("GsAdreno: parse failed: %s - %s", scenePath, lastLoadError_.c_str());
+        return false;
+    }
 
     // Load-time decimation: keep ~keepFrac_ of the gaussians, hash-selected for
     // a spatially-uniform thinning independent of file order. Every stage

@@ -634,7 +634,9 @@ std::string HandleAgentToolCall(XrSessionManager& xr, const std::string& toolNam
             std::lock_guard<std::mutex> lock(g_sceneMutex);
             if (!g_gsRenderer.loadScene(path.c_str())) {
                 ok = false;
-                result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (corrupt or unsupported)\"}";
+                const std::string why = g_gsRenderer.lastLoadError();
+                result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (" +
+                         JsonEscape(why.empty() ? std::string("corrupt or unsupported") : why) + ")\"}";
             } else {
                 g_loadedFileName = GetPlyFilename(path);
                 ApplyAutoFitForLoadedScene_locked();
@@ -870,11 +872,16 @@ static bool LoadSceneAtStartup(const std::string& path, const char* why) {
     std::lock_guard<std::mutex> lock(g_sceneMutex);
     if (g_gsRenderer.loadScene(path.c_str())) {
         g_loadedFileName = GetPlyFilename(path);
-        LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
+        LOG_INFO("Loaded %s (%s, %u gaussians)", g_loadedFileName.c_str(),
+                 GetPlyFileSize(path).c_str(), g_gsRenderer.gaussianCount());
         ApplyAutoFitForLoadedScene_locked();
         return true;
     }
-    LOG_WARN("%s: load failed for %s", why, path.c_str());
+    const std::string reason = g_gsRenderer.lastLoadError();
+    LOG_WARN("%s: load failed for %s - %s", why, path.c_str(),
+             reason.empty() ? "corrupt or unsupported" : reason.c_str());
+    ToastF("Can't open %s - %s", GetPlyFilename(path).c_str(),
+           reason.empty() ? "corrupt or unsupported" : reason.c_str());
     return false;
 }
 
@@ -1614,13 +1621,27 @@ static void RenderThreadFunc(
                 std::lock_guard<std::mutex> lock(g_sceneMutex);
                 if (g_gsRenderer.loadScene(path.c_str())) {
                     g_loadedFileName = GetPlyFilename(path);
-                    LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
-                        GetPlyFileSize(path).c_str());
+                    LOG_INFO("Scene loaded: %s (%s, %u gaussians)", g_loadedFileName.c_str(),
+                        GetPlyFileSize(path).c_str(), g_gsRenderer.gaussianCount());
                     ApplyAutoFitForLoadedScene_locked();
                 } else {
-                    LOG_ERROR("Failed to load scene: %s", path.c_str());
-                    MessageBoxA(hwnd, "Failed to load scene file.\nThe file may be corrupt or unsupported.",
-                        "Load Error", MB_OK | MB_ICONERROR);
+                    // The window STAYS UP. A bad file is a message, not an
+                    // exit and not a crash — in transparent mode the toast is
+                    // the only chrome there is, so it carries the reason
+                    // (which names the SPZ version for an .spz).
+                    const std::string why = g_gsRenderer.lastLoadError();
+                    LOG_ERROR("Failed to load scene: %s - %s", path.c_str(),
+                              why.empty() ? "corrupt or unsupported" : why.c_str());
+                    ToastF("Can't open %s - %s", GetPlyFilename(path).c_str(),
+                           why.empty() ? "corrupt or unsupported" : why.c_str());
+                    // A modal box would freeze the render thread (it IS this
+                    // thread) and is invisible-by-design in transparent mode.
+                    if (!g_transparentBg.load() && !LaunchQuiet()) {
+                        MessageBoxA(hwnd, ("Failed to load scene file.\n" +
+                                           (why.empty() ? std::string("The file may be corrupt or unsupported.")
+                                                        : why)).c_str(),
+                            "Load Error", MB_OK | MB_ICONERROR);
+                    }
                 }
             }
         }

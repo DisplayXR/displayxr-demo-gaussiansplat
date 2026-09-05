@@ -51,6 +51,12 @@ struct GsRenderer {
     // Returns the loaded scene file path.
     const std::string& scenePath() const;
 
+    //! One-line reason the last loadScene() returned false (empty after a
+    //! success). Never a crash substitute for logging: the caller is expected
+    //! to surface this to the user, since a chrome-free transparent window has
+    //! no other way to say why nothing appeared.
+    const std::string& lastLoadError() const { return lastLoadError_; }
+
     // Returns the number of Gaussians in the loaded scene.
     uint32_t gaussianCount() const;
 
@@ -209,6 +215,7 @@ private:
     bool initialized_ = false;
     bool sceneLoaded_ = false;
     std::string loadedScenePath_;
+    std::string lastLoadError_;
     uint32_t numGaussians_ = 0;
 
     // ── Derived dimensions ───────────────────────────────────────────────
