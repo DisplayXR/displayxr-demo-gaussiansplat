@@ -1698,130 +1698,6 @@ static bool AutoOrbitSuppressed(const XrSessionManager* xr) {
     return g_transparentBg.load() && IsStandaloneSession(xr);
 }
 
-// #100 v2 (XR_DXR_depth_budget SPEC_VERSION 2): XrContentBoundsDXR is defined
-// to chain on XrFrameEndInfo::next (see XR_DXR_depth_budget.h and the
-// runtime's oxr_session_frame_end.c — "same place other XrFrameEndInfo chains
-// are read"). displayxr::common v2.11.0's EndFrame()/EndFrameWithWindowSpaceLayers()
-// have no hook for that — only `projectionNext`, which chains onto
-// XrCompositionLayerProjection::next, a DIFFERENT chain the runtime does not
-// read this struct from. These two functions are byte-for-byte mirrors of
-// those v2.11.0 helpers (same params, same layer-building order, same
-// throttled failure log) plus one extra `endInfo.next = frameEndNext` line —
-// used ONLY when the depth-budget extension is enabled (frameEndNext is
-// nullptr otherwise, so behavior is identical to calling the shared helpers
-// directly). environmentBlendMode is hardcoded to OPAQUE, matching both this
-// file's own manual XrFrameEndInfo build in the `!rendered` branch below and
-// displayxr-common's SelectEnvBlendMode() default (its only other value is
-// gated on the DISPLAYXR_TRANSPARENT_BG env var, which this demo never sets —
-// transparency here goes through XrWin32WindowBindingCreateInfoDXR instead).
-// TODO: delete this pair once displayxr-common grows a `frameEndNext`
-// parameter on the shared helpers, and call those directly again.
-static bool EndFrame_ChainFrameEndNext(
-    XrSessionManager& xr, XrTime displayTime,
-    const XrCompositionLayerProjectionView* views,
-    uint32_t viewCount, XrCompositionLayerFlags projectionLayerFlags,
-    const void* projectionNext, const void* frameEndNext)
-{
-    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projectionLayer.next = projectionNext;
-    projectionLayer.space = xr.localSpace;
-    projectionLayer.layerFlags = projectionLayerFlags;
-    projectionLayer.viewCount = viewCount;
-    projectionLayer.views = views;
-
-    const XrCompositionLayerBaseHeader* layers[] = {
-        (const XrCompositionLayerBaseHeader*)&projectionLayer
-    };
-
-    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
-    endInfo.next = frameEndNext;
-    endInfo.displayTime = displayTime;
-    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = 1;
-    endInfo.layers = layers;
-
-    XrResult result = xrEndFrame(xr.session, &endInfo);
-    if (XR_FAILED(result)) {
-        static int endFrameFailLog = 0;
-        if (endFrameFailLog < 10 || endFrameFailLog % 300 == 0) {
-            LOG_WARN("[Frame] xrEndFrame FAILED: %d", result);
-        }
-        endFrameFailLog++;
-    }
-    return XR_SUCCEEDED(result);
-}
-
-static bool EndFrameWithWindowSpaceLayers_ChainFrameEndNext(
-    XrSessionManager& xr,
-    XrTime displayTime,
-    const XrCompositionLayerProjectionView* projViews,
-    float hudX, float hudY, float hudWidth, float hudHeight,
-    float hudDisparity,
-    uint32_t viewCount,
-    const void* uiLayers, uint32_t uiLayerCount,
-    int32_t srcX, int32_t srcY,
-    int32_t srcW, int32_t srcH,
-    bool submitHud,
-    XrCompositionLayerFlags projectionLayerFlags,
-    const void* projectionNext,
-    const XrCompositionLayerBaseHeader* const* extraLayers,
-    uint32_t extraLayerCount,
-    const void* frameEndNext)
-{
-    XrCompositionLayerProjection projectionLayer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
-    projectionLayer.next = projectionNext;
-    projectionLayer.space = xr.localSpace;
-    projectionLayer.layerFlags = projectionLayerFlags;
-    projectionLayer.viewCount = viewCount;
-    projectionLayer.views = projViews;
-
-    if (srcW < 0) srcW = (int32_t)xr.hudSwapchain.width;
-    if (srcH < 0) srcH = (int32_t)xr.hudSwapchain.height;
-
-    XrCompositionLayerWindowSpaceDXR hudLayer = {};
-    hudLayer.type = (XrStructureType)XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
-    hudLayer.next = nullptr;
-    hudLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-    hudLayer.subImage.swapchain = xr.hudSwapchain.swapchain;
-    hudLayer.subImage.imageRect.offset = {srcX, srcY};
-    hudLayer.subImage.imageRect.extent = {srcW, srcH};
-    hudLayer.subImage.imageArrayIndex = 0;
-    hudLayer.x = hudX;
-    hudLayer.y = hudY;
-    hudLayer.width = hudWidth;
-    hudLayer.height = hudHeight;
-    hudLayer.disparity = hudDisparity;
-
-    const XrCompositionLayerWindowSpaceDXR* ui =
-        reinterpret_cast<const XrCompositionLayerWindowSpaceDXR*>(uiLayers);
-    std::vector<const XrCompositionLayerBaseHeader*> layers;
-    layers.reserve(2 + uiLayerCount);
-    layers.push_back((const XrCompositionLayerBaseHeader*)&projectionLayer);
-    if (xr.hasHudSwapchain && submitHud)
-        layers.push_back((const XrCompositionLayerBaseHeader*)&hudLayer);
-    for (uint32_t i = 0; i < uiLayerCount; ++i)
-        layers.push_back((const XrCompositionLayerBaseHeader*)&ui[i]);
-    for (uint32_t i = 0; i < extraLayerCount; ++i)
-        if (extraLayers[i] != nullptr) layers.push_back(extraLayers[i]);
-
-    XrFrameEndInfo endInfo = {XR_TYPE_FRAME_END_INFO};
-    endInfo.next = frameEndNext;
-    endInfo.displayTime = displayTime;
-    endInfo.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-    endInfo.layerCount = (uint32_t)layers.size();
-    endInfo.layers = layers.data();
-
-    XrResult result = xrEndFrame(xr.session, &endInfo);
-    if (XR_FAILED(result)) {
-        static int endFrameFailLog = 0;
-        if (endFrameFailLog < 10 || endFrameFailLog % 300 == 0) {
-            LOG_WARN("[Frame] xrEndFrame (HUD) FAILED: %d", result);
-        }
-        endFrameFailLog++;
-    }
-    return XR_SUCCEEDED(result);
-}
-
 static void RenderThreadFunc(
     HWND hwnd,
     XrSessionManager* xr,
@@ -2328,10 +2204,10 @@ static void RenderThreadFunc(
                         // #100 v2: project the cached, outlier-trimmed scene AABB through
                         // every rendered eye's viewProj into a canvas-normalised union rect,
                         // and chain it as XrContentBoundsDXR onto this frame's XrFrameEndInfo
-                        // (see EndFrame_ChainFrameEndNext / EndFrameWithWindowSpaceLayers_
-                        // ChainFrameEndNext above for why a local shim is needed to reach
-                        // that chain). No scene loaded -> frameEndNext stays null -> the
-                        // runtime falls back to its v1 whole-canvas ROI, per spec.
+                        // via EndFrame's / EndFrameWithWindowSpaceLayers' `frameEndNext`
+                        // parameter (displayxr-common v2.11.1+). No scene loaded ->
+                        // frameEndNext stays null -> the runtime falls back to its v1
+                        // whole-canvas ROI, per spec.
                         static XrContentBoundsDXR s_contentBoundsChain{};
                         XrRect2Df contentBoundsRect{};
                         bool haveContentBounds = false;
@@ -2997,13 +2873,11 @@ static void RenderThreadFunc(
                     // own swapchain, so it composites on top of the HUD and
                     // shows even on the frames where `submitHud` is false
                     // (transparent mode hides all other chrome).
-                    // #100 v2: routed through the local
-                    // EndFrameWithWindowSpaceLayers_ChainFrameEndNext shim (byte-for-byte
-                    // mirror of displayxr::common's EndFrameWithWindowSpaceLayers, see its
-                    // definition above) so XrContentBoundsDXR can reach XrFrameEndInfo::next
-                    // — frameEndNext is nullptr whenever the extension is off or no scene is
-                    // loaded, which reproduces calling the shared helper directly.
-                    EndFrameWithWindowSpaceLayers_ChainFrameEndNext(*xr, frameState.predictedDisplayTime, projectionViews,
+                    // #100 v2: routed through displayxr-common's EndFrameWithWindowSpaceLayers
+                    // (v2.11.1+'s `frameEndNext` param) so XrContentBoundsDXR can reach
+                    // XrFrameEndInfo::next — frameEndNext is nullptr whenever the extension is
+                    // off or no scene is loaded, which reproduces the pre-#100 behavior.
+                    EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
                         0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
                         toastLayerReady ? &toastLayer : nullptr, toastLayerReady ? 1u : 0u,
                         0, 0, -1, -1,
@@ -3012,7 +2886,7 @@ static void RenderThreadFunc(
                         /*projectionNext=*/nullptr, /*extraLayers=*/nullptr, /*extraLayerCount=*/0u,
                         frameEndNext);
                 } else if (rendered) {
-                    EndFrame_ChainFrameEndNext(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount,
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount,
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                         /*projectionNext=*/nullptr, frameEndNext);
                 } else {
