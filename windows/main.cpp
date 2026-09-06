@@ -31,6 +31,7 @@
 #include "view_rig_math.h"
 #include "clip_policy.h"   // dxr::ResolveClipPlanes / ChainRearDepthBudget / RearDepthBudgetStateName (#100)
 #include "content_bounds.h" // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (#100 v2 ROI)
+#include "content_mask.h"   // dxr::ContentMaskFromCoverage / ChainContentMask (#100 v3 silhouette ROI)
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_depth_budget.h>
 
@@ -2040,6 +2041,13 @@ static void RenderThreadFunc(
                         // sentinel (0) unless a runtime that recognizes the struct fills
                         // it in, which is how "filled" is told from "not".
                         const bool hasDepthBudgetExt = XrDepthBudgetExtAvailable();
+                        // #100 v3: the silhouette content-mask ROI (XrContentMaskDXR) is a
+                        // v3-only addition to XR_DXR_depth_budget — gate on the RUNTIME's
+                        // reported extensionVersion, never on this app's vendored header,
+                        // so a v3-built binary never chains a struct a v2 runtime can't
+                        // parse (brief §6.1/6.2).
+                        const bool hasContentMaskV3 =
+                            hasDepthBudgetExt && XrDepthBudgetExtVersion() >= 3;
                         XrRearDepthBudgetDXR depthBudget{};
                         if (hasDepthBudgetExt) {
                             dxr::ChainRearDepthBudget(viewState, depthBudget);
@@ -2211,6 +2219,10 @@ static void RenderThreadFunc(
                         static XrContentBoundsDXR s_contentBoundsChain{};
                         XrRect2Df contentBoundsRect{};
                         bool haveContentBounds = false;
+                        // #100 v3: set true below (after the click-through silhouette for
+                        // this frame is available) when XrContentMaskDXR was actually
+                        // chained — read by the HUD "rear:" line further down.
+                        bool haveContentMask = false;
                         if (hasDepthBudgetExt && useRig && eyeCount > 0) {
                             float aabbMin[3], aabbMax[3];
                             bool aabbValid;
@@ -2545,6 +2557,66 @@ static void RenderThreadFunc(
                                                    chromeCount ? chrome : nullptr, chromeCount,
                                                    (lastV % cols) * renderW, (lastV / cols) * renderH,
                                                    eyeCount > 1);
+
+                                    // #100 v3: reduce the click-through silhouette g_punch just
+                                    // computed into a XR_DXR_depth_budget content-mask ROI
+                                    // (brief §6) — this app already derives exactly this
+                                    // artefact for SetWindowRgn, so no second alpha readback.
+                                    // Only when the RUNTIME has advertised v3 (hasContentMaskV3);
+                                    // a v2 runtime keeps the v2 content-bounds rect as its ROI.
+                                    // coverage() lags one update() call and returns nullptr
+                                    // until the first region has actually been applied — skip
+                                    // the mask this frame rather than chain stale/absent data;
+                                    // the v2 bounds chain above is untouched either way.
+                                    if (hasContentMaskV3) {
+                                        const uint8_t* cov = g_punch.coverage();
+                                        const uint32_t covW = g_punch.coverageWidth();
+                                        const uint32_t covH = g_punch.coverageHeight();
+                                        if (cov != nullptr && covW > 0 && covH > 0 &&
+                                            windowW > 0 && windowH > 0) {
+                                            // ~1/4 of the coverage raster, capped at the
+                                            // extension's recommended ceiling (content_mask.h) —
+                                            // finer buys nothing, the runtime's own disparity-band
+                                            // dilation erases sub-cell detail anyway.
+                                            uint32_t maskW = covW / 4;
+                                            uint32_t maskH = covH / 4;
+                                            if (maskW < 1) maskW = 1;
+                                            if (maskH < 1) maskH = 1;
+                                            if (maskW > dxr::kContentMaskRecommendedCells)
+                                                maskW = dxr::kContentMaskRecommendedCells;
+                                            if (maskH > dxr::kContentMaskRecommendedCells)
+                                                maskH = dxr::kContentMaskRecommendedCells;
+
+                                            // Static: ChainContentMask stores a pointer into this
+                                            // buffer that must stay valid through xrEndFrame further
+                                            // down this same frame; a function-local static (like
+                                            // s_contentBoundsChain above) avoids a dangling temporary
+                                            // without adding file-scope state.
+                                            static std::vector<uint8_t> s_contentMaskCells;
+                                            static XrContentMaskDXR s_contentMaskChain{};
+                                            // srcRectPx = nullptr: g_punch's coverage raster already
+                                            // covers the whole window client rect (no 3D zones in
+                                            // this app), matching ContentMaskFromCoverage's default.
+                                            if (dxr::ContentMaskFromCoverage(cov, covW, covH, covW,
+                                                    windowW, windowH, /*srcRectPx=*/nullptr,
+                                                    maskW, maskH, s_contentMaskCells) &&
+                                                dxr::ContentMaskCoverageCells(s_contentMaskCells) > 0) {
+                                                // Chain the mask FIRST, then let it point at
+                                                // whatever frameEndNext already carries (the v2
+                                                // content-bounds struct, when present) — bounds
+                                                // stays chained regardless (brief §6.4 "keep bounds
+                                                // always"); the runtime's own ROI precedence (mask,
+                                                // then bounds) doesn't depend on chain order.
+                                                XrFrameEndInfo maskChainProxy{};
+                                                maskChainProxy.next = frameEndNext;
+                                                if (dxr::ChainContentMask(maskChainProxy, s_contentMaskChain,
+                                                        s_contentMaskCells, maskW, maskH)) {
+                                                    frameEndNext = maskChainProxy.next;
+                                                    haveContentMask = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             } else if (g_punch.shaped()) {
                                 g_punch.disable(hwnd);
@@ -2650,16 +2722,22 @@ static void RenderThreadFunc(
                                     const float rbFarOffsetVH = depthBudgetPtr ? depthBudgetPtr->farOffsetVH : 0.0f;
                                     const XrRearDepthBudgetStateDXR rbState = depthBudgetPtr
                                         ? depthBudgetPtr->state : XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR;
-                                    wchar_t rbBuf[160];
+                                    wchar_t rbBuf[192];
+                                    // #100 v3: " mask" appended when XrContentMaskDXR was
+                                    // actually chained this frame (haveContentMask) — the
+                                    // silhouette ROI, not just the v2 bounds rect, reached
+                                    // the runtime.
                                     if (haveContentBounds) {
-                                        swprintf(rbBuf, 160, L"\nrear: %hs %.2fvH roi %.2f,%.2f-%.2f,%.2f",
+                                        swprintf(rbBuf, 192, L"\nrear: %hs %.2fvH roi %.2f,%.2f-%.2f,%.2f%hs",
                                             dxr::RearDepthBudgetStateName(rbState), rbFarOffsetVH,
                                             contentBoundsRect.offset.x, contentBoundsRect.offset.y,
                                             contentBoundsRect.offset.x + contentBoundsRect.extent.width,
-                                            contentBoundsRect.offset.y + contentBoundsRect.extent.height);
+                                            contentBoundsRect.offset.y + contentBoundsRect.extent.height,
+                                            haveContentMask ? " mask" : "");
                                     } else {
-                                        swprintf(rbBuf, 160, L"\nrear: %hs %.2fvH",
-                                            dxr::RearDepthBudgetStateName(rbState), rbFarOffsetVH);
+                                        swprintf(rbBuf, 192, L"\nrear: %hs %.2fvH%hs",
+                                            dxr::RearDepthBudgetStateName(rbState), rbFarOffsetVH,
+                                            haveContentMask ? " mask" : "");
                                     }
                                     stereoText += rbBuf;
                                 }
