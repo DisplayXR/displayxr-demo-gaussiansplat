@@ -25,6 +25,16 @@ static bool s_hasDepthBudgetExt = false;
 
 bool XrDepthBudgetExtAvailable() { return s_hasDepthBudgetExt; }
 
+// The runtime-reported extensionVersion (#100 v3 / brief §6): a v2 runtime
+// supports XrRearDepthBudgetDXR + XrContentBoundsDXR only, so the silhouette
+// content-mask path (XrContentMaskDXR) must gate on this being >= 3 rather
+// than on the app's own vendored header — an app built against the v3 header
+// against an older runtime must never chain a struct that runtime doesn't
+// know about. Stored next to s_hasDepthBudgetExt for the same reason.
+static uint32_t s_depthBudgetExtVersion = 0;
+
+uint32_t XrDepthBudgetExtVersion() { return s_depthBudgetExtVersion; }
+
 // INV-1.3 / runtime#715: 3D panel top-left in OS virtual-desktop pixels
 // (top-down, origin = primary monitor top-left), from
 // XrDisplayDesktopPositionDXR (XR_DXR_display_info spec v16). (0,0) =
@@ -104,6 +114,7 @@ bool InitializeOpenXR(XrSessionManager& xr) {
         }
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             s_hasDepthBudgetExt = true;
+            s_depthBudgetExtVersion = ext.extensionVersion;
         }
     }
 
@@ -114,7 +125,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_atlas_capture: %s", xr.hasAtlasCaptureExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_view_rig: %s", s_hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
-    LOG_INFO("XR_DXR_depth_budget: %s", s_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND");
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", s_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
+        s_depthBudgetExtVersion);
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");

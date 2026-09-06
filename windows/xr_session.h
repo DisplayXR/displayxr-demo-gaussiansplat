@@ -27,6 +27,14 @@ bool XrViewRigExtAvailable();
 // hand-rolled clip rule otherwise (dxr::ResolveClipPlanes(budget=nullptr, ...)).
 bool XrDepthBudgetExtAvailable();
 
+// The runtime's reported XR_DXR_depth_budget extensionVersion (#100 v3). A v2
+// runtime supports XrRearDepthBudgetDXR + XrContentBoundsDXR but NOT
+// XrContentMaskDXR — callers must gate the silhouette content-mask ROI on
+// this being >= 3, never on the app's own vendored header version, since an
+// app built against the v3 header can still run against an older runtime.
+// Returns 0 when the extension itself is unavailable.
+uint32_t XrDepthBudgetExtVersion();
+
 // INV-1.3 / runtime#715: 3D panel top-left in virtual-desktop pixels from
 // XrDisplayDesktopPositionDXR (display_info v16), filled by InitializeOpenXR.
 // (0,0) = primary/unknown (safe default, incl. on older runtimes). Demo-side
