@@ -27,6 +27,40 @@
  * spz the inflated buffer would send it down the NGSP path and it would reject
  * the version as < 4). Hence the "gunzip, look, then choose which buffer to
  * pass" shape below.
+ *
+ * ── Coordinate systems ──────────────────────────────────────────────────────
+ *
+ * THE SPZ CONTAINER DOES NOT RECORD ITS COORDINATE SYSTEM. Neither header
+ * carries the field: in the 32-byte `NgspFileHeader` the byte at offset 15 —
+ * the one a legacy 16-byte read shows as "reserved" — is `numStreams` (5 for a
+ * degree-0 file: positions, alphas, colors, scales, rotations). Upstream's only
+ * coordinate metadata is an optional *extension* block gated behind
+ * `SPZ_BUILD_EXTENSIONS`, which is compiled out here (and whose header isn't
+ * even in the tree at our pinned rev); the storefront's files carry
+ * `flags = 0`, i.e. no extensions. So the source system is a POLICY CHOICE the
+ * loader has to make, not something it can read.
+ *
+ * Upstream picks one unconditionally — `unpackGaussians()` ends in
+ * `convertCoordinates(CoordinateSystem::RUB, o.to)`, i.e. "the bytes are RUB".
+ * That is right for files the Niantic writer produced (v1-v3 in practice) and
+ * WRONG for every v4 file in the wild, because the only v4 writer anyone uses,
+ * `@playcanvas/splat-transform`, bakes the cloud into PLY space
+ * (`Transform.PLY`) and then calls `saveSpz` with `from = UNSPECIFIED` — an
+ * identity converter — so the on-disk bytes are RDF, not RUB. Its own source
+ * says so: "splat-transform stores SPZ with no coordinate conversion: data is
+ * baked to PLY/RDF space before saving … the format carries no coordinate
+ * metadata". Asking spz for `to = RUB` then applies RUB->RUB (nothing) and the
+ * scene renders upside down (RDF vs RUB differ by 180 deg about X).
+ *
+ * Hence `SpzSourceSystem()` below: legacy containers (v1-v3) are RUB, NGSP
+ * containers (v4+) are RDF. That is the generation split between the two
+ * writers, and it reproduces what the web viewers show — the storefront's
+ * Spark page loads the SAME cloud as `.sog` (splat-transform bakes `.sog` to
+ * `Transform.PLY` too) and rights it with `mesh.quaternion.set(1,0,0,0)`, a
+ * 180 deg rotation about X, which is exactly RDF -> RUB.
+ *
+ * `DXR_SPZ_COORD_SYSTEM=rub|rdf` overrides the choice for a file that breaks
+ * the rule (a raw-NGSP v4 straight out of Niantic's own writer would be RUB).
  */
 
 #include "gs_spz_loader.h"
@@ -38,6 +72,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -132,6 +167,33 @@ bool PeekSpzHeader(const uint8_t* data, size_t size,
     return true;
 }
 
+//! Printable name for the systems this loader can pick between.
+const char* CoordSystemName(spz::CoordinateSystem cs) {
+    switch (cs) {
+        case spz::CoordinateSystem::RUB: return "RUB (+X right, +Y up, +Z back)";
+        case spz::CoordinateSystem::RDF: return "RDF (+X right, +Y down, +Z front)";
+        default:                         return "UNSPECIFIED";
+    }
+}
+
+//! Which coordinate system the on-disk bytes are in. See the coordinate-systems
+//! section of the file header comment — the container never says, so this is the
+//! loader's policy: legacy containers come from Niantic's writer (RUB), NGSP
+//! containers come from @playcanvas/splat-transform (RDF/PLY space).
+//!
+//! `DXR_SPZ_COORD_SYSTEM=rub|rdf` overrides it for a file that breaks the rule.
+spz::CoordinateSystem SpzSourceSystem(uint32_t version) {
+    if (const char* env = std::getenv("DXR_SPZ_COORD_SYSTEM")) {
+        if (env[0] == 'r' || env[0] == 'R') {
+            if (env[1] == 'u' || env[1] == 'U') return spz::CoordinateSystem::RUB;
+            if (env[1] == 'd' || env[1] == 'D') return spz::CoordinateSystem::RDF;
+        }
+        fprintf(stderr, "ParseSpzFile: ignoring DXR_SPZ_COORD_SYSTEM='%s' (expected rub or rdf)\n",
+                env);
+    }
+    return version >= 4 ? spz::CoordinateSystem::RDF : spz::CoordinateSystem::RUB;
+}
+
 }  // namespace
 
 bool ParseSpzFile(const std::string& path, std::vector<GsVertex>& vertices, SpzFileInfo* info)
@@ -178,13 +240,14 @@ bool ParseSpzFile(const std::string& path, std::vector<GsVertex>& vertices, SpzF
     fi.numPoints = (int)headerPoints;
     fi.shDegree = (int)headerShDegree;
 
-    // EXPERIMENT: was RDF (Y-down, Z-forward = COLMAP/gsplat-trainer PLY convention).
-    // Trying RUB (Y-up, Z-back = OpenGL / OpenXR / SPZ-native) to see if the
-    // scene matches SuperSplat's orientation without needing a 180° yaw fix.
+    // Ask spz for its own storage convention (RUB) and do NOT let it convert:
+    // `unpackGaussians` would convert FROM an assumed RUB, and for a v4 file
+    // that assumption is the bug. The real source system is decided below and
+    // applied explicitly, so the conversion reads the way it means.
     spz::GaussianCloud cloud;
     try {
         spz::UnpackOptions options;
-        options.to = spz::CoordinateSystem::RUB;
+        options.to = spz::CoordinateSystem::RUB;  // RUB -> RUB, a no-op
         cloud = spz::loadSpz(payload, payloadSize, options);
     } catch (const std::exception& e) {
         fi.error = std::string("spz loader threw: ") + e.what();
@@ -231,8 +294,24 @@ bool ParseSpzFile(const std::string& path, std::vector<GsVertex>& vertices, SpzF
         return false;
     }
 
-    printf("ParseSpzFile: loading %u gaussians from %s (spzVersion=%d, shDegree=%d)\n",
-           numPoints, path.c_str(), fi.version, cloud.shDegree);
+    // The container never declares its coordinate system (see the file header
+    // comment), so name the one we assumed — a scene that comes out upside down
+    // is then one grep away from its cause, and DXR_SPZ_COORD_SYSTEM is the fix.
+    // Convert here, once per load, on the whole cloud: spz's own converter also
+    // handles the rotations, scales and SH bands, which a hand-rolled position
+    // flip in the vertex loop below would silently get wrong.
+    const spz::CoordinateSystem sourceSystem = SpzSourceSystem(version);
+    fi.sourceSystem = CoordSystemName(sourceSystem);
+    if (sourceSystem != spz::CoordinateSystem::RUB) {
+        cloud.convertCoordinates(sourceSystem, spz::CoordinateSystem::RUB);
+    }
+
+    printf("ParseSpzFile: loading %u gaussians from %s (spzVersion=%d, shDegree=%d, "
+           "source coords=%s -> RUB)\n",
+           numPoints, path.c_str(), fi.version, cloud.shDegree, fi.sourceSystem.c_str());
+    // stdout is block-buffered when redirected, and a viewer is usually ended by
+    // a kill, not a clean exit — an unflushed line is a line nobody ever sees.
+    fflush(stdout);
 
     // SH floats per point (beyond DC, which is stored in cloud.colors). Degree 4
     // is accepted but only its first 45 floats (bands 1–3) fit GsVertex; the
