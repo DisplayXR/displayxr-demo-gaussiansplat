@@ -58,6 +58,8 @@ gaussian_splatting_handle_vk_win.exe --transparent --src=https://host/scene.spz
 | `--rect=X,Y,W,H` | Window rect in **physical** virtual-screen pixels. Clamped into the 3D panel's monitor when the runtime confirms which monitor that is; never snapped. |
 | `--src=<url\|path>` | Scene to load. An `http(s)` URL is downloaded into the cache below; a local path loads directly. |
 | `--vh=<metres>` | Virtual display height the scene was authored at. Overrides the auto-fit guess and does not follow viewport changes. |
+| `--pose=YAW,PITCH[,ZOOM]` | Open on the side of the scene the sender was showing, instead of the loader's yaw-0 anchor. Degrees, in the web SDK's `setPose({yaw, pitch, zoom})` convention; `ZOOM` is a multiplier on the framed fit (default 1). Space returns here. |
+| `--margin=<0..1>` | Fraction of the window the framed scene may fill, replacing the default 80% cap. `--vh` still wins over both. |
 | `--title=<text>` | **Appended** to the window title; never replaces it. |
 | `--type=model\|splat` | Routing hint. `model` is forwarded to the DisplayXR 3D Model Viewer. |
 | `--dpr=<float>` | The launching page's `devicePixelRatio`. Logged only. |
@@ -72,7 +74,7 @@ Flags are `--key=value`, never `--key value`. `--` ends flag parsing.
 The same fields arrive as a query string on the `displayxr-view:` scheme:
 
 ```
-displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&dpr=2.5&title=<pct>&transparent=1&v=1
+displayxr-view://open?src=<pct>&type=model|splat&rect=X,Y,W,H&vh=0.2&pose=-61,-3&margin=0.82&dpr=2.5&title=<pct>&transparent=1&v=1
 ```
 
 `open` is the verb; `v=1` lets this viewer reject a future grammar loudly rather
@@ -89,7 +91,48 @@ registers the same scheme so the browser only asks the user once; whichever one
 the OS starts forwards a URL whose `type=` belongs to a sibling, looked up via
 `HKLM\Software\DisplayXR\Demos\<Viewer>\InstallPath`. A second launch does not
 open a second window — it hands its URL to the running instance over
-`WM_COPYDATA`, which re-applies the rect, the vH and the scene.
+`WM_COPYDATA`, which re-applies the rect, the vH, the pose, the margin and the
+scene.
+
+### Opening pose (`pose=`) and fit margin (`margin=`)
+
+A page that undocks an asset it has already turned should not hand the user a
+window showing a different side of it. `pose=` carries the page's own orbit and
+`margin=` its fit, so the undocked window opens on the picture the user was
+already looking at.
+
+The two viewers rotate opposite things, so **the signs are mirrored** — the page
+(`inline3d-viewer.js`) leaves its camera on +Z and rotates the *subject*
+(`_pivot.rotation.set(pitch, yaw, 0, 'XYZ')`), while this demo leaves the scene
+alone and orbits the *display rig* around it. Turning an object by `R` and
+viewing it from a fixed camera `C` is the same picture as viewing the untouched
+object from `Rᵀ·C`, which works out to
+
+```
+rig yaw   = −pose yaw
+rig pitch = −pose pitch
+scaleFactor = pose zoom          (bigger number = bigger subject, both sides)
+```
+
+Verified against `handbag_gen.spz` at the catalogue's `pose: {yaw: -61,
+pitch: -3}`: the atlas capture reproduces the page's own thumbnail — front
+panel and turn-lock toward the viewer, boxed side gusset on the left — while
+`--pose=61,-3` shows the *back* of the bag with the gusset on the right, i.e.
+the mapping is genuinely oriented rather than accidentally symmetric.
+
+Both viewers upright the splats identically first (the page with
+`mesh.quaternion.set(1,0,0,0)`, the SPZ loader with the source coordinate
+system it honours since the v3/v4 fix), which is what makes a shared convention
+possible at all.
+
+`margin` is the fraction of the window the framed asset may fill — the same
+knob as the built-in 80% cap, so `margin=0.8` and no `margin` mean the same
+thing. `--vh` still overrides the fit entirely, and a viewport change still
+re-derives the base without disturbing the pose or the zoom.
+
+The idle turntable is held off while a launch pose is in effect and lifts on the
+first mouse/keyboard input, so the opening pose is what the user actually sees
+rather than something the screensaver has already spun away from.
 
 ### The policy, in two sentences
 

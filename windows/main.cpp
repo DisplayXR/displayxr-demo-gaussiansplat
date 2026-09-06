@@ -168,6 +168,30 @@ static std::atomic<bool> g_suppressBundledAutoLoad{false};
 // multiplier.
 static std::atomic<bool> g_vhPinned{false};
 static std::atomic<float> g_vhPinnedValue{0.0f};
+// --pose=YAW,PITCH[,ZOOM] pins the ORBIT the sender was showing the asset at,
+// so the undocked window opens on the same side of the object the page did
+// rather than on the loader's yaw=0 anchor. Degrees, in the web SDK's
+// `setPose({yaw, pitch, zoom})` convention; zoom is a multiplier on the framed
+// fit. Like --vh this is a statement about how the ASSET should be presented,
+// so it re-applies on every framing (see ApplyAutoFitForLoadedScene_locked).
+static std::atomic<bool> g_posePinned{false};
+static std::atomic<float> g_poseYawDeg{0.0f};
+static std::atomic<float> g_posePitchDeg{0.0f};
+static std::atomic<float> g_poseZoom{1.0f};
+// --margin=<0..1> is the sender's fit margin: the fraction of the window the
+// framed asset may fill. It replaces this demo's default 80% cap (see
+// kAutoFitFill / AutoFitFill) so the undocked window frames the asset exactly
+// as tightly as the page's tile did. --vh still wins over both.
+static std::atomic<bool> g_marginPinned{false};
+static std::atomic<float> g_marginValue{0.0f};
+// A launch-supplied opening pose is what the user must see when the window
+// appears; the idle turntable would spin off it after 10 s of nobody touching
+// anything. Held until the first real user input (see AutoOrbitSuppressed and
+// the WindowProc input hook that clears it).
+static std::atomic<bool> g_openingPoseHeld{false};
+// A WM_COPYDATA re-launch that changes only the pose/margin (same scene, no
+// load to hang the framing off) sets this; the render thread re-frames.
+static std::atomic<bool> g_reframeRequested{false};
 // One download at a time; a second URL arriving over WM_COPYDATA while one is
 // in flight is refused with a toast rather than queued.
 static std::atomic<bool> g_fetchInFlight{false};
@@ -237,20 +261,38 @@ static std::mutex g_sceneMutex;
 // Fallback vHeight when no scene is loaded or auto-fit hits a degenerate
 // extent. Matches macOS demo's kDefaultVirtualDisplayHeightM (1.5m).
 static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
+// getMainObjectBounds bakes a 1.10x comfort margin into all three extent axes,
+// so the extents we hand dxr::AutoFitVHeight are 1.10x the true object size.
+// Every fill fraction below is therefore multiplied by this to cancel it and
+// net a cap on the TRUE object. (Do not "fix" this by unbaking the comfort in
+// getMainObjectBounds — that multiplier differs single-object vs scene and is
+// shared with other legs.)
+static constexpr float kBoundsComfort = 1.10f;
 // Fill fraction handed to dxr::AutoFitVHeight. The shared rule's default is
-// 0.80 (asset spans 80% of the viewport on its binding axis), but
-// getMainObjectBounds already bakes a 1.10x comfort margin into all three
-// extent axes, so the extents we pass are 1.10x the true object size. Pass
-// 0.88 = 0.80 x 1.10 to cancel that and net an 80% cap of the TRUE object.
-// (Do not "fix" this by unbaking the comfort in getMainObjectBounds — that
-// multiplier differs single-object vs scene and is shared with other legs.)
-static constexpr float kAutoFitFill = 0.88f;
+// 0.80 (asset spans 80% of the viewport on its binding axis); 0.88 = 0.80 x
+// 1.10 nets that 80% cap of the true object.
+static constexpr float kAutoFitFill = 0.80f * kBoundsComfort;
+
+// The fill fraction this framing should use: the launcher's --margin when it
+// sent one (the page calibrated it per asset), else the 80% default. Comfort-
+// compensated the same way in both cases, so --margin=0.80 and the default
+// mean the same thing.
+static float AutoFitFill() {
+    if (g_marginPinned.load(std::memory_order_relaxed)) {
+        const float m = g_marginValue.load(std::memory_order_relaxed);
+        if (m > 0.0f && m <= 1.0f) return m * kBoundsComfort;
+    }
+    return kAutoFitFill;
+}
 
 // Cached auto-fit pose for the currently loaded scene. Reused by Reset
-// so 'Space' returns to the framed pose rather than world origin.
+// so 'Space' returns to the framed pose rather than world origin — including
+// the launch --pose, which IS this scene's framed pose when one was supplied.
 static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
 static float g_fitVHeight   = kFallbackVirtualDisplayHeightM;
 static float g_fitYaw       = 0.0f;
+static float g_fitPitch     = 0.0f;
+static float g_fitZoom      = 1.0f;
 static std::atomic<bool> g_fitValid{false};
 
 // Refit state (displayxr-common common/auto_fit_canvas.h). vHeight is a
@@ -299,6 +341,57 @@ static bool GetAutoFitViewport(float& outW, float& outH) {
     return g_autoFitCanvas.Viewport(fallbackW, fallbackH, outW, outH);
 }
 
+// Fold a launch --pose into the cached framed pose (g_fitYaw/g_fitPitch/
+// g_fitZoom), which is both what the first post-load frame lands on and what
+// Space returns to. No-op when no --pose was supplied.
+//
+// SIGN CONVENTION — the two viewers rotate opposite things.
+//
+// The page (`inline3d-viewer.js`) leaves the camera on +Z looking at the
+// origin and rotates the SUBJECT: `_pivot.rotation.set(pitch, yaw, 0, 'XYZ')`,
+// i.e. R = Rx(pitch)·Ry(yaw) applied to the object. This demo does the
+// opposite — the object never moves and the display rig orbits it, with the
+// rig's eye at `centre + ez·(sin yaw·cos pitch, −sin pitch, cos yaw·cos pitch)`
+// (the rig looks down its own −Z; see the HUD's fwd vector).
+//
+// Viewing an object turned by R from a fixed camera C is the same picture as
+// viewing the untouched object from Rᵀ·C, and
+//
+//     Rᵀ·(0,0,d) = d·(−cos pitch·sin yaw,  sin pitch,  cos pitch·cos yaw)
+//
+// which matches this demo's eye only for yaw_rig = −yaw_page and
+// pitch_rig = −pitch_page. Hence the negation on both axes. Both viewers
+// upright the splats the same way first — the page with
+// `mesh.quaternion.set(1,0,0,0)` (180° about X), the SPZ loader with the
+// source coordinate system it now honours (#103) — so the two frames agree
+// before the orbit is applied, which is what makes a shared convention
+// possible at all.
+//
+// Zoom is a multiplier on the framed fit in both: the page scales the pivot by
+// `_fitScale * _zoom`, and here the render path divides the base vHeight by
+// `viewParams.scaleFactor`, so a bigger number means a bigger subject either
+// way. Keeping it in scaleFactor (rather than folding it into vHeight) is what
+// lets RefitForViewport move the base on a viewport change without disturbing
+// it.
+static void ApplyLaunchPoseToFit() {
+    if (!g_posePinned.load(std::memory_order_relaxed)) return;
+    constexpr float kDeg2Rad = 0.01745329252f;
+    const float yawDeg = g_poseYawDeg.load(std::memory_order_relaxed);
+    const float pitchDeg = g_posePitchDeg.load(std::memory_order_relaxed);
+    const float zoom = g_poseZoom.load(std::memory_order_relaxed);
+    g_fitYaw = -yawDeg * kDeg2Rad;
+    g_fitPitch = -pitchDeg * kDeg2Rad;
+    g_fitZoom = (zoom > 0.01f) ? zoom : 1.0f;
+    LOG_INFO("Launch --pose applied: page yaw=%.1fdeg pitch=%.1fdeg zoom=%.3f -> "
+             "rig yaw=%.1fdeg pitch=%.1fdeg scaleFactor=%.3f (mirrored: the page turns "
+             "the subject, the rig orbits it)",
+             yawDeg, pitchDeg, zoom,
+             g_fitYaw * 57.2957795f, g_fitPitch * 57.2957795f, g_fitZoom);
+    // The turntable must not spin off the opening pose while nobody has
+    // touched anything. Re-armed on every framing, cleared by the first input.
+    g_openingPoseHeld.store(true, std::memory_order_relaxed);
+}
+
 // Compute robust scene bounds (5th–95th percentile per axis) and stage
 // new display-rig pose + vHeight on g_inputState. Display orientation is
 // kept identity (forward = world −Z): splats have no canonical front, and
@@ -319,7 +412,8 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // horizontally. See kAutoFitFill for why fill is 0.88, not 0.80.
         float viewportW = 0.0f, viewportH = 0.0f;
         const bool fromCanvas = GetAutoFitViewport(viewportW, viewportH);
-        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, kAutoFitFill);
+        const float fill = AutoFitFill();
+        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, fill);
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -350,16 +444,28 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // SuperSplat-authored scenes already face −Z at yaw=0). Matches
         // macOS:1407 — the user can drag with LMB if a particular asset's
         // authored orientation is off.
+        //
+        // ...unless the launcher told us which side it was showing. --pose is
+        // the page's own orbit, and the two conventions are MIRRORED: the web
+        // viewer rotates the SUBJECT (`_pivot.rotation.set(pitch, yaw, 0,
+        // 'XYZ')` with a fixed camera on +Z), while this demo rotates the
+        // CAMERA rig about the subject. Turning the object +yaw and turning
+        // the camera +yaw show opposite sides, so the sign flips on both axes
+        // — see ApplyLaunchPoseToFit.
         g_fitYaw = 0.0f;
+        g_fitPitch = 0.0f;
+        g_fitZoom = 1.0f;
+        ApplyLaunchPoseToFit();
         const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
         const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
         LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
+                 "viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s fill=%.2f%s vHeight=%.3f yaw=%.0fdeg",
                  center[0], center[1], center[2],
                  extent[0], extent[1], extent[2],
                  viewportW, viewportH, fromCanvas ? "runtime canvas, m" : "client rect, px",
                  aspect, widthBound ? "width" : "height",
-                 kAutoFitFill, vh, g_fitYaw * 57.2957795f);
+                 fill, g_marginPinned.load(std::memory_order_relaxed) ? " (--margin)" : "",
+                 vh, g_fitYaw * 57.2957795f);
     }
     g_fitValid.store(ok);
 
@@ -368,9 +474,11 @@ static void ApplyAutoFitForLoadedScene_locked() {
     g_inputState.cameraPosY = ok ? g_fitCenter[1] : 0.0f;
     g_inputState.cameraPosZ = ok ? g_fitCenter[2] : 0.0f;
     g_inputState.yaw = ok ? g_fitYaw : 0.0f;
-    g_inputState.pitch = 0.0f;
+    g_inputState.pitch = ok ? g_fitPitch : 0.0f;
     g_inputState.viewParams.virtualDisplayHeight = ok ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
-    g_inputState.viewParams.scaleFactor = 1.0f;
+    // Zoom lives here, not in vHeight — see ApplyLaunchPoseToFit. 1.0 when no
+    // --pose was supplied, i.e. exactly the previous behavior.
+    g_inputState.viewParams.scaleFactor = ok ? g_fitZoom : 1.0f;
 
     // Per-format orientation correction is now done at load time (PLY loader
     // converts RDF+X-mirror → canonical RUB; SPZ loader uses RUB natively).
@@ -428,7 +536,7 @@ static void RefitForViewport(float dtSeconds) {
     const bool fromCanvas = GetAutoFitViewport(vpW, vpH);
     const float aspect = (vpH > 0.0f) ? (vpW / vpH) : 0.0f;
     if (dxr::AutoFitAspectChanged(g_fitAspect.load(std::memory_order_relaxed), aspect)) {
-        const float vh = dxr::AutoFitVHeight(extW, extH, vpW, vpH, kAutoFitFill);
+        const float vh = dxr::AutoFitVHeight(extW, extH, vpW, vpH, AutoFitFill());
         if (vh > 1e-3f) {
             // Retarget rather than restart: a resize that settles in two steps
             // must not snap back to where it started.
@@ -1065,12 +1173,36 @@ static void ApplyLaunchArgsLive(HWND hwnd, const dxr::LaunchArgs& a) {
         g_inputState.viewParams.virtualDisplayHeight = a.vh;
         LOG_INFO("WM_COPYDATA vh: %.3f m", a.vh);
     }
+    // --margin and --pose are properties of the ASSET the second launch is
+    // handing us, so they are staged BEFORE the load below: the framing that
+    // runs at the end of that load is the one that must consume them.
+    if (a.hasMargin) {
+        g_marginPinned.store(true, std::memory_order_relaxed);
+        g_marginValue.store(a.margin, std::memory_order_relaxed);
+        LOG_INFO("WM_COPYDATA margin: %.3f", a.margin);
+    }
+    if (a.hasPose) {
+        g_poseYawDeg.store(a.poseYawDeg, std::memory_order_relaxed);
+        g_posePitchDeg.store(a.posePitchDeg, std::memory_order_relaxed);
+        g_poseZoom.store(a.poseZoom, std::memory_order_relaxed);
+        g_posePinned.store(true, std::memory_order_relaxed);
+        LOG_INFO("WM_COPYDATA pose: yaw=%.1fdeg pitch=%.1fdeg zoom=%.3f",
+                 a.poseYawDeg, a.posePitchDeg, a.poseZoom);
+    }
+    const bool willLoad = a.srcKind != dxr::LaunchSrcKind::None || !a.positionalPath.empty();
     if (a.srcKind == dxr::LaunchSrcKind::Url) {
         StartUrlFetch(hwnd, a.src, a.maxBytes, a.noCache);
     } else if (a.srcKind == dxr::LaunchSrcKind::LocalPath) {
         QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.src));
     } else if (!a.positionalPath.empty()) {
         QueueSceneLoad(hwnd, dxr::NarrowPathForFopen(a.positionalPath));
+    }
+    // Re-pointing the SAME scene at a new pose/margin: no load will run, so
+    // nothing would consume what we just staged. Ask the render thread to
+    // re-frame — this is the window thread, and framing reads the renderer's
+    // splat data, which only the render thread may touch.
+    if (!willLoad && (a.hasPose || a.hasMargin) && g_fitValid.load()) {
+        g_reframeRequested.store(true, std::memory_order_relaxed);
     }
 }
 
@@ -1157,7 +1289,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     {
         std::lock_guard<std::mutex> lock(g_inputMutex);
+        // The shared handler stamps lastInputTimeSec on every message it
+        // treats as real user input, so a change in it is the cheapest honest
+        // "the user touched something" signal there is — no second opinion
+        // about which messages count. First such touch releases the launch
+        // --pose hold on the idle turntable (see AutoOrbitSuppressed).
+        const double inputStampBefore = g_inputState.lastInputTimeSec;
         UpdateInputState(g_inputState, msg, wParam, lParam);
+        if (g_inputState.lastInputTimeSec != inputStampBefore) {
+            g_openingPoseHeld.store(false, std::memory_order_relaxed);
+        }
     }
 
     switch (msg) {
@@ -1515,7 +1656,14 @@ static bool IsStandaloneSession(const XrSessionManager* xr) {
 //
 // The modelviewer's sibling gate has a second arm for a playing animation clip;
 // splat scenes carry no clips, so there is nothing to hold against here.
+// Second arm: a launch --pose. The sender picked the side of the object the
+// window must open on, so the turntable would quietly undo the one thing the
+// launch asked for after 10 s of nobody touching anything. This does not
+// depend on transparency — a framed (`transparent=0`) undock is just as much a
+// "show it like this" statement — and it lifts on the first user input, which
+// is the point at which the opening pose has served its purpose.
 static bool AutoOrbitSuppressed(const XrSessionManager* xr) {
+    if (g_openingPoseHeld.load(std::memory_order_relaxed)) return true;
     return g_transparentBg.load() && IsStandaloneSession(xr);
 }
 
@@ -1646,6 +1794,15 @@ static void RenderThreadFunc(
             }
         }
 
+        // A WM_COPYDATA re-launch that changed only the pose/margin, with no
+        // new scene to frame. Same entry point as a load, so there is exactly
+        // one place that decides what "framed" means.
+        if (g_reframeRequested.exchange(false, std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            LOG_INFO("Re-framing the loaded scene for a new launch pose/margin");
+            ApplyAutoFitForLoadedScene_locked();
+        }
+
         // Rendering mode requests (V/mode-button=cycle, 0-8=absolute) through the
         // shared ModeSwitch sequencer: eases viewParams.ipdFactor around the switch
         // and fires xrRequestDisplayRenderingModeDXR on the right frame. Ramped ipd
@@ -1698,7 +1855,14 @@ static void RenderThreadFunc(
             inputSnapshot.cameraPosY = g_fitCenter[1];
             inputSnapshot.cameraPosZ = g_fitCenter[2];
             inputSnapshot.yaw = g_fitYaw;
+            inputSnapshot.pitch = g_fitPitch;
             inputSnapshot.viewParams.virtualDisplayHeight = g_fitVHeight;
+            // The launch --pose's zoom is part of the framed pose too, so
+            // Space returns to the pose the window opened at rather than to a
+            // 1.0 the launcher never asked for. Without a --pose this is 1.0,
+            // which is what the shared reset already produced.
+            inputSnapshot.viewParams.scaleFactor = g_fitZoom;
+            renderPitch = inputSnapshot.pitch;
             // Land any in-flight refit on the reset target so the animation
             // cannot drag the base back off it over the next frames.
             g_fitTransition.start(g_fitVHeight, g_fitVHeight, 0.0f);
@@ -2643,14 +2807,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // survives. One parse, one policy — see displayxr-common/common/launch_args.h.
     g_launch = dxr::ParseLaunchArgsFromCommandLine();
     LOG_INFO("Launch: transparent=%d rect=%d(%d,%d %dx%d) src=%s(%s) positional='%s' "
-             "vh=%d(%.3f) dpr=%d(%.2f) type='%s' title='%s' protocol=%d maxBytes=%llu noCache=%d",
+             "vh=%d(%.3f) pose=%d(%.1f,%.1f,%.3f) margin=%d(%.3f) "
+             "dpr=%d(%.2f) type='%s' title='%s' protocol=%d maxBytes=%llu noCache=%d",
              g_launch.transparent ? 1 : 0, g_launch.hasRect ? 1 : 0,
              g_launch.rectX, g_launch.rectY, g_launch.rectW, g_launch.rectH,
              g_launch.src.c_str(),
              g_launch.srcKind == dxr::LaunchSrcKind::Url ? "url"
                  : g_launch.srcKind == dxr::LaunchSrcKind::LocalPath ? "path" : "none",
              g_launch.positionalPath.c_str(),
-             g_launch.hasVh ? 1 : 0, g_launch.vh, g_launch.hasDpr ? 1 : 0, g_launch.dpr,
+             g_launch.hasVh ? 1 : 0, g_launch.vh,
+             g_launch.hasPose ? 1 : 0, g_launch.poseYawDeg, g_launch.posePitchDeg,
+             g_launch.poseZoom,
+             g_launch.hasMargin ? 1 : 0, g_launch.margin,
+             g_launch.hasDpr ? 1 : 0, g_launch.dpr,
              g_launch.type.c_str(), g_launch.title.c_str(), g_launch.fromProtocol ? 1 : 0,
              (unsigned long long)g_launch.maxBytes, g_launch.noCache ? 1 : 0);
     for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
@@ -2729,6 +2898,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     if (g_launch.hasVh) {
         g_vhPinned.store(true, std::memory_order_relaxed);
         g_vhPinnedValue.store(g_launch.vh, std::memory_order_relaxed);
+    }
+    if (g_launch.hasMargin) {
+        g_marginPinned.store(true, std::memory_order_relaxed);
+        g_marginValue.store(g_launch.margin, std::memory_order_relaxed);
+    }
+    if (g_launch.hasPose) {
+        g_poseYawDeg.store(g_launch.poseYawDeg, std::memory_order_relaxed);
+        g_posePitchDeg.store(g_launch.posePitchDeg, std::memory_order_relaxed);
+        g_poseZoom.store(g_launch.poseZoom, std::memory_order_relaxed);
+        g_posePinned.store(true, std::memory_order_relaxed);
     }
     if (g_launch.srcKind != dxr::LaunchSrcKind::None || !g_launch.positionalPath.empty()) {
         g_suppressBundledAutoLoad.store(true, std::memory_order_relaxed);
