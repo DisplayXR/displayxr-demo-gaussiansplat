@@ -155,29 +155,23 @@ class MainActivity : NativeActivity() {
         }
     }
 
-    // Wake the DisplayXR runtime package before xrCreateInstance. After a
-    // force-stop / fresh install the runtime is in Android's "stopped" state,
-    // so the OpenXR loader's broker lookup excludes it → XR_ERROR_RUNTIME_
-    // UNAVAILABLE on a cold tap. Sending an explicit intent with
-    // FLAG_INCLUDE_STOPPED_PACKAGES clears the stopped flag so the broker
-    // becomes discoverable. (Test-harness convenience — real apps assume the
-    // runtime was already launched once.)
-    private fun wakeRuntime() {
-        try {
-            val intent = Intent("org.khronos.openxr.OpenXRRuntimeService").apply {
-                `package` = "org.freedesktop.monado.openxr_runtime.out_of_process"
-                addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
-            }
-            startService(intent)
-        } catch (_: Throwable) {
-            // Best-effort; the native side retries xrCreateInstance.
-        }
-    }
+    // The runtime wake used to live here, as a private wakeRuntime() using
+    // startService with a silent catch. It never worked: startService is refused
+    // from a background context by Android 8+ limits, and on OEM builds that block
+    // "related start" of another package's components no service API works at all --
+    // but the swallowed exception made it look like it did. All five demos shipped
+    // that same code, which is why it stayed invisible for so long.
+    //
+    // It is now the displayxr_client library, which ships with the runtime and starts
+    // the runtime's no-display WakeActivity -- the one gesture those OEM policies
+    // permit. The library registers itself through androidx.startup, so there is
+    // deliberately NOTHING to call from here: adding a call site back is how the five
+    // copies happened. See runtime#1453 / #1454.
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         // Do NOT lock orientation — let all four orientations through.
         requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
-        wakeRuntime()
         super.onCreate(savedInstanceState)
         pushRotation()
         (getSystemService(Context.DISPLAY_SERVICE) as DisplayManager)
