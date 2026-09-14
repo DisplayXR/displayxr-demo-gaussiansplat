@@ -2430,6 +2430,19 @@ static void RenderThreadFunc(
                                 hasGsScene = g_gsRenderer.hasScene();
                             }
 
+                            // #112 / XR_DXR_depth_budget v4: arm the preprocess stage's
+                            // pre-cull silhouette scatter whenever a content MASK could be
+                            // chained this frame. The mask must be the silhouette as it
+                            // would render at UNRESTRICTED budget; the rendered alpha is
+                            // not that, because clipFar[] below culls splats per-splat in
+                            // preprocess, so an alpha-derived mask is a function of the
+                            // budget the runtime published last frame -> the rear clip
+                            // oscillates (runtime#1470). Armed by the SESSION condition,
+                            // never by "is the clip currently engaged" — a source that
+                            // changed shape when the clip engaged would jitter on its own.
+                            g_gsRenderer.setSilhouetteCoverage(
+                                hasContentMaskV3 && g_transparentBg.load() && g_borderless.load());
+
                             if (hasGsScene) {
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Row-major eye placement in the atlas; for 2×1 SBS
@@ -2558,62 +2571,86 @@ static void RenderThreadFunc(
                                                    (lastV % cols) * renderW, (lastV / cols) * renderH,
                                                    eyeCount > 1);
 
-                                    // #100 v3: reduce the click-through silhouette g_punch just
-                                    // computed into a XR_DXR_depth_budget content-mask ROI
-                                    // (brief §6) — this app already derives exactly this
-                                    // artefact for SetWindowRgn, so no second alpha readback.
-                                    // Only when the RUNTIME has advertised v3 (hasContentMaskV3);
-                                    // a v2 runtime keeps the v2 content-bounds rect as its ROI.
-                                    // coverage() lags one update() call and returns nullptr
-                                    // until the first region has actually been applied — skip
-                                    // the mask this frame rather than chain stale/absent data;
-                                    // the v2 bounds chain above is untouched either way.
-                                    if (hasContentMaskV3) {
-                                        const uint8_t* cov = g_punch.coverage();
-                                        const uint32_t covW = g_punch.coverageWidth();
-                                        const uint32_t covH = g_punch.coverageHeight();
-                                        if (cov != nullptr && covW > 0 && covH > 0 &&
-                                            windowW > 0 && windowH > 0) {
-                                            // ~1/4 of the coverage raster, capped at the
-                                            // extension's recommended ceiling (content_mask.h) —
-                                            // finer buys nothing, the runtime's own disparity-band
-                                            // dilation erases sub-cell detail anyway.
-                                            uint32_t maskW = covW / 4;
-                                            uint32_t maskH = covH / 4;
-                                            if (maskW < 1) maskW = 1;
-                                            if (maskH < 1) maskH = 1;
-                                            if (maskW > dxr::kContentMaskRecommendedCells)
-                                                maskW = dxr::kContentMaskRecommendedCells;
-                                            if (maskH > dxr::kContentMaskRecommendedCells)
-                                                maskH = dxr::kContentMaskRecommendedCells;
+                                }
+                                // #100 v3 / #112 v4: chain a XR_DXR_depth_budget content-
+                                // mask ROI (brief §6). Only when the RUNTIME has advertised
+                                // v3 (hasContentMaskV3); a v2 runtime keeps the v2
+                                // content-bounds rect as its ROI.
+                                //
+                                // The mask does NOT come from g_punch. g_punch's coverage is
+                                // the post-clip rendered alpha — correct for SetWindowRgn
+                                // (the window must not stay clickable where nothing is
+                                // drawn) and wrong for the budget, because clipFar culls
+                                // splats in the preprocess stage, so that silhouette is a
+                                // smooth monotone function of the budget the runtime
+                                // published last frame. Measuring it closed the loop that
+                                // made the rear clip oscillate every ~0.6-1.1 s (#112,
+                                // runtime#1470); spec v4 asks for the silhouette AS IT WOULD
+                                // RENDER AT UNRESTRICTED BUDGET instead. That is what
+                                // readSilhouetteCoverage() returns — scattered by
+                                // preprocess.comp BEFORE its far cull, unioned over this
+                                // frame's views, and cleared by the read itself.
+                                //
+                                // Unavailable (not armed, no scene, no view drawn yet) ->
+                                // chain nothing and let the runtime fall back to the v2
+                                // bounds, which are clip-independent by construction: a
+                                // coarser ROI, never an oscillating one.
+                                if (hasContentMaskV3) {
+                                    // Static: read once per frame into a buffer that
+                                    // outlives this scope (see s_contentMaskCells below).
+                                    static std::vector<uint8_t> s_silhouetteCov;
+                                    const uint32_t covW = g_gsRenderer.silhouetteCoverageWidth();
+                                    const uint32_t covH = g_gsRenderer.silhouetteCoverageHeight();
+                                    const bool covOk =
+                                        g_gsRenderer.readSilhouetteCoverage(s_silhouetteCov) &&
+                                        covW > 0 && covH > 0 &&
+                                        s_silhouetteCov.size() >= (size_t)covW * (size_t)covH;
+                                    const uint8_t* cov = covOk ? s_silhouetteCov.data() : nullptr;
+                                    if (cov != nullptr && windowW > 0 && windowH > 0) {
+                                        // 1:1 with the coverage raster, capped at the
+                                        // extension's recommended ceiling (content_mask.h).
+                                        // Unlike g_punch's 4-px-per-texel alpha raster this
+                                        // one is ALREADY coarse (~1 texel per 16 render px,
+                                        // <=128 per side), and the runtime's own
+                                        // disparity-band dilation erases anything finer, so
+                                        // there is nothing left to downsample away.
+                                        uint32_t maskW = covW;
+                                        uint32_t maskH = covH;
+                                        if (maskW < 1) maskW = 1;
+                                        if (maskH < 1) maskH = 1;
+                                        if (maskW > dxr::kContentMaskRecommendedCells)
+                                            maskW = dxr::kContentMaskRecommendedCells;
+                                        if (maskH > dxr::kContentMaskRecommendedCells)
+                                            maskH = dxr::kContentMaskRecommendedCells;
 
-                                            // Static: ChainContentMask stores a pointer into this
-                                            // buffer that must stay valid through xrEndFrame further
-                                            // down this same frame; a function-local static (like
-                                            // s_contentBoundsChain above) avoids a dangling temporary
-                                            // without adding file-scope state.
-                                            static std::vector<uint8_t> s_contentMaskCells;
-                                            static XrContentMaskDXR s_contentMaskChain{};
-                                            // srcRectPx = nullptr: g_punch's coverage raster already
-                                            // covers the whole window client rect (no 3D zones in
-                                            // this app), matching ContentMaskFromCoverage's default.
-                                            if (dxr::ContentMaskFromCoverage(cov, covW, covH, covW,
-                                                    windowW, windowH, /*srcRectPx=*/nullptr,
-                                                    maskW, maskH, s_contentMaskCells) &&
-                                                dxr::ContentMaskCoverageCells(s_contentMaskCells) > 0) {
-                                                // Chain the mask FIRST, then let it point at
-                                                // whatever frameEndNext already carries (the v2
-                                                // content-bounds struct, when present) — bounds
-                                                // stays chained regardless (brief §6.4 "keep bounds
-                                                // always"); the runtime's own ROI precedence (mask,
-                                                // then bounds) doesn't depend on chain order.
-                                                XrFrameEndInfo maskChainProxy{};
-                                                maskChainProxy.next = frameEndNext;
-                                                if (dxr::ChainContentMask(maskChainProxy, s_contentMaskChain,
-                                                        s_contentMaskCells, maskW, maskH)) {
-                                                    frameEndNext = maskChainProxy.next;
-                                                    haveContentMask = true;
-                                                }
+                                        // Static: ChainContentMask stores a pointer into this
+                                        // buffer that must stay valid through xrEndFrame further
+                                        // down this same frame; a function-local static (like
+                                        // s_contentBoundsChain above) avoids a dangling temporary
+                                        // without adding file-scope state.
+                                        static std::vector<uint8_t> s_contentMaskCells;
+                                        static XrContentMaskDXR s_contentMaskChain{};
+                                        // srcRectPx = nullptr: the coverage raster spans one
+                                        // whole view tile, which the runtime maps to the whole
+                                        // window client rect (no 3D zones in this app) —
+                                        // matching ContentMaskFromCoverage's default, and the
+                                        // same assumption g_punch's raster was used under.
+                                        if (dxr::ContentMaskFromCoverage(cov, covW, covH, covW,
+                                                windowW, windowH, /*srcRectPx=*/nullptr,
+                                                maskW, maskH, s_contentMaskCells) &&
+                                            dxr::ContentMaskCoverageCells(s_contentMaskCells) > 0) {
+                                            // Chain the mask FIRST, then let it point at
+                                            // whatever frameEndNext already carries (the v2
+                                            // content-bounds struct, when present) — bounds
+                                            // stays chained regardless (brief §6.4 "keep bounds
+                                            // always"); the runtime's own ROI precedence (mask,
+                                            // then bounds) doesn't depend on chain order.
+                                            XrFrameEndInfo maskChainProxy{};
+                                            maskChainProxy.next = frameEndNext;
+                                            if (dxr::ChainContentMask(maskChainProxy, s_contentMaskChain,
+                                                    s_contentMaskCells, maskW, maskH)) {
+                                                frameEndNext = maskChainProxy.next;
+                                                haveContentMask = true;
                                             }
                                         }
                                     }
