@@ -115,6 +115,34 @@ struct GsAdrenoRenderer {
                    float clipFarViewSpace = 0.0f,
                    float clipFadeFrac = 0.0f);
 
+    // ── Pre-cull silhouette coverage (#112, XR_DXR_depth_budget v4) ──────
+    //
+    // Mirror of GsRenderer's API, same contract — see gs_renderer.h for the
+    // full rationale. A small occupancy raster of where the gaussians land on
+    // screen as they would render at UNRESTRICTED rear-depth budget, written
+    // by adreno_preprocess.comp BEFORE its far cull, so the depth-budget
+    // content mask is not a function of the budget the runtime just published.
+    //
+    // Windows-on-ARM is the leg that needs it here (this renderer is the TBDR
+    // one, and that is a transparent-window Windows target). Android never
+    // arms it: there is no background preview there and the budget is pinned
+    // clipped, so the Android path is bit-for-bit unchanged.
+    void setSilhouetteCoverage(bool on) { silhouetteOn_ = on; }
+    bool silhouetteCoverage() const { return silhouetteOn_; }
+    uint32_t silhouetteCoverageWidth() const { return coverageW_; }
+    uint32_t silhouetteCoverageHeight() const { return coverageH_; }
+
+    // Read the accumulated coverage and clear it for the next frame in one
+    // submission; `out` becomes width*height bytes, row-major, top-left
+    // origin, nonzero = covered. Call once per frame after the last view: the
+    // image then holds the union over exactly that frame's views. False when
+    // no scene is loaded or the coverage was never armed.
+    //
+    // NOTE: this DRAINS THE QUEUE, which collapses this renderer's frame ring
+    // for that frame. That is the price of a synchronous mask and the reason
+    // nothing calls it unless the app is actually chaining one.
+    bool readSilhouetteCoverage(std::vector<uint8_t>& out);
+
     void cleanup();
     ~GsAdrenoRenderer();
 
@@ -186,6 +214,17 @@ private:
     // ── Internal scaled render target (per slot: draw target + blit source) ──
     GsImage renderImage_[kFrameRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
 
+    // ── Pre-cull silhouette coverage (#112) ──
+    // Single image, NOT per slot: the readback drains the queue before it
+    // copies, so "everything submitted since the last read" is a well-defined
+    // accumulation window, and the union across the frame's views is the thing
+    // we actually want. ~8 KB.
+    GsImage coverageImage_;                 // R8_UINT, coverageW_ × coverageH_
+    GsBuffer coverageHost_;                 // host-visible readback staging
+    uint32_t coverageW_ = 0;
+    uint32_t coverageH_ = 0;
+    bool silhouetteOn_ = false;
+
     // ── Compute pipelines (5) ──
     VkPipeline pipeCov3d_ = VK_NULL_HANDLE;
     VkPipeline pipePreprocess_ = VK_NULL_HANDLE;
@@ -234,6 +273,9 @@ private:
     // ── Private helpers ──
     bool createSceneResources();
     void dispatchCov3d();
+    // Record UNDEFINED -> clear-to-zero -> GENERAL for coverageImage_ into an
+    // already-begun command buffer.
+    void cmdInitCoverageImage(VkCommandBuffer cmd);
     void updateUniforms(uint32_t slot,
                         const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
