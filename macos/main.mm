@@ -2676,6 +2676,54 @@ int main(int argc, char** argv) {
                                     g_input.yaw, g_input.pitch);
                             }
 
+                            // ── #112 coverage self-test (macOS only, env-gated) ──
+                            // DXR_GAUSS_MASKCOV_TEST=1 arms the preprocess stage's
+                            // pre-cull silhouette scatter and dumps what it produced.
+                            // The real consumer of this raster is the Windows
+                            // transparent leg's XR_DXR_depth_budget content mask — the
+                            // one leg a macOS box cannot reach — so this hook is what
+                            // makes the new storage image, the scatter and the readback
+                            // exercisable at all. The ASCII dump matters as much as the
+                            // count: an upside-down silhouette has exactly the same
+                            // covered-texel total as a right-way-up one.
+                            {
+                                static const bool s_covTest =
+                                    (getenv("DXR_GAUSS_MASKCOV_TEST") != nullptr);
+                                if (s_covTest) {
+                                    g_gsRenderer.setSilhouetteCoverage(true);
+                                    static std::vector<uint8_t> s_cov;
+                                    if (g_gsRenderer.readSilhouetteCoverage(s_cov)) {
+                                        const uint32_t cw = g_gsRenderer.silhouetteCoverageWidth();
+                                        const uint32_t ch = g_gsRenderer.silhouetteCoverageHeight();
+                                        size_t on = 0;
+                                        for (uint8_t v : s_cov) if (v) ++on;
+                                        if ((g_frameCount % 120) == 0) {
+                                            LOG_INFO("maskcov: %ux%u, %zu/%zu texels (%.1f%%) covered "
+                                                     "(union over %d view(s))",
+                                                     cw, ch, on, s_cov.size(),
+                                                     s_cov.empty() ? 0.0
+                                                         : 100.0 * (double)on / (double)s_cov.size(),
+                                                     eyeCount);
+                                            // Row-major, top-left origin — printed in that
+                                            // order, so the dump reads the way the scene looks.
+                                            const uint32_t stepY = (ch + 23u) / 24u;
+                                            const uint32_t stepX = (cw + 63u) / 64u;
+                                            for (uint32_t y = 0; y < ch; y += stepY) {
+                                                std::string row;
+                                                for (uint32_t x = 0; x < cw; x += stepX) {
+                                                    bool any = false;
+                                                    for (uint32_t yy = y; yy < y + stepY && yy < ch && !any; ++yy)
+                                                        for (uint32_t xx = x; xx < x + stepX && xx < cw && !any; ++xx)
+                                                            any = s_cov[(size_t)yy * cw + xx] != 0;
+                                                    row += any ? '#' : '.';
+                                                }
+                                                LOG_INFO("maskcov| %s", row.c_str());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // 'I' key: snapshot the multi-view atlas the runtime
                             // composes for this session via xrCaptureAtlasDXR
                             // (XR_DXR_atlas_capture, W6 of #396). The runtime owns
