@@ -42,6 +42,17 @@ layout (std430, set = 1, binding = 1) writeonly buffer VertexAttributes {
     VertexAttribute attr[];
 };
 
+// Pre-cull silhouette coverage (#112, XR_DXR_depth_budget v4) — mirror of
+// preprocess.comp's binding 3 (this set has no tiles_overlap buffer, so the
+// next free binding here is 2). One texel per ~16x16 render pixels; the host
+// clears it as part of its readback, so it accumulates the union over every
+// view drawn since the last read. Always bound; armed by the push constant.
+layout (set = 1, binding = 2, r8ui) uniform writeonly uimage2D coverage_img;
+
+layout (push_constant) uniform CoveragePush {
+    uint coverage_on;   // 0 = skip the scatter entirely
+};
+
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 mat3 get_projection_jacobian_approx(vec3 t) {
@@ -125,6 +136,43 @@ float ndc2Pix(float v, int S) {
     return ((v + 1.0) * S - 1.0) * 0.5;
 }
 
+// Mark this gaussian's screen-space bounding box in the coverage image.
+//
+// #112 / XR_DXR_depth_budget v4: the app's content MASK must be the silhouette
+// as it would render at UNRESTRICTED rear-depth budget. Deriving it from the
+// rendered alpha instead makes the measured region a function of the clip the
+// runtime published last frame — the runtime then measures the background it
+// just caused to be revealed, and the rear clip oscillates. So this is called
+// BEFORE the far cull below; nothing on this path may read clip_far.
+//
+// Cost: the raster is ~1 texel per 16x16 render pixels, i.e. 1/256th of the
+// area the gaussian's own instanced quad already rasterises and blends in
+// tile memory. A gaussian small enough to fall inside one texel — which is
+// most of them — costs exactly one store.
+// uv/radii are in the SCALED render-pixel space (`width`/`height`), y already
+// flipped by the caller, so the image is row-major TOP-LEFT origin — the
+// convention dxr::ContentMaskFromCoverage expects.
+void scatter_coverage(vec2 uv, float radii) {
+    ivec2 cs = imageSize(coverage_img);
+    vec2 s = vec2(float(cs.x) / float(width), float(cs.y) / float(height));
+    vec2 f0 = (uv - vec2(radii)) * s;
+    vec2 f1 = (uv + vec2(radii)) * s;
+    // Entirely off the raster — clamping such a box would wrongly mark an edge
+    // texel, which is a lie in the direction the runtime trusts.
+    if (f1.x < 0.0 || f1.y < 0.0 || f0.x > float(cs.x) || f0.y > float(cs.y)) {
+        return;
+    }
+    ivec2 lo = clamp(ivec2(floor(f0)), ivec2(0), cs - ivec2(1));
+    ivec2 hi = clamp(ivec2(floor(f1)), ivec2(0), cs - ivec2(1));
+    for (int y = lo.y; y <= hi.y; ++y) {
+        for (int x = lo.x; x <= hi.x; ++x) {
+            // Every writer stores the same value, so the races are benign and
+            // no atomic is needed.
+            imageStore(coverage_img, ivec2(x, y), uvec4(1u, 0u, 0u, 0u));
+        }
+    }
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
     if (index >= vertices.length()) {
@@ -146,6 +194,11 @@ void main() {
     // near/far clipping is done here as explicit p_view.z culls — see
     // preprocess.comp for the full rationale). near is SOFT (opacity ramp over
     // [clip_near, clip_near*(1+frac)]); far is HARD.
+    //
+    // #112: the FAR cull sits below the coverage scatter, not here — see
+    // preprocess.comp for the full rationale. Every test in between is a plain
+    // `return` and every attr[] write is past the last cull, so the rendered
+    // result is unchanged.
     float opacity_scale = 1.0f;
     if (clip_near > 0.0f) {
         if (p_view.z < clip_near) {
@@ -154,11 +207,6 @@ void main() {
         if (clip_fade_frac > 0.0f) {
             float near_fade_end = clip_near * (1.0f + clip_fade_frac);
             opacity_scale *= smoothstep(clip_near, near_fade_end, p_view.z);
-        }
-    }
-    if (clip_far > 0.0f) {
-        if (p_view.z > clip_far) {
-            return;
         }
     }
     if (opacity_scale <= 1.0f / 255.0f) {
@@ -189,6 +237,19 @@ void main() {
 
     // Vulkan Y-down raster flip (W7, #396) — negate ndc.y mapping to pixel.
     vec2 uv = vec2(ndc2Pix(ndc.x, int(width)), ndc2Pix(-ndc.y, int(height)));
+
+    // ── Unrestricted-budget silhouette (#112) — BEFORE the far cull ──────
+    if (coverage_on != 0u) {
+        scatter_coverage(uv, radii);
+    }
+
+    // Far clip — HARD cut. Everything below shapes what is actually RENDERED;
+    // the coverage image is already written, so the mask cannot depend on it.
+    if (clip_far > 0.0f) {
+        if (p_view.z > clip_far) {
+            return;
+        }
+    }
 
     attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
     attr[index].conic_opacity.w = vertices[index].scale_opacity.w * opacity_scale;

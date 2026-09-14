@@ -151,6 +151,45 @@ struct GsRenderer {
                    float clipFarViewSpace = 0.0f,
                    float clipFadeFrac = 0.0f);
 
+    // ── Pre-cull silhouette coverage (#112, XR_DXR_depth_budget v4) ──────
+    //
+    // A small occupancy raster of where this scene's gaussians land on screen
+    // **as they would render at UNRESTRICTED rear-depth budget** — i.e. with
+    // the far cull (clipFarViewSpace) taken out of the picture. It is written
+    // by the preprocess compute stage, before that cull, so it costs no extra
+    // dispatch, no second sort and no second render pass.
+    //
+    // It exists because the depth-budget content MASK must not be derived from
+    // the rendered alpha. Here the far clip is a per-splat cull in preprocess,
+    // so the rendered silhouette is a smooth monotone function of the budget
+    // the runtime published last frame; feeding that back as the runtime's
+    // analysis ROI makes the rear clip oscillate (#112, runtime#1470). The
+    // app's click-through window region keeps using the CLIPPED alpha — that
+    // one really is a visual clip — and only the budget mask comes from here.
+    //
+    // Armed per session, not per frame: a source that switched rasterisation
+    // when the clip engaged would jitter on its own. Unarmed, the shader takes
+    // one uniform branch per gaussian and writes nothing.
+    void setSilhouetteCoverage(bool on) { silhouetteOn_ = on; }
+    bool silhouetteCoverage() const { return silhouetteOn_; }
+    uint32_t silhouetteCoverageWidth() const { return coverageW_; }
+    uint32_t silhouetteCoverageHeight() const { return coverageH_; }
+
+    // Read the accumulated coverage and clear it for the next frame, in one
+    // submission. `out` is resized to width*height bytes, row-major, TOP-LEFT
+    // origin, nonzero = covered — the exact shape dxr::ContentMaskFromCoverage
+    // takes. Because the clear is part of the same readback, the image holds
+    // the UNION over every renderEye call since the last read: call this once
+    // per frame, after the last view. Returns false when no scene is loaded or
+    // the coverage was never armed (chain no mask then; the runtime falls back
+    // to the clip-independent XrContentBoundsDXR rect).
+    //
+    // Synchronises with the GPU. That is free on this renderer (renderEye
+    // already wait-idles twice per eye) and NOT free on GsAdrenoRenderer,
+    // whose frame ring it collapses — which is why nothing calls it unless the
+    // app actually needs a mask.
+    bool readSilhouetteCoverage(std::vector<uint8_t>& out);
+
     // Render-scale: run the entire compute pipeline (projection, tile grid,
     // sort, per-pixel composite) at scale*viewport dims, then upscale-blit the
     // result to the full viewport. Splats are soft so moderate downscale costs
@@ -243,6 +282,16 @@ private:
     // ── Internal render image ────────────────────────────────────────────
     GsImage renderImage_;  // R8G8B8A8_UNORM, width_ x height_
 
+    // ── Pre-cull silhouette coverage (#112) ──────────────────────────────
+    // ~1 texel per 16x16 render pixels, capped at 128 per side, so the stores
+    // the preprocess shader does per gaussian stay the same order as the
+    // (gaussian,tile) expansion the pipeline already pays for. ~8 KB.
+    GsImage coverageImage_;   // R8_UINT, coverageW_ x coverageH_
+    GsBuffer coverageHost_;   // host-visible readback staging, same size
+    uint32_t coverageW_ = 0;
+    uint32_t coverageH_ = 0;
+    bool silhouetteOn_ = false;
+
     // ── Compute pipelines (8) ────────────────────────────────────────────
     VkPipeline pipePrecompCov3d_ = VK_NULL_HANDLE;
     VkPipeline pipePreprocess_ = VK_NULL_HANDLE;
@@ -314,6 +363,9 @@ private:
     // must have wait-idled the queue. No-op if requiredCapacity fits.
     void growSortBuffers(uint32_t requiredCapacity);
     void dispatchPrecompCov3d();
+    // Record UNDEFINED -> clear-to-zero -> GENERAL for coverageImage_ into an
+    // already-begun command buffer (the one-time post-load transition).
+    void cmdInitCoverageImage(VkCommandBuffer cmd);
     void updateUniforms(const float viewMatrix[16], const float projMatrix[16],
                         uint32_t vpWidth, uint32_t vpHeight,
                         float clipNear = 0.0f, float clipFar = 0.0f,

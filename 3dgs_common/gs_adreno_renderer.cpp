@@ -116,6 +116,17 @@ static VkDescriptorSet allocDS(VkDevice d, VkDescriptorPool pool, VkDescriptorSe
     return ds;
 }
 
+static void writeImageDS(VkDevice d, VkDescriptorSet ds, uint32_t binding,
+                         VkImageView view) {
+    VkDescriptorImageInfo ii = {};
+    ii.imageView = view;
+    ii.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    w.dstSet = ds; w.dstBinding = binding; w.descriptorCount = 1;
+    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE; w.pImageInfo = &ii;
+    vkUpdateDescriptorSets(d, 1, &w, 0, nullptr);
+}
+
 static void writeDS(VkDevice d, VkDescriptorSet ds, uint32_t binding,
                     VkDescriptorType type, VkBuffer buf, VkDeviceSize range) {
     VkDescriptorBufferInfo bi = {buf, 0, range};
@@ -363,17 +374,41 @@ bool GsAdrenoRenderer::createSceneResources() {
             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     }
 
+    // Pre-cull silhouette coverage (#112) — ~1 texel per 16x16 render pixels,
+    // 16..128 per side. Always allocated (~8 KB) so arming is a push constant
+    // and never a descriptor rewrite mid-session.
+    {
+        auto covDim = [](uint32_t px) -> uint32_t {
+            uint32_t d = px / 16u;
+            if (d < 16u) d = 16u;
+            if (d > 128u) d = 128u;
+            return d;
+        };
+        coverageW_ = covDim(width_);
+        coverageH_ = covDim(height_);
+        coverageImage_ = gsCreateImage2D(device_, physDevice_, coverageW_, coverageH_,
+            VK_FORMAT_R8_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        coverageHost_ = gsCreateBuffer(device_, physDevice_,
+            (VkDeviceSize)coverageW_ * coverageH_,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    }
+
     // ── Descriptor pool ──
     {
         // Per slot: 7 sets (preprocSet1, keys, histEven, histOdd, sortE2O,
         // sortO2E, splat) using 20 storage + 1 uniform descriptors. Plus 2 single
         // sets (cov3d, preprocSet0) using 4 storage. Sized from kFrameRing so it
         // scales if the ring depth changes.
-        VkDescriptorPoolSize sizes[2] = {
+        // (+1 storage IMAGE per slot: the #112 coverage raster on preprocSet1.)
+        VkDescriptorPoolSize sizes[3] = {
             {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * kFrameRing + 4},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * kFrameRing}};
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * kFrameRing},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 * kFrameRing}};
         VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        ci.maxSets = 7 * kFrameRing + 2; ci.poolSizeCount = 2; ci.pPoolSizes = sizes;
+        ci.maxSets = 7 * kFrameRing + 2; ci.poolSizeCount = 3; ci.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(device_, &ci, nullptr, &descriptorPool_) != VK_SUCCESS)
             return false;
     }
@@ -388,9 +423,13 @@ bool GsAdrenoRenderer::createSceneResources() {
     // ── preprocess: set0{Vertices,Cov3Ds} set1{Params(ubo),VertexAttributes} ──
     dslPreprocessSet0_ = makeDSL(device_, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
+    // Binding 2 of set1 is the #112 pre-cull silhouette coverage raster; the
+    // push constant is its arm flag (see scatter_coverage in the shader).
     dslPreprocessSet1_ = makeDSL(device_, {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
-    layoutPreprocess_ = makePipeLayout(device_, {dslPreprocessSet0_, dslPreprocessSet1_}, 0);
+                                           VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                           VK_DESCRIPTOR_TYPE_STORAGE_IMAGE});
+    layoutPreprocess_ = makePipeLayout(device_, {dslPreprocessSet0_, dslPreprocessSet1_},
+                                       sizeof(uint32_t));
     { VkShaderModule m = makeModule(device_, adreno_preprocess_comp_data, sizeof(adreno_preprocess_comp_data));
       pipePreprocess_ = makeCompute(device_, layoutPreprocess_, m); vkDestroyShaderModule(device_, m, nullptr); }
 
@@ -522,6 +561,8 @@ bool GsAdrenoRenderer::createSceneResources() {
         dsPreprocessSet1_[s] = allocDS(device_, descriptorPool_, dslPreprocessSet1_);
         writeDS(device_, dsPreprocessSet1_[s], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, uniformBuffer_[s].buffer, uniformBuffer_[s].size);
         writeDS(device_, dsPreprocessSet1_[s], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_[s].buffer, attrBuffer_[s].size);
+        // #112: shared (not per-slot) pre-cull silhouette coverage raster.
+        writeImageDS(device_, dsPreprocessSet1_[s], 2, coverageImage_.view);
 
         dsKeys_[s] = allocDS(device_, descriptorPool_, dslKeys_);
         writeDS(device_, dsKeys_[s], 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_[s].buffer, attrBuffer_[s].size);
@@ -570,12 +611,139 @@ void GsAdrenoRenderer::dispatchCov3d() {
     float scale_factor = 1.0f;
     vkCmdPushConstants(cmd, layoutCov3d_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(float), &scale_factor);
     vkCmdDispatch(cmd, (numGaussians_ + 255) / 256, 1, 1);
+    cmdInitCoverageImage(cmd);   // #112 — same one-shot submit, no extra sync
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue_);
     vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+}
+
+// ══════════════ pre-cull silhouette coverage (#112, budget v4) ══════════════
+
+void GsAdrenoRenderer::cmdInitCoverageImage(VkCommandBuffer cmd)
+{
+    if (coverageImage_.image == VK_NULL_HANDLE) return;
+
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+
+    VkImageMemoryBarrier imb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.image = coverageImage_.image;
+    imb.subresourceRange = range;
+
+    imb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    imb.srcAccessMask = 0;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+
+    // Start empty: a freshly created image holds undefined bytes, and every
+    // nonzero one would read as content the scene never drew.
+    VkClearColorValue zero = {};
+    vkCmdClearColorImage(cmd, coverageImage_.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+
+    imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    imb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+}
+
+bool GsAdrenoRenderer::readSilhouetteCoverage(std::vector<uint8_t>& out)
+{
+    if (!sceneLoaded_ || !silhouetteOn_ || coverageW_ == 0 || coverageH_ == 0 ||
+        coverageImage_.image == VK_NULL_HANDLE ||
+        coverageHost_.buffer == VK_NULL_HANDLE) {
+        return false;
+    }
+
+    // Drain the ring. This renderer submits with per-slot fences precisely so
+    // the CPU does NOT block, so this is a real cost — see the header note. It
+    // is unavoidable for a same-frame mask: up to kFrameRing eyes may still be
+    // scattering into the image we are about to copy and clear.
+    vkQueueWaitIdle(queue_);
+
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return false;
+
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier imb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.image = coverageImage_.image;
+    imb.subresourceRange = range;
+
+    imb.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;    // tightly packed
+    region.bufferImageHeight = 0;
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = {coverageW_, coverageH_, 1};
+    vkCmdCopyImageToBuffer(cmd, coverageImage_.image,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, coverageHost_.buffer, 1, &region);
+
+    // Clear in the SAME submission as the copy. That is what makes the image
+    // hold exactly the union over the views drawn since the previous read —
+    // no separate "begin frame" call the caller could forget, and no window in
+    // which a clear could race a scatter it was supposed to keep.
+    imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    imb.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    imb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+
+    VkClearColorValue zero = {};
+    vkCmdClearColorImage(cmd, coverageImage_.image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+
+    imb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    imb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+
+    const size_t n = (size_t)coverageW_ * (size_t)coverageH_;
+    void* mapped = nullptr;
+    if (vkMapMemory(device_, coverageHost_.memory, 0, (VkDeviceSize)n, 0, &mapped)
+            != VK_SUCCESS) {
+        return false;
+    }
+    out.resize(n);
+    memcpy(out.data(), mapped, n);
+    vkUnmapMemory(device_, coverageHost_.memory);
+    return true;
 }
 
 // ═══════════════════════════ updateUniforms ═════════════════════════════════
@@ -705,6 +873,12 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocess_);
     VkDescriptorSet pp[] = {dsPreprocessSet0_, dsPreprocessSet1_[slot]};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutPreprocess_, 0, 2, pp, 0, nullptr);
+    // #112: arm/disarm the pre-cull silhouette scatter. Session-level, not
+    // clip-level — a coverage source that changed shape when the far clip
+    // engaged would jitter on its own.
+    const uint32_t covOn = silhouetteOn_ ? 1u : 0u;
+    vkCmdPushConstants(cmd, layoutPreprocess_, VK_SHADER_STAGE_COMPUTE_BIT,
+                       0, sizeof(uint32_t), &covOn);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 1);
@@ -925,6 +1099,10 @@ void GsAdrenoRenderer::cleanupScene() {
     }
 
     gsDestroyBuffer(device_, vertexBuffer_); gsDestroyBuffer(device_, cov3dBuffer_);
+    // #112 pre-cull silhouette coverage
+    gsDestroyImage(device_, coverageImage_);
+    gsDestroyBuffer(device_, coverageHost_);
+    coverageW_ = coverageH_ = 0;
     for (uint32_t s = 0; s < kFrameRing; s++) {
         gsDestroyImage(device_, renderImage_[s]);
         gsDestroyBuffer(device_, uniformBuffer_[s]); gsDestroyBuffer(device_, attrBuffer_[s]);
