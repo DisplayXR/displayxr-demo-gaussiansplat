@@ -583,7 +583,11 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
     // countdown when the user goes back to opaque, so the turntable doesn't snap
     // on the instant they hit Ctrl+T again. There is no workspace shell on
     // macOS, so — unlike the Windows arm — every session is standalone here.
-    if (g_transparentBg) {
+    // DXR_GS_NOORBIT pins the pose for a timing run: the turntable changes every
+    // splat's projected screen AREA, which is the dominant cost term, so with it
+    // on no two GS_TS samples measure the same workload.
+    static const bool kNoOrbit = (getenv("DXR_GS_NOORBIT") != nullptr);
+    if (kNoOrbit || g_transparentBg) {
         input.animationActive = false;
         input.lastInputTimeSec = NowSec();
     } else {
@@ -2560,6 +2564,7 @@ int main(int argc, char** argv) {
         const char *mode_str = getenv("SIM_DISPLAY_OUTPUT");
         if (mode_str) {
             if (strcmp(mode_str, "2d") == 0 ||
+                strcmp(mode_str, "mono") == 0 ||
                 strcmp(mode_str, "passthrough") == 0) envPinnedMode = 0;
             else if (strcmp(mode_str, "anaglyph") == 0) envPinnedMode = 1;
             else if (strcmp(mode_str, "sbs") == 0) envPinnedMode = 2;
@@ -2609,6 +2614,15 @@ int main(int argc, char** argv) {
         g_windowW = (uint32_t)g_rigFlags.windowW;
         g_windowH = (uint32_t)g_rigFlags.windowH;
         LOG_INFO("Window size from --window=%ux%u points", g_windowW, g_windowH);
+    } else if (const char *we = getenv("DXR_GS_WINDOW")) {
+        // Same knob for a benchmark sweep, from the environment. `--window`
+        // outranks it for the same reason `--mode` outranks SIM_DISPLAY_OUTPUT:
+        // the flag is the more explicit statement of intent.
+        unsigned w = 0, h = 0;
+        if (sscanf(we, "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240) {
+            g_windowW = w; g_windowH = h;
+            LOG_INFO("Window size from DXR_GS_WINDOW=%ux%u points", g_windowW, g_windowH);
+        }
     }
     if (!CreateMacOSWindow(g_windowW, g_windowH, xr.displayScreenLeft, xr.displayScreenTop)) {
         LOG_ERROR("Failed to create macOS window");
