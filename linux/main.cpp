@@ -263,6 +263,11 @@ struct AppXrSession {
     bool renderingModeDisplay3D[8] = {};
     uint32_t renderingModeTileColumns[8] = {};
     uint32_t renderingModeTileRows[8] = {};
+    // Index of the 3D mode the runtime reports ACTIVE at session create, or -1.
+    // Only a 3D mode is a candidate: the display commonly reports its 2D mode
+    // active at startup (it stays 2D until something asks for 3D), and adopting
+    // that would open this 3D demo in mono.
+    int32_t activeRenderingMode = -1;
     uint32_t currentRenderingMode = 1;   // default: first 3D mode
 
     // Views reported by xrEnumerateViewConfigurationViews under viewConfigType.
@@ -489,11 +494,15 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
                     xr.renderingModeDisplay3D[i] = (modes[i].hardwareDisplay3D == XR_TRUE);
                     xr.renderingModeTileColumns[i] = modes[i].tileColumns ? modes[i].tileColumns : 1;
                     xr.renderingModeTileRows[i] = modes[i].tileRows ? modes[i].tileRows : 1;
-                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d)",
+                    // Only a 3D mode is a candidate for the app's default —
+                    // see AppXrSession::activeRenderingMode.
+                    if (modes[i].isActive == XR_TRUE && modes[i].hardwareDisplay3D == XR_TRUE)
+                        xr.activeRenderingMode = (int32_t)i;
+                    LOG_INFO("  [%u] %s (views=%u, scale=%.2fx%.2f, tiles=%ux%u, 3D=%d, active=%d)",
                         modes[i].modeIndex, modes[i].modeName, modes[i].viewCount,
                         modes[i].viewScaleX, modes[i].viewScaleY,
                         xr.renderingModeTileColumns[i], xr.renderingModeTileRows[i],
-                        modes[i].hardwareDisplay3D);
+                        modes[i].hardwareDisplay3D, modes[i].isActive == XR_TRUE);
                 }
             }
         }
@@ -912,13 +921,31 @@ int main(int argc, char** argv) {
 
     LOG_INFO("=== DisplayXR Gaussian Splat Viewer (Vulkan, Linux) ===");
 
-    // Default rendering mode from SIM_DISPLAY_OUTPUT (matches the macOS leg).
     AppXrSession xr = {};
+    // Pre-session SIM_DISPLAY_OUTPUT pin. This is the only way an agent can
+    // select a rendering mode headlessly (V and the number keys need a human),
+    // so it takes PRECEDENCE over the adoption below rather than being a mere
+    // fallback. sim_display's enumerated mode table is
+    // [0]=2D [1]=Anaglyph [2]=Cropped SBS [3]=Squeezed SBS [4]=Quad; `quad`,
+    // `2d`/`passthrough` and `squeezed` were all missing from this map, so the
+    // 4-view and 1-view atlases — the two counts that most need exercising —
+    // could not be selected at all: the app stomped the display back to
+    // Anaglyph a frame after it booted into them.
+    int32_t envPinnedMode = -1;
     { const char* mode = getenv("SIM_DISPLAY_OUTPUT");
       if (mode) {
-          if (strcmp(mode, "sbs") == 0) xr.currentRenderingMode = 2;
-          else if (strcmp(mode, "blend") == 0) xr.currentRenderingMode = 3;
-          else xr.currentRenderingMode = 1; // anaglyph / first 3D mode
+          if (strcmp(mode, "2d") == 0 ||
+              strcmp(mode, "passthrough") == 0) envPinnedMode = 0;
+          else if (strcmp(mode, "anaglyph") == 0) envPinnedMode = 1;
+          else if (strcmp(mode, "sbs") == 0) envPinnedMode = 2;
+          else if (strcmp(mode, "squeezed") == 0 ||
+                   strcmp(mode, "squeezed_sbs") == 0) envPinnedMode = 3;
+          else if (strcmp(mode, "quad") == 0) envPinnedMode = 4;
+          // "blend" is a sim_display DP pipeline, not an enumerated rendering
+          // mode; left on the historical 3 as there is no index that names it.
+          else if (strcmp(mode, "blend") == 0) envPinnedMode = 3;
+          else envPinnedMode = 1; // unrecognised -> the first 3D mode
+          xr.currentRenderingMode = (uint32_t)envPinnedMode;
       } }
 
     if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
@@ -954,6 +981,29 @@ int main(int argc, char** argv) {
     if (!CreateSession(xr, vkInstance, physDevice, vkDevice, queueFamilyIndex)) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
+
+    // Settle the rendering mode ONCE, here — this leg has no mode-switch UI and
+    // issues no xrRequestDisplayRenderingModeDXR at all. Same precedence as the
+    // macOS leg: an explicit SIM_DISPLAY_OUTPUT pin wins, else the runtime's
+    // active 3D mode, else the app default (mode 1). Everything downstream —
+    // tile grid, view count, view scale — keys off xr.currentRenderingMode, and
+    // CreateSwapchains below sizes the atlas worst-case across all modes, so a
+    // 4-view Quad fits.
+    if (envPinnedMode >= 0) {
+        if (xr.renderingModeCount > 0 && (uint32_t)envPinnedMode >= xr.renderingModeCount) {
+            LOG_WARN("SIM_DISPLAY_OUTPUT selects mode %d but the display has only %u mode(s) "
+                     "— falling back to mode 0", envPinnedMode, xr.renderingModeCount);
+            xr.currentRenderingMode = 0;
+        } else {
+            xr.currentRenderingMode = (uint32_t)envPinnedMode;
+        }
+    } else if (xr.activeRenderingMode >= 0) {
+        xr.currentRenderingMode = (uint32_t)xr.activeRenderingMode;
+    }
+    LOG_INFO("Startup rendering mode: %u (%s)", xr.currentRenderingMode,
+             envPinnedMode >= 0 ? "SIM_DISPLAY_OUTPUT"
+                                : (xr.activeRenderingMode >= 0 ? "adopted from runtime"
+                                                               : "app default"));
 
     if (!CreateSpaces(xr) || !CreateSwapchains(xr)) {
         CleanupOpenXR(xr); vkDestroyDevice(vkDevice, nullptr);
@@ -1008,9 +1058,12 @@ int main(int argc, char** argv) {
         PumpXEvents(xr);   // Ctrl+O = open dialog; close button = exit
         PollFilePicker();  // async zenity result → loadScene
 
-        // Assert the app's default 3D rendering mode once the session is running.
-        if (xr.sessionRunning && xr.pfnRequestDisplayRenderingModeEXT && xr.session != XR_NULL_HANDLE)
-            xr.pfnRequestDisplayRenderingModeEXT(xr.session, xr.currentRenderingMode);
+        // NOTE: this used to re-assert the app's own rendering mode HERE, every
+        // frame, for as long as the session ran — so nothing outside the process
+        // could ever change the mode and SIM_DISPLAY_OUTPUT=quad was undone a
+        // frame after it took effect. The mode is now settled once after
+        // xrCreateSession (adopted from the runtime, or pinned by
+        // SIM_DISPLAY_OUTPUT) and this leg issues no request at all.
 
         if (!xr.sessionRunning) {
             struct timespec ts = {0, 10 * 1000 * 1000}; nanosleep(&ts, nullptr);
