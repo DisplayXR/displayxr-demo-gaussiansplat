@@ -26,10 +26,21 @@ layout (std430, set = 0, binding = 2) writeonly buffer OutPayloads {
     uint payloads[];
 };
 
+// VkDrawIndirectCommand. The host pre-fills vertexCount=4 and zeroes
+// instanceCount; this shader atomically counts the SURVIVORS into it, so the
+// draw can be issued indirectly over just those. See `compact` below.
+layout (std430, set = 0, binding = 3) buffer DrawCmd {
+    uint vertexCount;
+    uint instanceCount;
+    uint firstVertex;
+    uint firstInstance;
+};
+
 layout (push_constant) uniform Constants {
     uint count;             // number of gaussians (N)
     float depthMin;
     float invDepthRange;    // 65535 / (depthMax - depthMin)
+    uint compact;           // 1 = count survivors + reserve 0xFFFF for culled
 };
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
@@ -44,6 +55,32 @@ void main() {
 
     if (attr[i].color_radii.w <= 0.0 || attr[i].magic != MAGIC) {
         keys[i] = 0xFFFFFFFFu;   // culled → sort last
+        return;
+    }
+
+    // Compacted indirect draw (DXR_GS_COMPACT).
+    //
+    // Only the low 16 bits of the key are actually sorted (2 radix passes), and
+    // the culled key's low 16 bits are 0xFFFF. With the historical mapping a
+    // VALID key can also be 0xFFFF — that is depth16 == 0, i.e. the NEAREST
+    // splats — so culled entries would interleave with them at the tail and the
+    // survivors would not form a prefix. Reserving 0xFFFF for culled fixes that:
+    //
+    //   key = 65534 - clamp(v, 0, 65534)   instead of   65535 - clamp(v, 0, 65535)
+    //
+    // which is exactly (old key - 1) for every v <= 65534, i.e. the SAME order,
+    // and merges only depth buckets 65534 and 65535. Bucket 65535 is
+    // unreachable: depthMax comes from the scene bbox padded outward by 2 %, so
+    // no splat ever sits at the very top of the range. The ordering is therefore
+    // unchanged, which is why this can be on by default.
+    //
+    // atomicAdd gives the survivor COUNT, not an ordered slot — the ordering
+    // still comes from the radix sort, and the survivors land in [0, count)
+    // precisely because of the key reservation above.
+    if (compact != 0u) {
+        atomicAdd(instanceCount, 1u);
+        uint depth16 = uint(clamp((attr[i].depth - depthMin) * invDepthRange, 0.0, 65534.0));
+        keys[i] = 65534u - depth16;
         return;
     }
 

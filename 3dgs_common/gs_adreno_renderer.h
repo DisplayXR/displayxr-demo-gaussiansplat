@@ -248,6 +248,17 @@ private:
     GsBuffer valsOddBuffer_[kFrameRing];    // N × 4
     GsBuffer histBuffer_[kFrameRing];       // numSortWorkgroups_ × 256 × 4
 
+    // ── Compacted indirect draw (DXR_GS_COMPACT) ──
+    // splat_keys.comp atomically counts the gaussians that survived preprocess
+    // into this VkDrawIndirectCommand, and the draw is issued from it. Because
+    // the culled key is reserved to sort strictly last, the survivors are
+    // exactly the prefix [0, instanceCount) of the sorted payload — so a
+    // culled gaussian costs no vertex shader at all, instead of a 64-byte
+    // random gather into attr[] followed by a degenerate quad.
+    GsBuffer drawCmdBuffer_[kFrameRing];    // 16 B, STORAGE | INDIRECT
+    GsBuffer drawCmdHost_[kFrameRing];      // 16 B host-visible, for the GS_TS line
+    uint32_t lastDrawnInstances_ = 0;
+
     // ── Internal scaled render target (per slot: draw target + blit source) ──
     GsImage renderImage_[kFrameRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
 
