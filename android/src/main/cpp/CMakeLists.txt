@@ -144,6 +144,7 @@ add_library(gausssplat_vk_android SHARED
     # ── Adreno/TBDR-native renderer (3dgs_common/) — NOT the desktop
     #    gs_renderer.cpp compute compositor; this is the mobile graphics path. ──
     ${GS_COMMON}/gs_adreno_renderer.cpp
+    ${GS_COMMON}/gs_perf_knobs.cpp
     ${GS_COMMON}/gs_scene_loader.cpp
     ${GS_COMMON}/gs_spz_loader.cpp
     # gs_scene_loader.cpp dispatches .sog to ParseSogFile and the camera rig to
