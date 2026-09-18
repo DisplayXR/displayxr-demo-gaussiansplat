@@ -43,6 +43,9 @@
 // XR_DXR_display_info: the panel pixel size, so the load-time auto-fit
 // can use the real viewport instead of reconstructing one.
 #include <openxr/XR_DXR_display_info.h>
+// DxrSelectViewConfigType (runtime#1486 opt-in) — same vendored helper all four
+// legs use; openxr_includes/ is on every leg's include path.
+#include <dxr_view_config.h>
 #include <android/native_window.h>
 
 #define LOG_TAG "gausssplat_vk_android"
@@ -113,6 +116,19 @@ bool g_exit_requested = false;
 XrSpace g_app_space = XR_NULL_HANDLE;
 
 constexpr uint32_t kViewCount = 2;
+
+// runtime#1486 / #1500 — the view configuration this session begins with.
+// Resolved once by DxrSelectViewConfigType() in query_system_and_graphics_reqs()
+// and then fed to xrEnumerateViewConfigurationViews, xrBeginSession and every
+// xrLocateViews, so all four legs of this demo route through one helper.
+//
+// This leg is STEREO-FIXED (kViewCount = 2 sizes g_views[], projection_views[]
+// and the whole render path), so unlike the desktop legs it gains no modes from
+// opting in — it opts in for uniformity, and create_swapchains() falls BACK to
+// PRIMARY_STEREO if the multiview config reports a count it cannot fill. On
+// today's Android hardware (2-view panel) both configs report 2 and the
+// behaviour is bit-for-bit unchanged.
+XrViewConfigurationType g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
 
 struct PerView
 {
@@ -598,6 +614,13 @@ query_system_and_graphics_reqs()
 		}
 	}
 
+	// runtime#1486: pick the view configuration before anything view-typed runs
+	// (create_swapchains / xrBeginSession / xrLocateViews all read this). The
+	// helper degrades to PRIMARY_STEREO on a runtime that does not advertise
+	// PRIMARY_MULTIVIEW_DXR, or when XR_DXR_display_info was not enabled.
+	g_view_config_type = DxrSelectViewConfigType(g_instance, g_system_id);
+	LOGI("View configuration: %s", DxrViewConfigTypeName(g_view_config_type));
+
 	// Panel pixels for the load-time auto-fit. XR_DXR_display_info reports the
 	// native panel directly, which is the viewport the fit rule wants (this app
 	// is fullscreen, so window == panel). Falls back to per-view / view_scale,
@@ -815,8 +838,25 @@ create_swapchains()
 {
 	uint32_t expected_view_count = 0;
 	XrResult res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+	    g_instance, g_system_id, g_view_config_type,
 	    0, &expected_view_count, nullptr);
+
+	// runtime#1486: this leg renders a FIXED kViewCount atlas. Under
+	// PRIMARY_MULTIVIEW_DXR the runtime reports the device MAX across rendering
+	// modes, which on a future >2-view Android panel would exceed what this
+	// render path can fill. Rather than fail startup (what the bare `!=` check
+	// used to do), fall back to PRIMARY_STEREO — which the runtime guarantees
+	// reports exactly 2 — and carry on. Only a PRIMARY_STEREO that still
+	// disagrees is fatal.
+	if (res == XR_SUCCESS && expected_view_count != kViewCount &&
+	    g_view_config_type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+		LOGI("%s reports %u views; this leg is fixed at %u — falling back to PRIMARY_STEREO",
+		     DxrViewConfigTypeName(g_view_config_type), expected_view_count, kViewCount);
+		g_view_config_type = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		res = xrEnumerateViewConfigurationViews(
+		    g_instance, g_system_id, g_view_config_type,
+		    0, &expected_view_count, nullptr);
+	}
 	if (res != XR_SUCCESS || expected_view_count != kViewCount) {
 		LOGE("Expected %u views, runtime reports %u", kViewCount, expected_view_count);
 		return false;
@@ -826,7 +866,7 @@ create_swapchains()
 		view_configs[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
 	}
 	res = xrEnumerateViewConfigurationViews(
-	    g_instance, g_system_id, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+	    g_instance, g_system_id, g_view_config_type,
 	    kViewCount, &expected_view_count, view_configs);
 	if (res != XR_SUCCESS) {
 		log_xr_result("xrEnumerateViewConfigurationViews", res);
@@ -1123,7 +1163,7 @@ handle_session_state(XrSessionState new_state)
 	case XR_SESSION_STATE_READY: {
 		XrSessionBeginInfo begin = {};
 		begin.type = XR_TYPE_SESSION_BEGIN_INFO;
-		begin.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		begin.primaryViewConfigurationType = g_view_config_type;  // runtime#1486
 		XrResult res = xrBeginSession(g_session, &begin);
 		log_xr_result("xrBeginSession", res);
 		if (res == XR_SUCCESS) {
@@ -1223,7 +1263,7 @@ render_frame()
 		view_state.type = XR_TYPE_VIEW_STATE;
 		XrViewLocateInfo locate_info = {};
 		locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-		locate_info.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		locate_info.viewConfigurationType = g_view_config_type;  // runtime#1486
 		locate_info.displayTime = frame_state.predictedDisplayTime;
 		locate_info.space = g_app_space;
 

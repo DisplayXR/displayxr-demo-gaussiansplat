@@ -32,6 +32,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_view_rig.h>
+#include <dxr_view_config.h>   // DxrSelectViewConfigType (runtime#1486 opt-in)
 
 #include <cctype>
 #include <cmath>
@@ -1031,9 +1032,11 @@ struct AppXrSession {
     uint32_t renderingModeTileRows[8] = {};
 
     // Max views the runtime may return from xrLocateViews, taken from
-    // xrEnumerateViewConfigurationViews at session init. Some runtimes (e.g.
-    // sim_display on macOS) report the union across all rendering modes, so
-    // this is >= 2 even for PRIMARY_STEREO.
+    // xrEnumerateViewConfigurationViews at session init under viewConfigType.
+    // runtime#1486: this is the DEVICE MAX across rendering modes (4 on
+    // sim_display, 2 on Leia) because the session opts into
+    // PRIMARY_MULTIVIEW_DXR; under the conformant PRIMARY_STEREO fallback it is
+    // exactly 2.
     uint32_t maxViewCount = 2;
 
     void* windowHandle = nullptr;  // unused on macOS, kept for compatibility
@@ -1481,6 +1484,17 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     XrSystemGetInfo si = {XR_TYPE_SYSTEM_GET_INFO};
     si.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK(xrGetSystem(xr.instance, &si, &xr.systemId));
+
+    // runtime#1486 / #1500 — PRIMARY_MULTIVIEW_DXR opt-in. Must run before the
+    // first xrEnumerateViewConfigurationViews (CreateSwapchains below), and the
+    // SAME xr.viewConfigType then feeds xrBeginSession's
+    // primaryViewConfigurationType and every XrViewLocateInfo. This leg's view
+    // count comes from the active DXR rendering mode, so under the conformant
+    // PRIMARY_STEREO (exactly 2) it could not reach sim_display's 4-view Quad
+    // mode at all. Degrades to PRIMARY_STEREO on any runtime that does not
+    // advertise the new type, so it is safe to call unconditionally.
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     { XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
       xrGetSystemProperties(xr.instance, xr.systemId, &sp);
@@ -2428,6 +2442,38 @@ int main(int argc, char** argv) {
                             : 1u;
 
                         int eyeCount = monoMode ? 1 : (int)modeViewCount;
+
+                        // runtime#1486 INV-3.1: eyeCount is what gets rendered AND
+                        // what reaches xrEndFrame (projectionViews is sized from it),
+                        // so it is the single place to reconcile the counts that can
+                        // disagree: the active mode's view count, the count xrLocateViews
+                        // returned (modeViewCount is already clamped to it above), and
+                        // the number of tiles the swapchain atlas actually has. Never submit more
+                        // views than any of them; never drop to 0 (that blanks the
+                        // display) — floor is 1. One-shot log per distinct
+                        // disagreement, never per-frame.
+                        {
+                            const uint32_t sliceCap = (tileColumns ? tileColumns : 1u) *
+                                                      (tileRows ? tileRows : 1u);
+                            int capped = eyeCount;
+                            if (capped > (int)runtimeViewCount) capped = (int)runtimeViewCount;
+                            if (capped > (int)sliceCap) capped = (int)sliceCap;
+                            if (capped < 1) capped = 1;
+                            if (capped != eyeCount) {
+                                static uint32_t s_lastClampKey = 0;
+                                const uint32_t key = ((uint32_t)eyeCount << 24) |
+                                                     (runtimeViewCount << 16) |
+                                                     (sliceCap << 8) | (uint32_t)capped;
+                                if (key != s_lastClampKey) {
+                                    s_lastClampKey = key;
+                                    LOG_WARN("Submitted view count clamped %d -> %d "
+                                             "(mode=%u located=%u slices=%u)",
+                                             eyeCount, capped, modeViewCount,
+                                             runtimeViewCount, sliceCap);
+                                }
+                                eyeCount = capped;
+                            }
+                        }
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel

@@ -9,6 +9,7 @@
 #include "logging.h"
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_depth_budget.h>
+#include <dxr_view_config.h>   // DxrSelectViewConfigType (runtime#1486 opt-in)
 #include <cstring>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima math and
@@ -178,6 +179,29 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     systemInfo.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
     XR_CHECK_LOG(xrGetSystem(xr.instance, &systemInfo, &xr.systemId));
     LOG_INFO("System ID: %llu", (unsigned long long)xr.systemId);
+
+    // runtime#1486 / #1500 — PRIMARY_MULTIVIEW_DXR opt-in.
+    //
+    // This viewer's per-frame view count comes from the ACTIVE DXR rendering
+    // mode (xrEnumerateDisplayRenderingModesDXR + the 1/2/3/V mode keys), so it
+    // can submit 4 views in sim_display's Quad mode. PRIMARY_STEREO now means
+    // exactly 2 views and the runtime rejects an xrEndFrame carrying more, so
+    // staying on it would fail every frame in Quad
+    // (XR_ERROR_VALIDATION_FAILURE) instead of going 4-view.
+    //
+    // MUST be before the first xrEnumerateViewConfigurationViews below, and the
+    // SAME variable then feeds every view-configuration-typed call. On the
+    // Windows leg that is all of them: displayxr::common (>= v2.13.0) already
+    // routes xr.viewConfigType into xrEnumerateViewConfigurationViews,
+    // xrEnumerateEnvironmentBlendModes, XrSessionBeginInfo and
+    // XrViewLocateInfo — XrSessionManager's PRIMARY_STEREO initialiser is only
+    // the fallback default, which is exactly what this assignment overrides.
+    //
+    // Safe unconditionally: the helper probes xrEnumerateViewConfigurations and
+    // degrades to PRIMARY_STEREO on any runtime that does not advertise the new
+    // type (including one where XR_DXR_display_info was not enabled).
+    xr.viewConfigType = DxrSelectViewConfigType(xr.instance, xr.systemId);
+    LOG_INFO("View configuration: %s", DxrViewConfigTypeName(xr.viewConfigType));
 
     // Get system name
     {

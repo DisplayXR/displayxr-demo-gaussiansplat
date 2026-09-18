@@ -1965,6 +1965,18 @@ static void RenderThreadFunc(
                 // frame" xrEndFrame calls (outside that block) can still see it.
                 const void* frameEndNext = nullptr;
 
+                // runtime#1486 — inputs to the xrEndFrame view-count clamp, filled
+                // inside the locate block and read by the "Submit frame" block below
+                // (which is outside that scope). 0 = "this frame never got there".
+                //   locatedViewCount  — what xrLocateViews actually returned.
+                //   filledViewCount   — how many projectionViews[] slots were written.
+                //   atlasSliceCount   — how many tiles the swapchain can hold for the
+                //                       active mode (array layers on a layered
+                //                       swapchain, cols x rows on this app's tiled one).
+                uint32_t locatedViewCount = 0;
+                uint32_t filledViewCount = 0;
+                uint32_t atlasSliceCount = 0;
+
                 // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
                 // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
                 // sized once at session create). When the workspace tile is
@@ -2060,6 +2072,7 @@ static void RenderThreadFunc(
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
+                        locatedViewCount = viewCount;  // runtime#1486 clamp input
 
                         const XrRearDepthBudgetDXR* depthBudgetPtr =
                             (hasDepthBudgetExt && depthBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR)
@@ -2134,6 +2147,15 @@ static void RenderThreadFunc(
                         uint32_t renderH = (uint32_t)((double)windowH * scaleY);
                         if (renderW == 0) renderW = 1;
                         if (renderH == 0) renderH = 1;
+
+                        // runtime#1486 clamp inputs. This app's swapchain is TILED
+                        // (CreateSwapchain defaults arraySize=1, every projection view
+                        // uses imageArrayIndex 0 and its own imageRect), so its slice
+                        // capacity is cols x rows, not the array size. Handle both so
+                        // the clamp stays correct if the swapchain ever goes layered.
+                        atlasSliceCount = (xr->swapchain.arraySize > 1)
+                            ? xr->swapchain.arraySize : (cols * rows);
+                        filledViewCount = (uint32_t)eyeCount;
 
                         // --- Consume the runtime's render-ready XrView{pose, fov} (#396 W7) ---
                         // The runtime owns the off-axis Kooima (window resolve included); the
@@ -2969,6 +2991,37 @@ static void RenderThreadFunc(
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
+
+                // runtime#1486 INV-3.1: never submit more views than were LOCATED,
+                // than were actually written into projectionViews[], or than the
+                // swapchain has slices. Until now this count came straight off the
+                // active rendering mode and was never reconciled with the other
+                // three, so any disagreement (a mode switch racing the locate, a
+                // runtime reporting fewer views than the mode advertises) reached
+                // xrEndFrame as a malformed layer. Clamping keeps the layer valid;
+                // dropping to layerCount 0 would blank the display instead, so the
+                // floor is 1. Logged ONCE per distinct disagreement — never
+                // per-frame — because a silent clamp is how this class of bug hides.
+                if (rendered) {
+                    uint32_t clamped = submitViewCount;
+                    if (locatedViewCount > 0 && clamped > locatedViewCount) clamped = locatedViewCount;
+                    if (filledViewCount > 0 && clamped > filledViewCount) clamped = filledViewCount;
+                    if (atlasSliceCount > 0 && clamped > atlasSliceCount) clamped = atlasSliceCount;
+                    if (clamped < 1) clamped = 1;
+                    if (clamped != submitViewCount) {
+                        static uint32_t s_lastClampKey = 0;
+                        const uint32_t key = (submitViewCount << 24) | (locatedViewCount << 16) |
+                                             (filledViewCount << 8) | (atlasSliceCount & 0xFFu);
+                        if (key != s_lastClampKey) {
+                            s_lastClampKey = key;
+                            LOG_WARN("Submitted view count clamped %u -> %u "
+                                     "(mode=%u located=%u rendered=%u slices=%u)",
+                                     submitViewCount, clamped, submitViewCount,
+                                     locatedViewCount, filledViewCount, atlasSliceCount);
+                        }
+                        submitViewCount = clamped;
+                    }
+                }
                 if (rendered && (hudSubmitted || toastLayerReady)) {
                     // Layer footprint sized per-frame to match the HUD
                     // swapchain's aspect (computed above as layerFracW ×

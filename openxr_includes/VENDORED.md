@@ -32,7 +32,8 @@ Pins in force:
 
 | Runtime commit | Headers |
 |---|---|
-| `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_depth_budget.h`, `XR_DXR_display_info.h`, `XR_DXR_xlib_window_binding.h`, `XR_MNDX_ball_on_a_stick_controller.h`, `XR_MNDX_blubur_s1.h`, `XR_MNDX_hydra.h`, `XR_MNDX_oculus_remote.h`, `XR_MNDX_system_buttons.h`, `XR_MNDX_xdev_space.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
+| `220e9393511aab23c1ef2c6bb796d452f4fe3060`<br>220e93935 (2026-09-07) feat(android): XR_DXR_android_surface_binding v2 — mini-window layout hint (#1396) (#1398) | `XR_DXR_depth_budget.h`, `XR_DXR_xlib_window_binding.h`, `XR_MNDX_ball_on_a_stick_controller.h`, `XR_MNDX_blubur_s1.h`, `XR_MNDX_hydra.h`, `XR_MNDX_oculus_remote.h`, `XR_MNDX_system_buttons.h`, `XR_MNDX_xdev_space.h`, `openxr.h`, `openxr_extension_helpers.h`, `openxr_loader_negotiation.h`, `openxr_platform.h`, `openxr_platform_defines.h`, `openxr_reflection.h`, `openxr_reflection_parent_structs.h`, `openxr_reflection_structs.h` |
+| `c1e4fe00da0f189122eca14e61e9faaa88e4b38e`<br>c1e4fe00d (2026-09-18) chore(cts): drop the by-name exclusion of xrLocateSpace_xrLocateViews — #1502 landed<br>(newest runtime commit at which our copy is byte-identical; the spec-v19 content landed in 23c616e3d, #1486) | `XR_DXR_display_info.h` |
 | `a71979a4d1385841a224eccd64ae973385300b1f`<br>a71979a4d (2026-07-12) feat(#734): fold planned XR_EXT_android_surface_binding → XR_DXR_ (docs/comments); post-rename-safe map regen | `XR_DXR_atlas_capture.h`, `XR_DXR_cocoa_window_binding.h`, `XR_DXR_display_zones.h`, `XR_DXR_local_3d_zone.h`, `XR_DXR_macos_gl_binding.h`, `XR_DXR_mcp_tools.h`, `XR_DXR_spatial_workspace.h`, `XR_DXR_view_rig.h`, `XR_DXR_weave.h`, `XR_DXR_win32_window_binding.h`, `XR_DXR_workspace_file_dialog.h` |
 
 ## Known drift vs runtime `main`
@@ -56,6 +57,9 @@ passes over the wire changed shape, so the app is correct as pinned.
 | `XR_DXR_win32_window_binding.h` | SPEC_VERSION 1 here vs 8 on runtime main; the struct is unchanged (the only text delta is dropping the retired chroma-key sentence). |
 | `XR_DXR_workspace_file_dialog.h` | SPEC_VERSION macro is 1 here; runtime main carries the real number. The demos' copies date from the ~24h window between the `XR_EXT_* → XR_DXR_*` rename (runtime `fefa3d3dc`/`a71979a4d`, 2026-07-12) and `2a87861e2`, which restored the pre-rename SPEC_VERSION values. No struct or enum change. |
 
+`XR_DXR_display_info.h` dropped out of the live `--drift` output in the #1486
+opt-in pass: it is now pinned at spec **19** and byte-identical to runtime `main`.
+
 `scripts/check_vendored_headers.py --drift` prints this list live (it is
 informational — only a pin *mismatch* fails CI).
 
@@ -68,3 +72,26 @@ informational — only a pin *mismatch* fails CI).
    `FetchContent` OpenXR `GIT_TAG` if the core headers moved.
 
 Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
+
+## `dxr_view_config.h` — NOT part of the pinned vendor dir
+
+`openxr_includes/dxr_view_config.h` sits one level **above** `openxr/`, and
+`VENDORED.json` does not cover it. It is a DisplayXR *app* helper
+(`DxrSelectViewConfigType`), not a header from the OpenXR registry, and it comes
+from a different runtime path than `VENDORED.json`'s single `source_path`:
+
+    DisplayXR/displayxr-runtime  test_apps/common/dxr_view_config.h
+    @ c1e4fe00da0f189122eca14e61e9faaa88e4b38e
+
+Its provenance is pinned in prose, in the file's own header comment. It lives
+here because `openxr_includes/` is the one include directory all four legs
+(`windows/`, `macos/`, `linux/`, `android/`) share, so every leg reaches it as
+`#include <dxr_view_config.h>`. The vendored copy adds one thing the runtime
+original does not have: a second-stage fallback that defines the enumerator when
+the vendored `XR_DXR_display_info.h` is present but older than spec 19 — the
+runtime original only probes for the header's *existence*, which is sufficient
+in a tree whose headers always move together, and is not sufficient here.
+
+When `common/CMakeLists.txt` re-pins `displayxr-common` to **v2.14.0** (which
+ships the same helper), the Windows leg can drop its include; the three legs
+with their own session code keep using this file.
