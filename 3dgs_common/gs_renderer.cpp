@@ -11,6 +11,8 @@
 #include "gs_renderer.h"
 #include "gs_scene_loader.h"
 #include "gs_spz_loader.h"
+#include "gs_sog_loader.h"
+#include "gs_camera_rig.h"
 #include <cstdio>
 
 // On Android, printf() to stdout is NOT captured by logcat — only
@@ -724,9 +726,18 @@ bool GsRenderer::loadScene(const char* plyPath)
     // A parse failure is a RETURN, never an exception and never a crash: an
     // unsupported or corrupt file must leave the window up with a message.
     bool parseOk;
+    // The scene camera is cleared on EVERY load, before the format dispatch:
+    // only a SOG bundle carrying a `camera` block fills it, so a .ply/.spz
+    // loaded after a photo-lifted .sog must not inherit the previous file's
+    // camera and strand the viewer on the camera rig.
+    sceneCamera_ = GsSceneCamera();
     if (ext == ".spz") {
         SpzFileInfo info;
         parseOk = ParseSpzFile(scenePath, vertices, &info);
+        if (!parseOk) lastLoadError_ = info.error;
+    } else if (ext == ".sog") {
+        SogFileInfo info;
+        parseOk = ParseSogFile(scenePath, vertices, &info, &sceneCamera_);
         if (!parseOk) lastLoadError_ = info.error;
     } else {
         parseOk = ParsePlyFile(scenePath, vertices);
@@ -739,6 +750,12 @@ bool GsRenderer::loadScene(const char* plyPath)
                 plyPath, lastLoadError_.c_str());
         return false;
     }
+
+    // Median forward depth of the cloud as loaded (before any decimation, so
+    // the number does not move with a perf knob). It stands in for the gallery
+    // camera model's `dSubject` and is what the camera rig pivots about when
+    // the file names no convergence — see gs_camera_rig.h.
+    sceneMedianForwardDepthM_ = GsMedianForwardDepth(vertices);
 
     // Load-time opacity cull (perf): compact out near-transparent gaussians
     // before upload. scale_opacity[3] is the sigmoid'd opacity in [0,1]. These
