@@ -57,6 +57,16 @@ struct GsRenderer {
     //! no other way to say why nothing appeared.
     const std::string& lastLoadError() const { return lastLoadError_; }
 
+    //! The recording camera the CURRENT scene declared, or a default-constructed
+    //! (`present == false`) one when it declared none. Only a SOG bundle with a
+    //! `camera` block fills it; its presence is what selects the viewer's
+    //! camera rig. Valid from the moment loadScene() returns until the next load.
+    const GsSceneCamera& sceneCamera() const { return sceneCamera_; }
+
+    //! Median forward depth (-z) of the current cloud in metres, measured
+    //! before decimation; 0 when unknown. The camera rig's default pivot.
+    float sceneMedianForwardDepthM() const { return sceneMedianForwardDepthM_; }
+
     // Returns the number of Gaussians in the loaded scene.
     uint32_t gaussianCount() const;
 
@@ -255,6 +265,8 @@ private:
     bool sceneLoaded_ = false;
     std::string loadedScenePath_;
     std::string lastLoadError_;
+    GsSceneCamera sceneCamera_;
+    float sceneMedianForwardDepthM_ = 0.0f;
     uint32_t numGaussians_ = 0;
 
     // ── Derived dimensions ───────────────────────────────────────────────
