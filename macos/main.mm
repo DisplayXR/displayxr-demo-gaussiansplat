@@ -1034,7 +1034,7 @@ struct AppXrSession {
     // Max views the runtime may return from xrLocateViews, taken from
     // xrEnumerateViewConfigurationViews at session init under viewConfigType.
     // runtime#1486: this is the DEVICE MAX across rendering modes (4 on
-    // sim_display, 2 on Leia) because the session opts into
+    // sim_display, 2 on a stereo-only panel) because the session opts into
     // PRIMARY_MULTIVIEW_DXR; under the conformant PRIMARY_STEREO fallback it is
     // exactly 2.
     uint32_t maxViewCount = 2;
