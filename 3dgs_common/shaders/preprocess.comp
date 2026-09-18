@@ -43,9 +43,19 @@ layout (std430, set = 1, binding = 2) writeonly buffer NumTilesOverlap {
 // so an unarmed session pays one uniform branch per gaussian and nothing else.
 layout (set = 1, binding = 3, r8ui) uniform writeonly uimage2D coverage_img;
 
-layout (push_constant) uniform CoveragePush {
-    uint coverage_on;   // 0 = skip the scatter entirely
+layout (push_constant) uniform PreprocPush {
+    uint coverage_on;     // 0 = skip the #112 silhouette scatter entirely
+    uint flags;           // see FLAG_* below (gsperf::kFlag* on the host)
+    float max_radius_px;  // quad extent cap in render px; 0 = uncapped
 };
+
+// Byte-identical semantics to adreno_preprocess.comp — see the long comment
+// there. On this path `radii` sizes the TILE AABB, so shrinking it removes
+// (gaussian,tile) sort instances as well as per-pixel work; and because
+// render.comp evaluates the conic from `s_uv[i] - curr_uv` (never from an
+// interpolated quad corner), the pixels that remain are bit-identical.
+#define FLAG_OPACITY_EXTENT 1u
+#define FLAG_INVISIBLE_CULL 2u
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -222,6 +232,15 @@ void main() {
         return;
     }
 
+    // Effective opacity — exactly the co.w render.comp composites with.
+    float opacity = vertices[index].scale_opacity.w * opacity_scale;
+
+    // Exactly-invisible cull; STRICT '<' (alpha == 1/255 at the centre still
+    // renders). See adreno_preprocess.comp for the full argument.
+    if ((flags & FLAG_INVISIBLE_CULL) != 0u && opacity < 1.0f / 255.0f) {
+        return;
+    }
+
     mat2 cov2d = compute_cov2d(p_view.xyz);
     float det = determinant(cov2d);
     if (det <= 0.0) {
@@ -233,7 +252,14 @@ void main() {
     float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
     float lambda2 = mid - sqrt(max(0.1, mid * mid - det));
     float lambda = max(lambda1, lambda2);
-    float radii = ceil(3.0 * sqrt(lambda));
+    float extent = 3.0 * sqrt(lambda);
+    if ((flags & FLAG_OPACITY_EXTENT) != 0u) {
+        extent = min(extent, sqrt(2.0 * lambda * log(max(255.0 * opacity, 1.0))));
+    }
+    if (max_radius_px > 0.0) {   // lossy, opt-in
+        extent = min(extent, max_radius_px);
+    }
+    float radii = ceil(extent);
 
     // Subpixel cull — gaussians smaller than 1 px contribute nothing visible
     // and waste sort capacity. (Capping the radius higher would create square
@@ -275,7 +301,7 @@ void main() {
         return;
     }
     attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
-    attr[index].conic_opacity.w = vertices[index].scale_opacity.w * opacity_scale;
+    attr[index].conic_opacity.w = opacity;
     attr[index].aabb = bounding_box;
     tiles_overlap[index] = num_tiles_overlap;
     attr[index].depth = p_view.z;

@@ -49,9 +49,24 @@ layout (std430, set = 1, binding = 1) writeonly buffer VertexAttributes {
 // view drawn since the last read. Always bound; armed by the push constant.
 layout (set = 1, binding = 2, r8ui) uniform writeonly uimage2D coverage_img;
 
-layout (push_constant) uniform CoveragePush {
-    uint coverage_on;   // 0 = skip the scatter entirely
+layout (push_constant) uniform PreprocPush {
+    uint coverage_on;     // 0 = skip the #112 silhouette scatter entirely
+    uint flags;           // see FLAG_* below (gsperf::kFlag* on the host)
+    float max_radius_px;  // quad extent cap in render px; 0 = uncapped
 };
+
+// Opacity-aware quad extent. The quad only has to cover the pixels the
+// FRAGMENT shader would keep, and splat.frag discards at alpha < 1/255 with
+// alpha = opacity * exp(power), power = -q/2 for the conic form q. So the
+// last surviving pixel sits at q = 2*ln(255*opacity), and the ellipse
+// {q <= c} reaches at most sqrt(c*lambda) along any direction. Clamped to
+// the historical 3 sigma so this can only ever SHRINK the quad — every
+// fragment it removes is one the FS was already discarding, which is what
+// makes it bit-exact rather than an approximation.
+#define FLAG_OPACITY_EXTENT 1u
+// Drop gaussians whose effective opacity cannot reach 1/255 at ANY pixel
+// (exp(power) <= 1 everywhere), so they can never pass the FS test.
+#define FLAG_INVISIBLE_CULL 2u
 
 layout (local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -213,6 +228,19 @@ void main() {
         return;
     }
 
+    // Effective opacity — exactly what splat.frag receives as v_opacity.
+    float opacity = vertices[index].scale_opacity.w * opacity_scale;
+
+    // Exactly-invisible cull. alpha = min(0.99, opacity * exp(power)) and
+    // power <= 0 for a positive-definite conic, so alpha <= opacity at every
+    // pixel. opacity < 1/255 therefore means alpha < 1/255 everywhere and the
+    // FS discards every fragment of this quad. STRICT '<': at opacity exactly
+    // 1/255 the centre pixel has alpha == 1/255, which is NOT < 1/255 and does
+    // render — so '<=' here would drop a visible splat.
+    if ((flags & FLAG_INVISIBLE_CULL) != 0u && opacity < 1.0f / 255.0f) {
+        return;
+    }
+
     vec4 p_hom = proj_mat * vertices[index].position;
     float p_w = 1.0f / p_hom.w;
     vec3 ndc = vec3(p_hom.xyz * p_w);
@@ -228,7 +256,22 @@ void main() {
     float lambda1 = mid + sqrt(max(0.1, mid * mid - det));
     float lambda2 = mid - sqrt(max(0.1, mid * mid - det));
     float lambda = max(lambda1, lambda2);
-    float radii = ceil(3.0 * sqrt(lambda));
+    float extent = 3.0 * sqrt(lambda);
+    if ((flags & FLAG_OPACITY_EXTENT) != 0u) {
+        // ln(255*opacity) > 0 is guaranteed here: opacity >= 1/255 either
+        // because FLAG_INVISIBLE_CULL rejected the rest, or — with that flag
+        // off — because max() floors the argument at 1 so the extent collapses
+        // to 0 and the radii<1 cull below removes the quad. Either way the
+        // gaussian that reaches min() has a real, non-negative radius.
+        extent = min(extent, sqrt(2.0 * lambda * log(max(255.0 * opacity, 1.0))));
+    }
+    // Lossy, opt-in: clamp the on-screen footprint of the sky-sized mega-splats
+    // that dominate overdraw. Unlike the two levers above this DOES remove
+    // fragments the FS would have kept, so it is off by default.
+    if (max_radius_px > 0.0) {
+        extent = min(extent, max_radius_px);
+    }
+    float radii = ceil(extent);
 
     // Subpixel cull — gaussians under 1 px contribute nothing visible.
     if (radii < 1.0) {
@@ -252,7 +295,7 @@ void main() {
     }
 
     attr[index].conic_opacity.xyz = vec3(conic[0][0], conic[0][1], conic[1][1]);
-    attr[index].conic_opacity.w = vertices[index].scale_opacity.w * opacity_scale;
+    attr[index].conic_opacity.w = opacity;
     attr[index].color_radii.xyz = compute_sh();
     attr[index].color_radii.w = radii;
     attr[index].uv = uv;
