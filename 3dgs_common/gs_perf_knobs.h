@@ -64,7 +64,7 @@ struct Knobs {
     float cullAlpha = 0.0f;         //!< DXR_GS_CULL_ALPHA   (lossy, default off)
     bool opacityExtent = true;      //!< DXR_GS_EXTENT=3sigma disables
     bool invisibleCull = true;      //!< DXR_GS_INVISIBLE_CULL=0 disables
-    bool compactDraw = true;        //!< DXR_GS_COMPACT=0 disables (graphics path)
+    bool compactDraw = false;       //!< DXR_GS_COMPACT=1 enables (graphics path, LOSSLESS but measured slower on MoltenVK)
     float maxRadiusFrac = 0.0f;     //!< DXR_GS_MAX_RADIUS_FRAC (lossy, default off)
     char dumpPath[512] = {0};       //!< DXR_GS_DUMP=<file.png>, empty = no dump
     unsigned long long dumpFrame = 240;  //!< DXR_GS_DUMP_FRAME (eye counter)

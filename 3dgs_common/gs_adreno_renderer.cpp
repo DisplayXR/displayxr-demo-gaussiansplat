@@ -426,6 +426,14 @@ bool GsAdrenoRenderer::createSceneResources() {
         valsOddBuffer_[s] = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
         uniformBuffer_[s] = gsCreateBuffer(device_, physDevice_, sizeof(GsUniformBuffer),
                                            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, hostVis);
+        // VkDrawIndirectCommand for the compacted draw + a host-visible mirror
+        // so the throttled GS_TS line can report how many instances actually
+        // reached the rasterizer.
+        drawCmdBuffer_[s] = gsCreateBuffer(device_, physDevice_, 16,
+            ssbo | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            devLocal);
+        drawCmdHost_[s] = gsCreateBuffer(device_, physDevice_, 16,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, hostVis);
     }
 
     // Radix sort workgroup sizing — parallelism, NOT just coverage. With a
@@ -475,12 +483,13 @@ bool GsAdrenoRenderer::createSceneResources() {
     // ── Descriptor pool ──
     {
         // Per slot: 7 sets (preprocSet1, keys, histEven, histOdd, sortE2O,
-        // sortO2E, splat) using 20 storage + 1 uniform descriptors. Plus 2 single
+        // sortO2E, splat) using 21 storage + 1 uniform descriptors (the keys
+        // set gained the VkDrawIndirectCommand for the compacted draw). Plus 2 single
         // sets (cov3d, preprocSet0) using 4 storage. Sized from kFrameRing so it
         // scales if the ring depth changes.
         // (+1 storage IMAGE per slot: the #112 coverage raster on preprocSet1.)
         VkDescriptorPoolSize sizes[3] = {
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 20 * kFrameRing + 4},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21 * kFrameRing + 4},
             {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1 * kFrameRing},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 * kFrameRing}};
         VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -512,8 +521,9 @@ bool GsAdrenoRenderer::createSceneResources() {
     // ── keygen: attr → {keys, payloads} + push {count, depthMin, invRange} ──
     dslKeys_ = makeDSL(device_, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                 VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER});
-    layoutKeys_ = makePipeLayout(device_, {dslKeys_}, sizeof(uint32_t) + 2 * sizeof(float));
+    layoutKeys_ = makePipeLayout(device_, {dslKeys_}, 2 * sizeof(uint32_t) + 2 * sizeof(float));
     { VkShaderModule m = makeModule(device_, splat_keys_comp_data, sizeof(splat_keys_comp_data));
       pipeKeys_ = makeCompute(device_, layoutKeys_, m); vkDestroyShaderModule(device_, m, nullptr); }
 
@@ -644,6 +654,7 @@ bool GsAdrenoRenderer::createSceneResources() {
         writeDS(device_, dsKeys_[s], 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, attrBuffer_[s].buffer, attrBuffer_[s].size);
         writeDS(device_, dsKeys_[s], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, keysEvenBuffer_[s].buffer, keysEvenBuffer_[s].size);
         writeDS(device_, dsKeys_[s], 2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, valsEvenBuffer_[s].buffer, valsEvenBuffer_[s].size);
+        writeDS(device_, dsKeys_[s], 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, drawCmdBuffer_[s].buffer, drawCmdBuffer_[s].size);
 
         dsHistEven_[s] = allocDS(device_, descriptorPool_, dslHist_);
         writeDS(device_, dsHistEven_[s], 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, keysEvenBuffer_[s].buffer, keysEvenBuffer_[s].size);
@@ -896,9 +907,19 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
             const uint64_t mask = (tsValidBits_ >= 64) ? ~0ULL : ((1ULL << tsValidBits_) - 1ULL);
             auto ms = [&](uint32_t a, uint32_t b) -> double {
                 return (double)((ts[b] & mask) - (ts[a] & mask)) * (double)timestampPeriod_ / 1.0e6; };
-            GS_LOGI("GS_TS[adreno] N=%u render=%ux%u(scale=%.2f keep=%.2f) | preproc=%.2f keygen=%.2f "
+            // Survivor count from the same retired submission (host-visible
+            // mirror of the VkDrawIndirectCommand; instanceCount is word 1).
+            if (knobs_.compactDraw && drawCmdHost_[slot].buffer != VK_NULL_HANDLE) {
+                void *m = nullptr;
+                if (vkMapMemory(device_, drawCmdHost_[slot].memory, 0, 16, 0, &m) == VK_SUCCESS) {
+                    lastDrawnInstances_ = ((const uint32_t *)m)[1];
+                    vkUnmapMemory(device_, drawCmdHost_[slot].memory);
+                }
+            }
+            GS_LOGI("GS_TS[adreno] N=%u drawn=%u render=%ux%u(scale=%.2f keep=%.2f) | preproc=%.2f keygen=%.2f "
                     "radix=%.2f draw=%.2f blit=%.2f | TOTAL=%.2f ms",
-                    N, rw, rh, renderScale_, keepFrac_, ms(0,1), ms(1,2), ms(2,3), ms(3,4), ms(4,5), ms(0,5));
+                    N, knobs_.compactDraw ? lastDrawnInstances_ : N,
+                    rw, rh, renderScale_, keepFrac_, ms(0,1), ms(1,2), ms(2,3), ms(3,4), ms(4,5), ms(0,5));
         }
     }
 
@@ -966,10 +987,24 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 1);
 
     // ── 2. keygen: far-first depth key + index payload ──
+    // Seed the VkDrawIndirectCommand first: vertexCount = 4 (the quad strip),
+    // instanceCount = 0 for splat_keys.comp's atomicAdd to count survivors into.
+    // vkCmdUpdateBuffer is a transfer, so it needs its own barrier before the
+    // compute stage reads/writes the same memory.
+    const bool compactDraw = knobs_.compactDraw;
+    if (compactDraw) {
+        const uint32_t seed[4] = {4u, 0u, 0u, 0u};
+        vkCmdUpdateBuffer(cmd, drawCmdBuffer_[slot].buffer, 0, sizeof(seed), seed);
+        VkMemoryBarrier tb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        tb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        tb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
+    }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeKeys_);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutKeys_, 0, 1, &dsKeys_[slot], 0, nullptr);
-    struct { uint32_t count; float depthMin; float invRange; }
-        kpc = {N, depthQMin, 65535.0f / (depthQMax - depthQMin)};
+    struct { uint32_t count; float depthMin; float invRange; uint32_t compact; }
+        kpc = {N, depthQMin, 65535.0f / (depthQMax - depthQMin), compactDraw ? 1u : 0u};
     vkCmdPushConstants(cmd, layoutKeys_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(kpc), &kpc);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
@@ -1001,11 +1036,13 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     }
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 3);
 
-    // Make attr[] + sorted payloads visible to the vertex shader.
+    // Make attr[] + sorted payloads visible to the vertex shader, and the
+    // survivor count visible to the indirect-draw fetch.
     mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+        VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        0, 1, &mb, 0, nullptr, 0, nullptr);
 
     // ── 4. instanced alpha-blended quad draw into renderImage_ (scaled region) ──
     VkClearValue clear = {}; clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
@@ -1022,7 +1059,14 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutSplat_, 0, 1, &dsSplat_[slot], 0, nullptr);
     uint32_t splatPC[2] = {rw, rh};
     vkCmdPushConstants(cmd, layoutSplat_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(splatPC), splatPC);
-    vkCmdDraw(cmd, 4, N, 0, 0);
+    if (compactDraw) {
+        // Survivors are the prefix [0, instanceCount) of the sorted payload —
+        // see the key-reservation argument in splat_keys.comp. A culled
+        // gaussian now costs no vertex invocation at all.
+        vkCmdDrawIndirect(cmd, drawCmdBuffer_[slot].buffer, 0, 1, 0);
+    } else {
+        vkCmdDraw(cmd, 4, N, 0, 0);
+    }
     vkCmdEndRenderPass(cmd);  // renderImage_ now in TRANSFER_SRC_OPTIMAL
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 4);
 
@@ -1055,6 +1099,14 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 5);
+
+    // Mirror the survivor count for the next throttled GS_TS line. Read when
+    // this slot's fence next signals, exactly like the timestamps, so nothing
+    // here synchronises.
+    if (compactDraw) {
+        VkBufferCopy bc = {0, 0, 16};
+        vkCmdCopyBuffer(cmd, drawCmdBuffer_[slot].buffer, drawCmdHost_[slot].buffer, 1, &bc);
+    }
 
     // ── One-shot DXR_GS_DUMP: copy the (pre-blit, pre-upscale) render target
     //    into a host buffer in this same submission. Fires on exactly one eye,
@@ -1226,6 +1278,7 @@ void GsAdrenoRenderer::cleanupScene() {
         gsDestroyBuffer(device_, keysEvenBuffer_[s]); gsDestroyBuffer(device_, keysOddBuffer_[s]);
         gsDestroyBuffer(device_, valsEvenBuffer_[s]); gsDestroyBuffer(device_, valsOddBuffer_[s]);
         gsDestroyBuffer(device_, histBuffer_[s]);
+        gsDestroyBuffer(device_, drawCmdBuffer_[s]); gsDestroyBuffer(device_, drawCmdHost_[s]);
     }
 
     posX_.clear(); posY_.clear(); posZ_.clear();

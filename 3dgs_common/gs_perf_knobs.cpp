@@ -120,7 +120,10 @@ Knobs load(float defaultRenderScale, float defaultKeepFrac)
     // leaves the (bit-exact) opacity-aware extent on.
     k.opacityExtent = !equals("DXR_GS_EXTENT", "debug.dxr.gs.extent", "3sigma");
     k.invisibleCull = getBool("DXR_GS_INVISIBLE_CULL", "debug.dxr.gs.invcull", true);
-    k.compactDraw = getBool("DXR_GS_COMPACT", "debug.dxr.gs.compact", true);
+    // Opt-IN: lossless, but measured a large REGRESSION on macOS/MoltenVK and
+    // it only removes gaussians preprocess already culled — 0 % of butterfly.spz
+    // and 3.4 % of a 364k object scan at their rest poses. See the PR body.
+    k.compactDraw = getBool("DXR_GS_COMPACT", "debug.dxr.gs.compact", false);
     k.maxRadiusFrac = getFloat("DXR_GS_MAX_RADIUS_FRAC", "debug.dxr.gs.maxradiusfrac", 0.0f);
     if (!(k.maxRadiusFrac > 0.0f && k.maxRadiusFrac <= 1.0f)) k.maxRadiusFrac = 0.0f;
     lookup("DXR_GS_DUMP", "debug.dxr.gs.dump", k.dumpPath, sizeof(k.dumpPath));
