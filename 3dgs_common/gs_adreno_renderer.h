@@ -35,6 +35,8 @@
 
 #pragma once
 
+#include "gs_scene_loader.h"  // GsVertex, GsSceneCamera
+
 #include <vulkan/vulkan.h>
 #include <string>
 #include <cstdint>
@@ -64,6 +66,16 @@ struct GsAdrenoRenderer {
     //! to surface this to the user, since a chrome-free transparent window has
     //! no other way to say why nothing appeared.
     const std::string& lastLoadError() const { return lastLoadError_; }
+
+    //! The recording camera the CURRENT scene declared, or a default-constructed
+    //! (`present == false`) one when it declared none. Only a SOG bundle with a
+    //! `camera` block fills it; its presence is what selects the viewer's
+    //! camera rig. Valid from the moment loadScene() returns until the next load.
+    const GsSceneCamera& sceneCamera() const { return sceneCamera_; }
+
+    //! Median forward depth (-z) of the current cloud in metres, measured
+    //! before decimation; 0 when unknown. The camera rig's default pivot.
+    float sceneMedianForwardDepthM() const { return sceneMedianForwardDepthM_; }
     uint32_t gaussianCount() const { return numGaussians_; }
 
     // Robust scene centroid + per-axis extent (outlier-trimmed): per axis takes
@@ -162,6 +174,8 @@ private:
     bool sceneLoaded_ = false;
     std::string loadedScenePath_;
     std::string lastLoadError_;
+    GsSceneCamera sceneCamera_;
+    float sceneMedianForwardDepthM_ = 0.0f;
     uint32_t numGaussians_ = 0;
 
     // Internal render scale (1.0 = full res). Default 0.6 on Android — the

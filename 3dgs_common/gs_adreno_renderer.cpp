@@ -13,6 +13,8 @@
 #include "gs_adreno_renderer.h"
 #include "gs_scene_loader.h"
 #include "gs_spz_loader.h"
+#include "gs_sog_loader.h"
+#include "gs_camera_rig.h"
 
 #include <cstdio>
 #include <cstring>
@@ -244,9 +246,16 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
     std::string ext = path.substr(path.find_last_of('.'));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     bool ok;
+    // Cleared on EVERY load, before the dispatch — see the note in
+    // GsRenderer::loadScene.
+    sceneCamera_ = GsSceneCamera();
     if (ext == ".spz") {
         SpzFileInfo info;
         ok = ParseSpzFile(path, verts, &info);
+        if (!ok) lastLoadError_ = info.error;
+    } else if (ext == ".sog") {
+        SogFileInfo info;
+        ok = ParseSogFile(path, verts, &info, &sceneCamera_);
         if (!ok) lastLoadError_ = info.error;
     } else {
         ok = ParsePlyFile(path, verts);
@@ -257,6 +266,12 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
         GS_LOGE("GsAdreno: parse failed: %s - %s", scenePath, lastLoadError_.c_str());
         return false;
     }
+
+    // Median forward depth of the cloud as loaded (before any decimation, so
+    // the number does not move with a perf knob). It stands in for the gallery
+    // camera model's `dSubject` and is what the camera rig pivots about when
+    // the file names no convergence — see gs_camera_rig.h.
+    sceneMedianForwardDepthM_ = GsMedianForwardDepth(verts);
 
     // Load-time decimation: keep ~keepFrac_ of the gaussians, hash-selected for
     // a spatially-uniform thinning independent of file order. Every stage
