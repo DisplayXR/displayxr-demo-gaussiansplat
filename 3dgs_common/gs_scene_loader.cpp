@@ -161,7 +161,7 @@ bool ValidateSceneFile(const std::string& path)
     std::filesystem::path p(path);
     auto ext = p.extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-    if (ext != ".ply" && ext != ".spz") return false;
+    if (ext != ".ply" && ext != ".spz" && ext != ".sog") return false;
 
     return std::filesystem::exists(p);
 }
