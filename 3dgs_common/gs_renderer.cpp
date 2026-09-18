@@ -9,6 +9,7 @@
  */
 
 #include "gs_renderer.h"
+#include "gs_perf_knobs.h"
 #include "gs_scene_loader.h"
 #include "gs_spz_loader.h"
 #include "gs_sog_loader.h"
@@ -56,6 +57,16 @@ struct alignas(16) GsUniformBuffer {
     float clip_near;           // offset 168 — view-space near cull (0 = disabled)
 };
 static_assert(sizeof(GsUniformBuffer) == 176, "GsUniformBuffer must be 176 bytes");
+
+// ── Preprocess push constants (mirror of PreprocPush in preprocess.comp) ──
+// Identical layout to the graphics renderer's, deliberately: the two
+// preprocess shaders share the extent/cull math and must share its controls.
+struct GsPreprocPush {
+    uint32_t coverage_on;
+    uint32_t flags;        // gsperf::kFlag*
+    float max_radius_px;   // 0 = uncapped (the historical behaviour)
+};
+static_assert(sizeof(GsPreprocPush) == 12, "GsPreprocPush must match the shader block");
 
 // ── Helper: create a compute pipeline from SPIR-V ───────────────────────
 static VkShaderModule createShaderModule(VkDevice device, const uint32_t* code, size_t sizeBytes)
@@ -285,9 +296,26 @@ bool GsRenderer::init(VkInstance instance,
         timestampPeriod_ = 0.0f;  // disable profiling
     }
 
+    // ── DXR_GS_* perf levers ──────────────────────────────────────────────
+    // setRenderScale/setKeepFraction/setCullMinOpacity exist on this class but
+    // had ZERO call sites, so on desktop the levers were unreachable. Seed them
+    // from the environment here (the setters stay authoritative for any caller
+    // that uses them afterwards). An unset environment reproduces the previous
+    // defaults exactly. Same knobs, same names as the graphics renderer.
+    knobs_ = gsperf::load(/*defaultRenderScale=*/renderScale_,
+                          /*defaultKeepFrac=*/cullKeepFrac_);
+    renderScale_ = knobs_.renderScale;
+    cullKeepFrac_ = knobs_.keepFrac;
+    if (knobs_.cullAlpha > 0.0f) cullMinOpacity_ = knobs_.cullAlpha;
+
     initialized_ = true;
     GS_LOGI("GsRenderer: initialized (%ux%u, subgroup=%u, tiles=%ux%u, ts_period=%.2fns valid_bits=%u)",
             width_, height_, subgroupSize_, tileX_, tileY_, timestampPeriod_, tsValidBits_);
+    GS_LOGI("GsRenderer: knobs scale=%.2f keep=%.2f cullAlpha=%.3f extent=%s "
+            "invCull=%s maxRadiusFrac=%.3f",
+            renderScale_, cullKeepFrac_, cullMinOpacity_,
+            knobs_.opacityExtent ? "opacity" : "3sigma",
+            knobs_.invisibleCull ? "on" : "off", knobs_.maxRadiusFrac);
     return true;
 }
 
@@ -317,7 +345,7 @@ bool GsRenderer::createPipelines()
     dslPreprocessSet0_ = createDSLayout(device_, {S, S});
     dslPreprocessSet1_ = createDSLayout(device_, {U, S, S, I});
     layoutPreprocess_ = createPipeLayout(device_,
-        {dslPreprocessSet0_, dslPreprocessSet1_}, sizeof(uint32_t));
+        {dslPreprocessSet0_, dslPreprocessSet1_}, sizeof(GsPreprocPush));
     {
         auto mod = createShaderModule(device_, preprocess_comp_data,
                                       sizeof(preprocess_comp_data));
@@ -1364,9 +1392,15 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         // #112: arm/disarm the pre-cull silhouette scatter. Session-level, not
         // clip-level — the coverage source must not change shape when the far
         // clip engages, or it would jitter on its own.
-        const uint32_t covOn = silhouetteOn_ ? 1u : 0u;
+        GsPreprocPush ppPush = {};
+        ppPush.coverage_on = silhouetteOn_ ? 1u : 0u;
+        ppPush.flags = gsperf::preprocFlags(knobs_);
+        // Fraction of the RENDER height, so the cap means the same thing on
+        // screen at any render scale.
+        ppPush.max_radius_px = (knobs_.maxRadiusFrac > 0.0f)
+                                   ? knobs_.maxRadiusFrac * (float)rh : 0.0f;
         vkCmdPushConstants(cmd, layoutPreprocess_, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(uint32_t), &covOn);
+                           0, sizeof(ppPush), &ppPush);
         vkCmdDispatch(cmd, groups256, 1, 1);
         if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 1);  // ts[1] preprocess
 
@@ -1722,6 +1756,49 @@ void GsRenderer::renderEye(VkImage swapchainImage,
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
         if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool_, 7);  // ts[7] blit/copy
 
+        // ── One-shot DXR_GS_DUMP: the pre-blit, pre-upscale render target as a
+        //    PNG, once, at eye DXR_GS_DUMP_FRAME. The artefact the bit-exactness
+        //    claims are diffed on; steady-state timing is untouched. NOTE: the
+        //    barrier above has already put renderImage_ back to GENERAL, so this
+        //    copy declares TRANSFER_SRC for itself.
+        const bool dumpNow = (!dumpDone_ && knobs_.dumpPath[0] != '\0' &&
+                              frameCounter_ == knobs_.dumpFrame);
+        if (dumpNow) {
+            const VkDeviceSize bytes = (VkDeviceSize)rw * (VkDeviceSize)rh * 4;
+            if (dumpHost_.buffer == VK_NULL_HANDLE || dumpHost_.size < bytes) {
+                gsDestroyBuffer(device_, dumpHost_);
+                dumpHost_ = gsCreateBuffer(device_, physDevice_, bytes,
+                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                               VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            }
+            if (dumpHost_.buffer != VK_NULL_HANDLE) {
+                VkImageMemoryBarrier db = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                db.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                db.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                db.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                db.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                db.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                db.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                db.image = renderImage_.image;
+                db.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+                VkBufferImageCopy r = {};
+                r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                r.imageExtent = {rw, rh, 1};
+                vkCmdCopyImageToBuffer(cmd, renderImage_.image,
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       dumpHost_.buffer, 1, &r);
+                db.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                db.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                db.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &db);
+                dumpW_ = rw; dumpH_ = rh;
+            }
+        }
+
         vkEndCommandBuffer(cmd);
         VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
         si.commandBufferCount = 1;
@@ -1729,6 +1806,19 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
         vkQueueWaitIdle(queue_);
         vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+
+        if (dumpNow && dumpHost_.buffer != VK_NULL_HANDLE) {
+            dumpDone_ = true;  // one shot even if the write below fails
+            void *m = nullptr;
+            if (vkMapMemory(device_, dumpHost_.memory, 0,
+                            (VkDeviceSize)dumpW_ * dumpH_ * 4, 0, &m) == VK_SUCCESS) {
+                const bool ok = gsperf::writePng(knobs_.dumpPath, (const uint8_t *)m,
+                                                 dumpW_, dumpH_);
+                vkUnmapMemory(device_, dumpHost_.memory);
+                GS_LOGI("GsRenderer: DXR_GS_DUMP %s %ux%u -> %s",
+                        ok ? "wrote" : "FAILED writing", dumpW_, dumpH_, knobs_.dumpPath);
+            }
+        }
 
         // ── Read back GPU timestamps, log per-stage ms every kTsLogPeriod ──
         frameCounter_++;
@@ -2111,6 +2201,7 @@ void GsRenderer::cleanupScene()
     // #112 pre-cull silhouette coverage
     gsDestroyImage(device_, coverageImage_);
     gsDestroyBuffer(device_, coverageHost_);
+    gsDestroyBuffer(device_, dumpHost_);
     coverageW_ = 0;
     coverageH_ = 0;
 

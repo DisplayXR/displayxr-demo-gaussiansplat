@@ -43,6 +43,7 @@
 #include <string>
 #include <cstdint>
 #include <vector>
+#include "gs_perf_knobs.h"
 #include "gs_vulkan_utils.h"
 
 struct GsAdrenoRenderer {
@@ -185,10 +186,25 @@ private:
     GsFitBounds fitBoundsLegacy_;
     uint32_t numGaussians_ = 0;
 
-    // Internal render scale (1.0 = full res). Default 0.6 on Android — the
+    // Internal render scale (1.0 = full res). Default 1.0 everywhere — the
     // pipeline runs at scale×eye dims then linear-upscales the blit.
     float renderScale_ = 1.0f;
     float keepFrac_ = 1.0f;     // load-time decimation (1.0 = keep all)
+
+    // Resolved DXR_GS_* levers (gs_perf_knobs.h). Read once in init(); the
+    // per-frame path only reads the already-resolved fields, never the
+    // environment.
+    gsperf::Knobs knobs_;
+
+    // ── One-shot DXR_GS_DUMP capture ──
+    // A synchronous readback of the internal render target, written as a PNG
+    // exactly once (at eye DXR_GS_DUMP_FRAME). It exists to PROVE bit-exactness
+    // of the extent/cull levers by diffing two runs, so it deliberately reads
+    // the pre-blit, pre-upscale image — the only surface where "same pixels"
+    // is a meaningful claim.
+    GsBuffer dumpHost_;
+    bool dumpDone_ = false;
+    uint32_t dumpW_ = 0, dumpH_ = 0;
 
     // ── Frame pipelining ring ──
     // Each renderEye submits with a per-slot fence instead of vkQueueWaitIdle,

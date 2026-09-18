@@ -11,6 +11,7 @@
  */
 
 #include "gs_adreno_renderer.h"
+#include "gs_perf_knobs.h"
 #include "gs_scene_loader.h"
 #include "gs_spz_loader.h"
 #include "gs_sog_loader.h"
@@ -57,6 +58,16 @@ struct alignas(16) GsUniformBuffer {
     float clip_near;
 };
 static_assert(sizeof(GsUniformBuffer) == 176, "GsUniformBuffer must be 176 bytes");
+
+// ── Preprocess push constants (mirror of PreprocPush in adreno_preprocess.comp) ──
+// The perf levers ride here rather than in the UBO so they stay per-dispatch
+// and cost no std140 re-layout; `flags` carries gsperf::kFlag* bits.
+struct GsPreprocPush {
+    uint32_t coverage_on;
+    uint32_t flags;
+    float max_radius_px;   // 0 = uncapped (the historical behaviour)
+};
+static_assert(sizeof(GsPreprocPush) == 12, "GsPreprocPush must match the shader block");
 
 // ═══════════════════════════ small Vulkan helpers ═══════════════════════════
 
@@ -165,27 +176,16 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
 
     // Render-scale: the whole pipeline runs at scale×eye dims then upscales the
     // blit. Per-fragment overdraw dominates, so this is a near-linear fps lever.
-    renderScale_ = 1.0f;
-    keepFrac_ = 1.0f;
-#if defined(__ANDROID__)
-    // Max-quality default: native resolution + all gaussians. On the NP02J this is
-    // ~22 fps (vs ~48 at 0.45/0.25) — the team chose image quality over framerate
-    // for the demo. debug.dxr.gs.scale / .keep still override live for perf sweeps.
-    renderScale_ = 1.0f;
-    keepFrac_ = 1.0f;
-    {
-        char v[PROP_VALUE_MAX] = {0};
-        if (__system_property_get("debug.dxr.gs.scale", v) > 0) {
-            float s = (float)atof(v);
-            if (s > 0.05f) renderScale_ = s;
-        }
-        v[0] = 0;
-        if (__system_property_get("debug.dxr.gs.keep", v) > 0) {
-            float k = (float)atof(v);
-            if (k > 0.01f && k <= 1.0f) keepFrac_ = k;
-        }
-    }
-#endif
+    //
+    // Max-quality default on every leg: native resolution + all gaussians. On
+    // the NP02J that is ~22 fps (vs ~48 at 0.45/0.25) — the team chose image
+    // quality over framerate for the demo. Every lever below is an override, so
+    // an unset environment reproduces the historical behaviour exactly.
+    // DXR_GS_SCALE / DXR_GS_KEEP now work on all four legs; the Android
+    // debug.dxr.gs.* properties keep working unchanged (gs_perf_knobs.h).
+    knobs_ = gsperf::load(/*defaultRenderScale=*/1.0f, /*defaultKeepFrac=*/1.0f);
+    renderScale_ = knobs_.renderScale;
+    keepFrac_ = knobs_.keepFrac;
     if (renderScale_ < 0.2f) renderScale_ = 0.2f;
     if (renderScale_ > 1.0f) renderScale_ = 1.0f;
 
@@ -232,6 +232,15 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     GS_LOGI("GsAdreno: initialized (%ux%u eye, renderScale=%.2f, subgroup=%u, "
             "ts_period=%.2fns valid_bits=%u)",
             width_, height_, renderScale_, subgroupSize_, timestampPeriod_, tsValidBits_);
+    // One line, once per session: which perf levers are live. Anything that
+    // reports a non-default here changes the pixels or the timings, so a
+    // benchmark log that does not carry it cannot be reproduced.
+    GS_LOGI("GsAdreno: knobs scale=%.2f keep=%.2f cullAlpha=%.3f extent=%s "
+            "invCull=%s compact=%s maxRadiusFrac=%.3f",
+            renderScale_, keepFrac_, knobs_.cullAlpha,
+            knobs_.opacityExtent ? "opacity" : "3sigma",
+            knobs_.invisibleCull ? "on" : "off",
+            knobs_.compactDraw ? "on" : "off", knobs_.maxRadiusFrac);
     return true;
 }
 
@@ -273,6 +282,26 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
     // copy is dropped) and BEFORE any decimation, so no number here moves with
     // a perf knob. See GsSceneMeasurements.
     sceneMeasurements_ = GsMeasureScene(verts);
+
+    // Load-time opacity cull (DXR_GS_CULL_ALPHA) — LOSSY, default off.
+    // scale_opacity[3] is the already-sigmoid'd opacity in [0,1]. Splats below
+    // the threshold still cost a full preprocess + key + sort slot + instanced
+    // quad every eye while contributing almost nothing, so dropping them cuts
+    // every stage at once. Unlike the 1/255 cull in preprocess this one removes
+    // splats that ARE visible, hence opt-in with a documented visual cost.
+    if (knobs_.cullAlpha > 0.0f && verts.size() >= 1024) {
+        const size_t total = verts.size();
+        size_t kept = 0;
+        for (size_t i = 0; i < total; i++) {
+            if (verts[i].scale_opacity[3] < knobs_.cullAlpha) continue;
+            verts[kept++] = verts[i];
+        }
+        if (kept >= 1024) {
+            verts.resize(kept);
+            GS_LOGI("GsAdreno: opacity cull dropped %zu/%zu gaussians (minOpacity=%.3f)",
+                    total - kept, total, (double)knobs_.cullAlpha);
+        }
+    }
 
     // Load-time decimation: keep ~keepFrac_ of the gaussians, hash-selected for
     // a spatially-uniform thinning independent of file order. Every stage
@@ -476,7 +505,7 @@ bool GsAdrenoRenderer::createSceneResources() {
                                            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                                            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE});
     layoutPreprocess_ = makePipeLayout(device_, {dslPreprocessSet0_, dslPreprocessSet1_},
-                                       sizeof(uint32_t));
+                                       sizeof(GsPreprocPush));
     { VkShaderModule m = makeModule(device_, adreno_preprocess_comp_data, sizeof(adreno_preprocess_comp_data));
       pipePreprocess_ = makeCompute(device_, layoutPreprocess_, m); vkDestroyShaderModule(device_, m, nullptr); }
 
@@ -923,9 +952,15 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     // #112: arm/disarm the pre-cull silhouette scatter. Session-level, not
     // clip-level — a coverage source that changed shape when the far clip
     // engaged would jitter on its own.
-    const uint32_t covOn = silhouetteOn_ ? 1u : 0u;
+    GsPreprocPush ppPush = {};
+    ppPush.coverage_on = silhouetteOn_ ? 1u : 0u;
+    ppPush.flags = gsperf::preprocFlags(knobs_);
+    // DXR_GS_MAX_RADIUS_FRAC is a fraction of the RENDER height, so the cap
+    // means the same thing on screen at any render scale.
+    ppPush.max_radius_px = (knobs_.maxRadiusFrac > 0.0f)
+                               ? knobs_.maxRadiusFrac * (float)rh : 0.0f;
     vkCmdPushConstants(cmd, layoutPreprocess_, VK_SHADER_STAGE_COMPUTE_BIT,
-                       0, sizeof(uint32_t), &covOn);
+                       0, sizeof(ppPush), &ppPush);
     vkCmdDispatch(cmd, (N + 255) / 256, 1, 1);
     computeBarrier();
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 1);
@@ -1021,11 +1056,53 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 5);
 
+    // ── One-shot DXR_GS_DUMP: copy the (pre-blit, pre-upscale) render target
+    //    into a host buffer in this same submission. Fires on exactly one eye,
+    //    so nothing about steady-state timing is affected — and the file is the
+    //    artefact the bit-exactness claims are diffed on.
+    const bool dumpNow = (!dumpDone_ && knobs_.dumpPath[0] != '\0' &&
+                          frameCounter_ == knobs_.dumpFrame);
+    if (dumpNow) {
+        const VkDeviceSize bytes = (VkDeviceSize)rw * (VkDeviceSize)rh * 4;
+        if (dumpHost_.buffer == VK_NULL_HANDLE || dumpHost_.size < bytes) {
+            gsDestroyBuffer(device_, dumpHost_);
+            dumpHost_ = gsCreateBuffer(device_, physDevice_, bytes,
+                                       VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        if (dumpHost_.buffer != VK_NULL_HANDLE) {
+            // renderImage_ is left in TRANSFER_SRC_OPTIMAL by the render pass's
+            // final layout, and the blit above already read it from there.
+            VkBufferImageCopy r = {};
+            r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            r.imageExtent = {rw, rh, 1};
+            vkCmdCopyImageToBuffer(cmd, renderImage_[slot].image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   dumpHost_.buffer, 1, &r);
+            dumpW_ = rw; dumpH_ = rh;
+        }
+    }
+
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
     vkQueueSubmit(queue_, 1, &si, ringFence_[slot]);  // fence (not waitIdle) → pipelined
     frameCounter_++;
+
+    if (dumpNow && dumpHost_.buffer != VK_NULL_HANDLE) {
+        dumpDone_ = true;  // one shot even if the write below fails
+        vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
+        void *m = nullptr;
+        if (vkMapMemory(device_, dumpHost_.memory, 0,
+                        (VkDeviceSize)dumpW_ * dumpH_ * 4, 0, &m) == VK_SUCCESS) {
+            const bool ok = gsperf::writePng(knobs_.dumpPath, (const uint8_t *)m,
+                                             dumpW_, dumpH_);
+            vkUnmapMemory(device_, dumpHost_.memory);
+            GS_LOGI("GsAdreno: DXR_GS_DUMP %s %ux%u -> %s",
+                    ok ? "wrote" : "FAILED writing", dumpW_, dumpH_, knobs_.dumpPath);
+        }
+    }
 }
 
 // ═══════════════════════════ getRobustSceneBounds ═══════════════════════════
@@ -1141,6 +1218,8 @@ void GsAdrenoRenderer::cleanupScene() {
     gsDestroyImage(device_, coverageImage_);
     gsDestroyBuffer(device_, coverageHost_);
     coverageW_ = coverageH_ = 0;
+    gsDestroyBuffer(device_, dumpHost_);
+    dumpW_ = dumpH_ = 0;
     for (uint32_t s = 0; s < kFrameRing; s++) {
         gsDestroyImage(device_, renderImage_[s]);
         gsDestroyBuffer(device_, uniformBuffer_[s]); gsDestroyBuffer(device_, attrBuffer_[s]);
