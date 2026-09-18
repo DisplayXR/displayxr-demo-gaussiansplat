@@ -32,7 +32,7 @@
 #include <openxr/XR_DXR_atlas_capture.h>
 #include <openxr/XR_DXR_mcp_tools.h>
 #include <openxr/XR_DXR_view_rig.h>
-#include <dxr_view_config.h>   // DxrSelectViewConfigType (runtime#1486 opt-in)
+#include "../openxr_includes/dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
 
 #include <cctype>
 #include <cmath>

@@ -43,7 +43,7 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
-#include <dxr_view_config.h>   // DxrSelectViewConfigType (runtime#1486 opt-in)
+#include "../openxr_includes/dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
 
 #include <cmath>
 #include <csignal>
