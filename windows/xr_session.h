@@ -92,3 +92,9 @@ void RegisterAgentTools(XrSessionManager& xr);
 // Set `success` false to fail the call to the agent; return the result payload.
 std::string HandleAgentToolCall(XrSessionManager& xr, const std::string& toolName,
                                 const std::string& argsJson, bool& success);
+
+// True when the runtime named an active rendering mode at session create
+// (XrDisplayRenderingModeInfoDXR::isActive, XR_DXR_display_info v13). Set in
+// CreateSession; read by the startup-mode log line in main.cpp. See the
+// definition in xr_session.cpp for why the mode index alone is not enough.
+extern bool g_runtimeNamedActiveMode;

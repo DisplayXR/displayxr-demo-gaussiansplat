@@ -79,6 +79,35 @@ Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` und
 - Uses `XR_DXR_display_info` (v12+) for display dims + rendering modes.
 - Submits a single `XrCompositionLayerProjection` per frame.
 
+**ADOPT the runtime's active rendering mode; never force one at startup.** All
+three desktop legs read `XrDisplayRenderingModeInfoDXR::isActive`
+(`XR_DXR_display_info` v13) once after `xrCreateSession` and take it, logging
+`Startup rendering mode: N (…)`. They used to force mode 1 instead — Windows by
+seeding `g_inputState.absoluteRenderingModeRequested = 1`, macOS by firing an
+unconditional `xrRequestDisplayRenderingModeDXR`, Linux by **re-asserting its own
+mode every frame** for the life of the session. That made every N-view mode
+unreachable from outside the process: a panel in Quad logged `Rendering mode
+changed 4 -> 1` a moment after startup. A pre-v13 runtime names no active mode
+and the app then keeps its own default, still without issuing a request.
+
+Adoption is gated on the active mode being **3D** on every leg: a panel commonly
+reports 2D active at startup and stays there until something asks for 3D, and
+adopting that verbatim would open this 3D demo in mono. When nothing 3D is
+active, mode 1 (the first 3D mode) stands. On macOS and Linux an explicit
+`SIM_DISPLAY_OUTPUT` pin takes **precedence over** adoption — it is the only way
+an agent can select a mode headlessly, so adoption must not silently override it
+(including `2d`, which is how the 1-view atlas gets exercised). The Windows leg
+has no such map; there the env var is read by the runtime's sim_display plug-in
+and adoption is how it reaches the app.
+
+**Exercising N-view headlessly.** `SIM_DISPLAY_OUTPUT` picks the sim_display mode
+for BOTH the runtime and the app's pre-session fallback hint, and the indices must
+match `sim_display_device.c`: `2d`/`passthrough`=0, `anaglyph`=1, `sbs`=2,
+`squeezed`=3, `quad`=4 (`blend` stays at the historical 3). Keys `0`–`4` select a
+mode directly on macOS, `V` cycles. Confirm what actually reached the compositor
+with the runtime's `Atlas blit: view_count=…, eff_tiles=…, layer_view_count=…`
+WARN, not with the app's own log.
+
 **View configuration: `PRIMARY_MULTIVIEW_DXR`, not `PRIMARY_STEREO` (runtime#1486 / #1500).**
 This viewer's per-frame view count comes from the **active DXR rendering mode**
 (`xrEnumerateDisplayRenderingModesDXR` + the 1/2/3/V keys), so it can submit 4
