@@ -79,6 +79,44 @@ Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` und
 - Uses `XR_DXR_display_info` (v12+) for display dims + rendering modes.
 - Submits a single `XrCompositionLayerProjection` per frame.
 
+**View configuration: `PRIMARY_MULTIVIEW_DXR`, not `PRIMARY_STEREO` (runtime#1486 / #1500).**
+This viewer's per-frame view count comes from the **active DXR rendering mode**
+(`xrEnumerateDisplayRenderingModesDXR` + the 1/2/3/V keys), so it can submit 4
+views in sim_display's Quad mode. `PRIMARY_STEREO` now means *exactly* 2 views
+and the runtime rejects an `xrEndFrame` carrying more, so every leg calls
+`DxrSelectViewConfigType(instance, systemId)` once, right after `xrGetSystem()`
+and **before** the first `xrEnumerateViewConfigurationViews()`, and feeds that
+one variable to every view-configuration-typed call
+(`xrEnumerateViewConfigurationViews`, `xrEnumerateEnvironmentBlendModes`,
+`XrSessionBeginInfo::primaryViewConfigurationType`,
+`XrViewLocateInfo::viewConfigurationType`). The helper probes
+`xrEnumerateViewConfigurations` and degrades to `PRIMARY_STEREO` on any runtime
+that does not advertise the new type, so it is safe to call unconditionally —
+but it needs `XR_DXR_display_info` **enabled on the instance**, which is what
+makes the runtime enumerate the type at all.
+
+The helper is vendored at `openxr_includes/dxr_view_config.h` — deliberately one
+level above `openxr/`, because `openxr_includes/` is the single include
+directory all four legs share and it is *not* part of the byte-pinned
+`VENDORED.json` vendor dir (see `openxr_includes/VENDORED.md`). On Windows the
+variable is `XrSessionManager::viewConfigType` from `displayxr-common` (which
+already routes it into all four calls since v2.13.0); macOS/Linux/Android carry
+their own session code and their own variable.
+
+**Never submit more views than were located.** `submitViewCount` is clamped to
+`min(active mode's view count, xrLocateViews' returned count, views actually
+written into `projectionViews[]`, swapchain slice/tile capacity)`, floored at 1
+(dropping to `layerCount = 0` blanks the display) and logged **once** per
+distinct disagreement — never per-frame. INV-3.1; `scripts/check_displayxr_app.py`
+enforces the opt-in.
+
+The **Android leg is stereo-fixed** (`kViewCount = 2` sizes `g_views[]`,
+`projection_views[]` and the whole render path). It opts in for uniformity, and
+`create_swapchains()` falls back to `PRIMARY_STEREO` if the multiview config
+ever reports a count it cannot fill — that path used to be a hard startup
+failure. On today's 2-view Android panels both configs report 2 and the
+behaviour is bit-for-bit unchanged.
+
 The runtime's VK native compositor handles the rest (atlas → display processor → present). The demo doesn't need to know the chroma-key / weave / DComp internals — those happen runtime-side based on the `XR_DXR_win32_window_binding` flags the demo sets at session create.
 
 ## Projection / clip planes
