@@ -60,6 +60,8 @@
 #include "camera3d_view.h"
 #include "gs_renderer_select.h"   // GsActiveRenderer = graphics on Apple Silicon (default)
 #include "gs_scene_loader.h"
+#include "gs_camera_rig.h"       // GsCameraRig / GsRigFlags — the photo-lifted rig
+#include "launch_args.h"         // dxr::ParseLaunchArgs — the shared --key=value grammar
 #include "atlas_capture.h"
 #include "auto_fit.h"             // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
 #include "auto_fit_canvas.h"      // dxr::AutoFitCanvas — the runtime-resolved viewport
@@ -183,6 +185,18 @@ static dxr::ModeSwitch g_modeSwitch;
 static bool g_modeSwitchConfigured = false;
 static uint32_t g_msLastMode = 1; // matches g_input.currentRenderingMode default
 static const float CAMERA_HALF_TAN_VFOV = 0.32491969623f;
+
+// ── The two rigs (see 3dgs_common/gs_camera_rig.h) ──────────────────────────
+// Display rig (everything above): auto-fit the AABB to the virtual display and
+// orbit the display around the subject. Camera rig: frame a photo-lifted scene
+// through the camera it was predicted from. The rig is chosen per SCENE — a
+// `camera` block in a SOG meta.json means camera rig, its absence means display
+// rig — and `--rig=` overrides. g_cameraRigActive is the single live flag; when
+// it is false every path below behaves exactly as it did before.
+static dxr::LaunchArgs g_launch;        //!< shared flags (--src/--vh/--pose/...)
+static GsRigFlags      g_rigFlags;      //!< rig flags (--rig/--fx/--size/...)
+static GsCameraRig     g_camRig;        //!< resolved camera rig, valid while active
+static bool            g_cameraRigActive = false;
 
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
@@ -324,6 +338,7 @@ static float RigLocalEyeZ(const XrPosef& rig, const XrVector3f& eyeWorld) {
 struct AppXrSession;
 static void UpdateTopBarButtonTitles(AppXrSession& xr);
 static void ApplyAutoFitForLoadedScene();
+static void ApplyRigForLoadedScene();
 
 // ============================================================================
 // Input timestamp helper
@@ -368,6 +383,23 @@ static void yaw_pitch_from_quat(XrQuaternionf q, float* yaw, float* pitch) {
 // ============================================================================
 
 static void UpdateCameraMovement(InputState& input, float dt, float displayHeightM) {
+    if (input.resetViewRequested && g_cameraRigActive && g_camRig.valid) {
+        // The camera rig's rest pose is the capture camera, and there is
+        // nothing else to return to: no fit, no zoom, no turntable. Absolute,
+        // like the display rig's reset, so repeated presses cannot drift.
+        input.yaw = 0.0f;
+        input.pitch = 0.0f;
+        input.cameraPosX = g_camRig.restPosition[0];
+        input.cameraPosY = g_camRig.restPosition[1];
+        input.cameraPosZ = g_camRig.restPosition[2];
+        input.viewParams = ViewParams();
+        input.viewParams.scaleFactor = 1.0f;
+        input.resetViewRequested = false;
+        input.transitioning = false;
+        input.animationActive = false;
+        input.lastInputTimeSec = NowSec();
+        return;
+    }
     if (input.resetViewRequested) {
         input.pitch = 0;
         input.viewParams = ViewParams();
@@ -444,7 +476,10 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.lastInputTimeSec = NowSec();
     } else {
         double idleFor = NowSec() - input.lastInputTimeSec;
-        input.animationActive = (input.animateEnabled && idleFor > 10.0);
+        // Never on the camera rig: a photo-lifted cloud has no support more
+        // than ~15 deg off the capture axis, so a turntable shows floaters.
+        input.animationActive =
+            (input.animateEnabled && !g_cameraRigActive && idleFor > 10.0);
         if (input.animationActive) {
             float rate = 6.2831853f / 20.0f; // one revolution per 20 seconds
             input.yaw += rate * dt;
@@ -557,7 +592,7 @@ static void OpenLoadDialog() {
                         g_loadedFileName = GetPlyFilename(pathStr);
                         LOG_INFO("Scene loaded: %s (%s)", g_loadedFileName.c_str(),
                             GetPlyFileSize(pathStr).c_str());
-                        ApplyAutoFitForLoadedScene();
+                        ApplyRigForLoadedScene();
                     } else {
                         LOG_ERROR("Failed to load scene: %s", path);
                         NSAlert *alert = [[NSAlert alloc] init];
@@ -615,6 +650,24 @@ static void OpenLoadDialog() {
 
 - (void)mouseDragged:(NSEvent *)event {
     MarkUserInput(g_input);
+    if (g_cameraRigActive && g_camRig.valid) {
+        // Camera rig: a drag turns the SCENE about the pivot, not the camera.
+        // The camera and its window stay put — the eyes are the runtime's
+        // (head-tracked) and displacing them would fight the tracker, and on a
+        // flat panel an off-axis window shift reads as shear rather than
+        // rotation. Turntable sign (the scene follows the finger) and the
+        // comfort cone are GsOrbitFromDrag's; the gain is per canvas fraction,
+        // so a full-width drag reaches the cap and no further.
+        NSSize vb = [[g_window contentView] bounds].size;
+        const float vw = (vb.width  > 1.0f) ? (float)vb.width  : 1.0f;
+        const float vh = (vb.height > 1.0f) ? (float)vb.height : 1.0f;
+        const GsOrbit d = GsOrbitFromDrag((float)[event deltaX] / vw,
+                                          (float)[event deltaY] / vh);
+        g_input.yaw   += d.yaw;
+        g_input.pitch += d.pitch;
+        g_camRig.ClampOrbit(g_input.yaw, g_input.pitch);
+        return;
+    }
     g_input.yaw -= (float)[event deltaX] * 0.005f;
     // pitch -= deltaY: since W7 (#396) gs_renderer flips Vulkan-Y at the
     // RASTER stage (ndc2Pix(-ndc.y) + cov2d off-diagonal negation), NOT by
@@ -1326,7 +1379,7 @@ static void HandleMcpToolCall(AppXrSession& xr, const XrEventDataMCPToolCallDXR*
             result = "{\"error\":\"failed to load '" + JsonEscape(path) + "' (corrupt or unsupported)\"}";
         } else {
             g_loadedFileName = GetPlyFilename(path);
-            ApplyAutoFitForLoadedScene();
+            ApplyRigForLoadedScene();
             snprintf(buf, sizeof(buf), "\",\"splat_count\":%u}", g_gsRenderer.gaussianCount());
             result = "{\"file\":\"" + JsonEscape(path) + buf;
             LOG_INFO("Agent loaded scene: %s (%u splats)",
@@ -2099,8 +2152,60 @@ static void ApplyAutoFitForLoadedScene() {
     // +Y-up convention. No runtime view-stage flips needed.
 }
 
-// Optional scene path from the command line (argv[1]); overrides the bundled
-// butterfly auto-load. Lets us launch straight into a specific asset:
+// Frame the freshly-loaded scene with whichever rig it asked for.
+//
+// This is the ONE place the choice is made, so every load path (startup, the
+// Open dialog, drag-and-drop, the MCP tool) agrees. Camera rig when the scene
+// declared a capture camera (or --rig=camera supplied one), display rig
+// otherwise — and a camera rig that cannot be resolved falls back to the
+// display rig with a WARN rather than inventing intrinsics.
+static void ApplyRigForLoadedScene() {
+    const GsSceneCamera& cam = g_gsRenderer.sceneCamera();
+    if (GsSelectRigKind(cam, g_rigFlags) == GsRigKind::Camera) {
+        // Coarse fallback pivot for a --rig=camera override on a scene that
+        // carries no camera: the forward depth of the main object's centre.
+        float boundsDepth = 0.0f;
+        float c[3], e[3];
+        if (g_gsRenderer.getMainObjectBounds(64u, c, e) && -c[2] > 0.0f) boundsDepth = -c[2];
+
+        std::string why;
+        if (GsResolveCameraRig(cam, g_rigFlags, g_gsRenderer.sceneMedianForwardDepthM(),
+                               boundsDepth, g_camRig, &why)) {
+            g_cameraRigActive = true;
+            g_fitValid = false;               // nothing to return to but the rest pose
+            g_input.yaw = 0.0f;               // the orbit is the SCENE's, and rest is 0
+            g_input.pitch = 0.0f;
+            g_input.cameraPosX = g_camRig.restPosition[0];
+            g_input.cameraPosY = g_camRig.restPosition[1];
+            g_input.cameraPosZ = g_camRig.restPosition[2];
+            g_input.viewParams.scaleFactor = 1.0f;
+            // The idle turntable is a display-rig gesture: a photo-lifted scene
+            // has no support more than ~15 deg off the capture axis, so spinning
+            // it shows floaters, not the subject.
+            g_input.animateEnabled = false;
+            g_input.animationActive = false;
+            MarkUserInput(g_input);
+            float du = 0.0f, dv = 0.0f;
+            g_camRig.PrincipalShiftTan(du, dv);
+            LOG_INFO("Camera rig: fx=%.3f fy=%.3f cx=%.1f cy=%.1f %dx%d baseline=%.4fm "
+                     "pivot=%.3fm (%s) vFOV=%.1fdeg principal-shift=(%.5f, %.5f)",
+                     g_camRig.fx, g_camRig.fy, g_camRig.cx, g_camRig.cy,
+                     g_camRig.width, g_camRig.height, g_camRig.baselineM,
+                     g_camRig.pivotM, g_camRig.pivotSource.c_str(),
+                     g_camRig.VerticalFovRad((float)g_camRig.width / (float)g_camRig.height) *
+                         57.2957795f, du, dv);
+            return;
+        }
+        LOG_WARN("Camera rig requested but %s — framing with the display rig instead",
+                 why.c_str());
+    }
+    g_cameraRigActive = false;
+    ApplyAutoFitForLoadedScene();
+}
+
+// Optional scene path from the command line (a positional argument or --src=);
+// overrides the bundled butterfly auto-load. Lets us launch straight into a
+// specific asset:
 //   gaussian_splatting_handle_vk_macos "/path/to/KAWS FAMILY.spz"
 static std::string g_cliScenePath;
 
@@ -2127,7 +2232,7 @@ static void TryAutoLoadBundledScene() {
     if (g_gsRenderer.loadScene(path.c_str())) {
         g_loadedFileName = GetPlyFilename(path);
         LOG_INFO("Loaded %s (%s)", g_loadedFileName.c_str(), GetPlyFileSize(path).c_str());
-        ApplyAutoFitForLoadedScene();
+        ApplyRigForLoadedScene();
     } else {
         LOG_WARN("Auto-load failed for %s", path.c_str());
     }
@@ -2141,8 +2246,33 @@ int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
-    if (argc > 1 && argv[1] && argv[1][0] != '\0') {
-        g_cliScenePath = argv[1];
+    // Command line. The shared grammar is displayxr-common's launch-args parser
+    // — the same one the Windows arm uses, so `--vh=`, `--src=`, a positional
+    // path and the `displayxr-view:` protocol mean exactly what they mean there
+    // rather than growing a second macOS-only implementation. The rig flags are
+    // a second pass over the same argv (GsParseRigFlags leaves tokens it does
+    // not own alone, and the launch parser only WARNS about tokens it does not
+    // know), so neither parser has to learn the other's vocabulary.
+    {
+        std::vector<std::string> args;
+        for (int i = 1; i < argc; i++)
+            if (argv[i]) args.emplace_back(argv[i]);
+        g_launch = dxr::ParseLaunchArgs(args);
+        for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+        for (const std::string& e : g_launch.errors)   LOG_ERROR("launch: %s", e.c_str());
+        // A local `--src=` and the legacy positional both name a scene; the
+        // explicit flag wins. A URL src is a Windows-only capability here (no
+        // download cache on this arm) — name it rather than silently ignoring it.
+        if (g_launch.srcKind == dxr::LaunchSrcKind::LocalPath && !g_launch.src.empty())
+            g_cliScenePath = g_launch.src;
+        else if (!g_launch.positionalPath.empty())
+            g_cliScenePath = g_launch.positionalPath;
+        if (g_launch.srcKind == dxr::LaunchSrcKind::Url)
+            LOG_WARN("launch: --src URL is not fetched on macOS; pass a local path");
+
+        std::vector<std::string> rigWarn;
+        GsParseRigFlags(argc, argv, g_rigFlags, &rigWarn);
+        for (const std::string& w : rigWarn) LOG_WARN("rig: %s", w.c_str());
     }
 
     signal(SIGINT, SignalHandler);
@@ -2351,7 +2481,7 @@ int main(int argc, char** argv) {
                 LOG_INFO("Loading dropped scene: %s", p.c_str());
                 if (g_gsRenderer.loadScene(p.c_str())) {
                     g_loadedFileName = GetPlyFilename(p);
-                    ApplyAutoFitForLoadedScene();
+                    ApplyRigForLoadedScene();
                 }
             }
         }
@@ -2453,11 +2583,25 @@ int main(int argc, char** argv) {
 
                     // Clean +Y-up world camera pose (no Y-mirror — the GsRenderer now
                     // owns the Vulkan Y-down flip at its view stage; see updateUniforms).
+                    // On the CAMERA rig the rig pose is the capture camera's REST pose and
+                    // never the orbit: a drag turns the scene (see mouseDragged), so feeding
+                    // yaw/pitch here as well would double-apply the rotation.
+                    const bool camRig = g_cameraRigActive && g_camRig.valid;
                     XrPosef cameraPose;
-                    quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
-                    cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                    if (camRig) {
+                        cameraPose.orientation = {g_camRig.restRotation[0], g_camRig.restRotation[1],
+                                                  g_camRig.restRotation[2], g_camRig.restRotation[3]};
+                        cameraPose.position = {g_camRig.restPosition[0], g_camRig.restPosition[1],
+                                               g_camRig.restPosition[2]};
+                    } else {
+                        quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
+                        cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
+                    }
                     const float rigVH =
                         g_input.viewParams.virtualDisplayHeight / g_input.viewParams.scaleFactor;
+                    // Canvas aspect the runtime will derive the horizontal FOV from.
+                    const float canvasAspect =
+                        (g_windowH > 0) ? ((float)g_windowW / (float)g_windowH) : 1.0f;
 
                     // XR_DXR_view_rig (#396 W7): chain the display rig so the runtime
                     // owns the window resolve + off-axis Kooima and returns render-ready
@@ -2466,8 +2610,29 @@ int main(int argc, char** argv) {
                     const bool useRig =
                         xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
                     XrDisplayRigDXR displayRig = {XR_TYPE_DISPLAY_RIG_DXR};
+                    XrCameraRigDXR  camRigDesc  = {XR_TYPE_CAMERA_RIG_DXR};
                     XrViewDisplayRawDXR viewRigRaw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
-                    if (useRig) {
+                    if (useRig && camRig) {
+                        // DECLARE, never compute. The photo's intrinsics become an
+                        // XR_DXR_view_rig CAMERA descriptor and the runtime returns
+                        // render-ready XrView{pose, fov}; the app does no Kooima.
+                        //
+                        // ipdFactor / parallaxFactor on this rig are ABSOLUTE scales, not
+                        // the display rig's [0,1] factors, and they stay absolute: the eye
+                        // separation is the capture baseline in world metres, never
+                        // normalised against the convergence distance. IpdScale() divides
+                        // the baseline by a nominal 63 mm face because the runtime scales
+                        // the TRACKED eye spread; metersToVirtual is 1 because a lifted
+                        // scene is already metric.
+                        camRigDesc.pose = cameraPose;
+                        camRigDesc.ipdFactor = g_camRig.IpdScale() * g_input.viewParams.ipdFactor;
+                        camRigDesc.parallaxFactor = g_input.viewParams.parallaxFactor;
+                        camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters();
+                        camRigDesc.verticalFov = g_camRig.VerticalFovRad(canvasAspect);
+                        camRigDesc.metersToVirtual = 1.0f;
+                        locateInfo.next = &camRigDesc;
+                        eyeTrackingState.next = &viewRigRaw;
+                    } else if (useRig) {
                         displayRig.pose = cameraPose;
                         displayRig.virtualDisplayHeight = rigVH;
                         displayRig.ipdFactor = g_input.viewParams.ipdFactor;
@@ -2621,18 +2786,67 @@ int main(int argc, char** argv) {
                                     srcViews.push_back(views[e < (int)runtimeViewCount ? e : 0]);
                             }
 
+                            float camShiftU = 0.0f, camShiftV = 0.0f;
+                            if (camRig) g_camRig.PrincipalShiftTan(camShiftU, camShiftV);
+                            float camSceneOrbit[16];
+                            const bool camOrbiting =
+                                camRig && (g_input.yaw != 0.0f || g_input.pitch != 0.0f);
+                            if (camOrbiting)
+                                g_camRig.SceneOrbitMatrix(g_input.yaw, g_input.pitch, camSceneOrbit);
+
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 const XrView& sv = srcViews[eye];
-                                float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
-                                float near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                                float far_z  = g_transparentBg ? ez : (ez + 1000.0f * rigVH);
+                                float near_z, far_z;
+                                XrFovf fov = sv.fov;
+                                if (camRig) {
+                                    // The ONE intrinsic XrCameraRigDXR cannot carry: an
+                                    // off-centre principal point (it has verticalFov and
+                                    // nothing else about the image plane). The window shift
+                                    // is the ASSET's own calibration — the deconvergence a
+                                    // stereo lift bakes in — so it is applied on top of the
+                                    // render-ready fov rather than re-derived; it is exactly
+                                    // zero for the centred principal point assets have today.
+                                    // Raising a principalPoint field upstream is the real fix.
+                                    if (camShiftU != 0.0f) {
+                                        fov.angleLeft  = atanf(tanf(fov.angleLeft)  + camShiftU);
+                                        fov.angleRight = atanf(tanf(fov.angleRight) + camShiftU);
+                                    }
+                                    if (camShiftV != 0.0f) {
+                                        fov.angleUp   = atanf(tanf(fov.angleUp)   + camShiftV);
+                                        fov.angleDown = atanf(tanf(fov.angleDown) + camShiftV);
+                                    }
+                                    // Scene-absolute planes, not vHeight-relative: on this rig
+                                    // there is no virtual display to anchor them to. FAR is
+                                    // deliberately far past any content (a deconverged lift
+                                    // puts the sky at the depth worker's cap); a splat
+                                    // rasteriser sorts rather than depth-tests, so the huge
+                                    // near:far ratio costs no precision. Transparent mode
+                                    // still clips at the ZDP, which here is the pivot.
+                                    near_z = kGsCameraRigNearM;
+                                    far_z  = g_transparentBg ? g_camRig.pivotM : kGsCameraRigFarM;
+                                } else {
+                                    float ez = RigLocalEyeZ(cameraPose, sv.pose.position);
+                                    near_z = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                                    far_z  = g_transparentBg ? ez : (ez + 1000.0f * rigVH);
+                                }
                                 if (far_z < near_z + 1.0e-4f) far_z = near_z + 1.0e-4f;
                                 mat4_view_from_xr_pose(eyeViews[eye].view_matrix, sv.pose);
-                                mat4_from_xr_fov(eyeViews[eye].projection_matrix, sv.fov, near_z, far_z);
-                                eyeViews[eye].fov = sv.fov;
+                                if (camOrbiting) {
+                                    // view * scene: the drag's rotation is a MODEL transform
+                                    // folded into the view matrix (this renderer has no
+                                    // separate model stage). It is rigid, so the gaussian
+                                    // covariances rotate with it correctly.
+                                    float combined[16];
+                                    mat4_multiply(combined, eyeViews[eye].view_matrix, camSceneOrbit);
+                                    memcpy(eyeViews[eye].view_matrix, combined, sizeof(combined));
+                                }
+                                mat4_from_xr_fov(eyeViews[eye].projection_matrix, fov, near_z, far_z);
+                                eyeViews[eye].fov = fov;
                                 eyeViews[eye].eye_world = sv.pose.position;
                                 eyeViews[eye].orientation = sv.pose.orientation;
-                                eyeViews[eye].eye_display = {0.0f, 0.0f, ez};  // ZDP depth (pick/transparent)
+                                eyeViews[eye].eye_display = {0.0f, 0.0f,
+                                    camRig ? g_camRig.pivotM
+                                           : RigLocalEyeZ(cameraPose, sv.pose.position)};
                                 eyeViews[eye].near_z = near_z;
                                 eyeViews[eye].far_z = far_z;
                             }
@@ -2642,7 +2856,10 @@ int main(int argc, char** argv) {
                         // physical mouse location on the display surface, pick nearest splat,
                         // then smoothly move & re-orient the virtual display to face back
                         // along the ray.
-                        if (g_input.teleportRequested && useRig) {
+                        // Double-click recentres the DISPLAY rig on a picked splat. On
+                        // the camera rig the viewpoint is the photograph's and is not the
+                        // user's to move, so the request is consumed below instead.
+                        if (g_input.teleportRequested && useRig && !camRig) {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
@@ -2727,11 +2944,45 @@ int main(int argc, char** argv) {
                             std::vector<std::pair<uint32_t, uint32_t>> tileOffsets((size_t)eyeCount);
                             for (int eye = 0; eye < eyeCount; eye++) {
                                 int srcView = eye < (int)runtimeViewCount ? eye : 0;
+                                XrFovf submitFov = {};
+                                bool haveSubmitFov = false;
                                 if (hasKooima) {
                                     memcpy(viewMat[eye].data(), eyeViews[eye].view_matrix, sizeof(float) * 16);
                                     memcpy(projMat[eye].data(), eyeViews[eye].projection_matrix, sizeof(float) * 16);
                                     views[srcView].pose.position = eyeViews[eye].eye_world;
                                     views[srcView].pose.orientation = cameraPose.orientation;
+                                } else if (camRig) {
+                                    // No XR_DXR_view_rig on this runtime: the rig cannot be
+                                    // declared, so there is no head-tracked off-axis frustum.
+                                    // Keep at least the photo's own symmetric frustum (plus
+                                    // its principal-point shift) so the rest view is still the
+                                    // right picture, and say so once.
+                                    static bool s_warned = false;
+                                    if (!s_warned) {
+                                        s_warned = true;
+                                        LOG_WARN("Camera rig: runtime does not advertise %s — "
+                                                 "rendering the photo frustum without head "
+                                                 "parallax", XR_DXR_VIEW_RIG_EXTENSION_NAME);
+                                    }
+                                    float du = 0.0f, dv = 0.0f;
+                                    g_camRig.PrincipalShiftTan(du, dv);
+                                    const float tv = 0.5f * (float)g_camRig.height / g_camRig.fy;
+                                    const float th = 0.5f * (float)g_camRig.width  / g_camRig.fx;
+                                    const float aspect = (renderH > 0)
+                                        ? ((float)renderW / (float)renderH) : 1.0f;
+                                    const float tvUse = (th > 0.0f && aspect > 1.0e-4f &&
+                                                         th / aspect < tv) ? (th / aspect) : tv;
+                                    const float thUse = tvUse * aspect;
+                                    XrFovf fov;
+                                    fov.angleLeft  = atanf(-thUse + du);
+                                    fov.angleRight = atanf( thUse + du);
+                                    fov.angleUp    = atanf( tvUse + dv);
+                                    fov.angleDown  = atanf(-tvUse + dv);
+                                    mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
+                                    mat4_from_xr_fov(projMat[eye].data(), fov,
+                                                     kGsCameraRigNearM, kGsCameraRigFarM);
+                                    submitFov = fov;
+                                    haveSubmitFov = true;
                                 } else {
                                     mat4_view_from_xr_pose(viewMat[eye].data(), views[srcView].pose);
                                     mat4_from_xr_fov(projMat[eye].data(), views[srcView].fov, 0.01f, 100.0f);
@@ -2751,7 +3002,8 @@ int main(int argc, char** argv) {
                                 projectionViews[eye].subImage.imageRect.extent = {(int32_t)renderW, (int32_t)renderH};
                                 projectionViews[eye].subImage.imageArrayIndex = 0;
                                 projectionViews[eye].pose = views[srcView].pose;
-                                projectionViews[eye].fov = hasKooima ? eyeViews[eye].fov : views[srcView].fov;
+                                projectionViews[eye].fov = hasKooima ? eyeViews[eye].fov
+                                    : (haveSubmitFov ? submitFov : views[srcView].fov);
                             }
 
                             // Render 3DGS or placeholder
@@ -2909,6 +3161,17 @@ int main(int argc, char** argv) {
                         ? [NSString stringWithFormat:@"Scene: %s", g_loadedFileName.c_str()]
                         : @"No scene loaded (Ctrl+O)";
 
+                    // Which rig is framing the scene, and the numbers that decided it.
+                    NSString *rigLabel =
+                        (g_cameraRigActive && g_camRig.valid)
+                            ? [NSString stringWithFormat:
+                                   @"camera  f=%.0fpx  %dx%d  base=%.0fmm  pivot=%.2fm (%s)",
+                                   g_camRig.fy, g_camRig.width, g_camRig.height,
+                                   g_camRig.baselineM * 1000.0f, g_camRig.pivotM,
+                                   g_camRig.pivotSource.c_str()]
+                            : [NSString stringWithFormat:@"display  vH=%.3fm",
+                                   g_input.viewParams.virtualDisplayHeight];
+
                     int depthPct = (int)(g_input.viewParams.ipdFactor * 100.0f + 0.5f);
                     // "held" rather than "idle countdown" in transparent mode —
                     // the countdown is being reset every frame, so it will never
@@ -2929,6 +3192,7 @@ int main(int argc, char** argv) {
                         @"%s\nSession: %d\n"
                         "Mode: %s (%s, %u view%s)\n"
                         "%@\n"
+                        "Rig: %@\n"
                         "Depth/IPD: %d%%  Zoom: %.2fx  Auto-Orbit: %s\n"
                         "Transparent: %s\n"
                         "FPS: %.0f (%.1f ms)\n"
@@ -2944,6 +3208,7 @@ int main(int argc, char** argv) {
                         (xr.renderingModeCount > 0 ? (xr.renderingModeDisplay3D[g_input.currentRenderingMode] ? "3D" : "2D") : "3D"),
                         activeViewCount, activeViewCount == 1 ? "" : "s",
                         sceneInfo,
+                        rigLabel,
                         depthPct, g_input.viewParams.scaleFactor, orbitLabel,
                         g_transparentBg ? "ON" : "OFF",
                         fps, g_avgFrameTime * 1000.0,
