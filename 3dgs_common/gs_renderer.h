@@ -19,6 +19,7 @@
 #include <string>
 #include <cstdint>
 #include <vector>
+#include "gs_perf_knobs.h"
 #include "gs_vulkan_utils.h"
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"  // GsSceneMeasurements
@@ -248,6 +249,18 @@ private:
     float renderScale_ = 1.0f;      // see setRenderScale()
     float cullMinOpacity_ = 0.0f;   // see setCullMinOpacity()
     float cullKeepFrac_ = 1.0f;     // see setKeepFraction()
+
+    // Resolved DXR_GS_* levers (gs_perf_knobs.h), read once in init(). The
+    // three setters above stay authoritative when a caller uses them — init()
+    // only seeds the fields from the environment, so an unset environment is
+    // bit-identical to the historical defaults. Nothing per-frame ever touches
+    // the environment.
+    gsperf::Knobs knobs_;
+
+    // ── One-shot DXR_GS_DUMP capture (see GsAdrenoRenderer for the rationale) ──
+    GsBuffer dumpHost_;
+    bool dumpDone_ = false;
+    uint32_t dumpW_ = 0, dumpH_ = 0;
 
     // ── GPU timestamp profiling ──────────────────────────────────────────
     // Per-stage VkQueryPool timestamps around each renderEye dispatch group
