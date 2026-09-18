@@ -208,6 +208,8 @@ add_library(gs_renderer STATIC
     gs_adreno_renderer.h
     gs_adreno_renderer.cpp
     gs_renderer_select.h
+    gs_perf_knobs.h
+    gs_perf_knobs.cpp
     gs_scene_loader.h
     gs_scene_loader.cpp
     gs_spz_loader.h
