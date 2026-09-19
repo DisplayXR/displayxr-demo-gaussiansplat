@@ -228,6 +228,71 @@ static bool  g_camRigRestSampled = false;
 static float g_camRigRestEyeXY[2] = {0.0f, 0.0f};  //!< display-space x,y of the untracked centroid
 static float g_camRigRestTan[2]   = {0.0f, 0.0f};  //!< tangent centre of the untracked frustum
 
+// ── The focus, and how it moves ─────────────────────────────────────────────
+//
+// One point does three jobs (orbit centre, pivot plane, convergence), so there
+// is one target and one easing. `g_focusRest` is where the waterfall put it —
+// what Space returns to — and `g_focusTarget` is where a double-click sent it.
+// The live value is g_camRig.focusLocal, eased toward the target so a
+// convergence change is a glide rather than a jump; a jump in convergence is
+// felt as the whole scene lurching in depth.
+//
+// 0.18 per frame is the gallery's `EASE`: the same constant the web tier uses
+// for exactly this, so a user moving between the two does not meet two
+// different feels.
+static constexpr float kFocusEase = 0.18f;
+// Defined with the rest of this file's quaternion math, further down.
+static void quat_rotate_vec3(XrQuaternionf q, float vx, float vy, float vz,
+                             float* ox, float* oy, float* oz);
+static float g_focusRest[3]   = {0.0f, 0.0f, -kGsFallbackPivotM};
+static float g_focusTarget[3] = {0.0f, 0.0f, -kGsFallbackPivotM};
+static bool  g_focusEasing    = false;
+
+//! Ease the live focus toward the target, once per frame. Returns true while
+//! still moving. Settles hard at 1 mm so it cannot creep forever.
+static bool StepFocusEase() {
+    if (!g_cameraRigActive || !g_camRig.valid) return false;
+    float d[3];
+    float mag = 0.0f;
+    for (int i = 0; i < 3; i++) {
+        d[i] = g_focusTarget[i] - g_camRig.focusLocal[i];
+        mag += d[i] * d[i];
+    }
+    if (mag < 1.0e-6f) {                       // < 1 mm: land on it and stop
+        if (g_focusEasing) {
+            g_camRig.SetFocusLocal(g_focusTarget[0], g_focusTarget[1], g_focusTarget[2]);
+            g_focusEasing = false;
+        }
+        return false;
+    }
+    g_camRig.SetFocusLocal(g_camRig.focusLocal[0] + d[0] * kFocusEase,
+                           g_camRig.focusLocal[1] + d[1] * kFocusEase,
+                           g_camRig.focusLocal[2] + d[2] * kFocusEase);
+    g_focusEasing = true;
+    return true;
+}
+
+//! Aim the focus at a point given in WORLD space (what a pick returns),
+//! converting into the rest camera's frame on the way.
+static void SetFocusTargetWorld(float wx, float wy, float wz, const char* why) {
+    if (!g_cameraRigActive || !g_camRig.valid) return;
+    // rest^-1 * world. The rest rotation is identity for every lift shipping
+    // today, but a block may carry one and the focus must land in the same
+    // frame focusLocal is expressed in.
+    const XrQuaternionf inv = {-g_camRig.restRotation[0], -g_camRig.restRotation[1],
+                               -g_camRig.restRotation[2],  g_camRig.restRotation[3]};
+    float lx, ly, lz;
+    quat_rotate_vec3(inv, wx - g_camRig.restPosition[0], wy - g_camRig.restPosition[1],
+                     wz - g_camRig.restPosition[2], &lx, &ly, &lz);
+    if (!(-lz > kGsPivotMinM)) {
+        LOG_WARN("Focus target rejected (%s): %.3f m is not in front of the camera", why, -lz);
+        return;
+    }
+    g_focusTarget[0] = lx; g_focusTarget[1] = ly; g_focusTarget[2] = lz;
+    g_focusEasing = true;
+    LOG_INFO("Focus -> (%.3f, %.3f, %.3f), pivot %.3f m [%s]", lx, ly, lz, -lz, why);
+}
+
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
@@ -2175,16 +2240,24 @@ static void ApplyAutoFitForLoadedScene() {
 // display rig with a WARN rather than inventing intrinsics.
 static void ApplyRigForLoadedScene() {
     const GsSceneCamera& cam = g_gsRenderer.sceneCamera();
-    if (GsSelectRigKind(cam, g_rigFlags) == GsRigKind::Camera) {
-        // Coarse fallback pivot for a --rig=camera override on a scene that
-        // carries no camera: the forward depth of the main object's centre.
-        float boundsDepth = 0.0f;
-        float c[3], e[3];
-        if (g_gsRenderer.getMainObjectBounds(64u, c, e) && -c[2] > 0.0f) boundsDepth = -c[2];
+    std::string rigSource;
+    const GsRigKind kind = GsSelectRigKind(cam, g_rigFlags, &rigSource);
+
+    // Coarse fallback focus for a --rig=camera override on a scene that carries
+    // no camera: the forward depth of the main object's centre.
+    float boundsDepth = 0.0f;
+    float c[3], e[3];
+    const bool haveBounds = g_gsRenderer.getMainObjectBounds(64u, c, e);
+    if (haveBounds && -c[2] > 0.0f) boundsDepth = -c[2];
+
+    if (kind == GsRigKind::Camera) {
+        GsRigResolveInput in;
+        in.measurements = &g_gsRenderer.sceneMeasurements();
+        in.boundsForwardDepthM = boundsDepth;
 
         std::string why;
-        if (GsResolveCameraRig(cam, g_rigFlags, g_gsRenderer.sceneMedianForwardDepthM(),
-                               boundsDepth, g_camRig, &why)) {
+        if (GsResolveCameraRig(cam, g_rigFlags, in, g_camRig, &why)) {
+            g_camRig.rigSource = rigSource;
             g_cameraRigActive = true;
             g_fitValid = false;               // nothing to return to but the rest pose
             g_input.yaw = 0.0f;               // the orbit is the SCENE's, and rest is 0
@@ -2199,22 +2272,86 @@ static void ApplyRigForLoadedScene() {
             g_input.animateEnabled = false;
             g_input.animationActive = false;
             MarkUserInput(g_input);
+            // The focus starts where the waterfall put it, and the eased
+            // target starts there too, so the first frame is already at rest.
+            for (int i = 0; i < 3; i++) {
+                g_focusRest[i] = g_camRig.focusLocal[i];
+                g_focusTarget[i] = g_camRig.focusLocal[i];
+            }
+            g_focusEasing = false;
             float du = 0.0f, dv = 0.0f;
             g_camRig.PrincipalShiftTan(du, dv);
-            LOG_INFO("Camera rig: fx=%.3f fy=%.3f cx=%.1f cy=%.1f %dx%d baseline=%.4fm "
-                     "pivot=%.3fm (%s) vFOV=%.1fdeg principal-shift=(%.5f, %.5f)",
+            LOG_INFO("Camera rig [%s]: intrinsics[%s] fx=%.3f fy=%.3f cx=%.1f cy=%.1f %dx%d "
+                     "baseline=%.4fm dxr(ipd=%.2f par=%.2f) vFOV=%.1fdeg "
+                     "principal-shift=(%.5f, %.5f)",
+                     g_camRig.rigSource.c_str(), g_camRig.intrinsicsSource.c_str(),
                      g_camRig.fx, g_camRig.fy, g_camRig.cx, g_camRig.cy,
                      g_camRig.width, g_camRig.height, g_camRig.baselineM,
-                     g_camRig.pivotM, g_camRig.pivotSource.c_str(),
+                     g_camRig.dxrIpdFactor, g_camRig.dxrParallaxFactor,
                      g_camRig.VerticalFovRad((float)g_camRig.width / (float)g_camRig.height) *
                          57.2957795f, du, dv);
+            LOG_INFO("Camera rig focus[%s]: point=(%.3f, %.3f, %.3f) pivot=%.3fm",
+                     g_camRig.focusSource.c_str(), g_camRig.focusLocal[0],
+                     g_camRig.focusLocal[1], g_camRig.focusLocal[2], g_camRig.pivotM);
+            // When BOTH the block and the cloud have an opinion about the
+            // frustum, say whether they agree. A silent disagreement is
+            // exactly a wrong zoom, which is the failure this rig exists to
+            // prevent — so it gets its own line whether or not it is bad news.
+            if (g_camRig.estimate.valid) {
+                const float estHalf = 0.5f * (g_camRig.estimate.tanRight - g_camRig.estimate.tanLeft);
+                const float useHalf = g_camRig.TanHalfPhotoW();
+                LOG_INFO("Camera rig focal check: using h-tan %.5f (%.1fmm-eq), cloud says "
+                         "%.5f (%s) — %+.1f%%",
+                         useHalf, (useHalf > 1e-6f) ? 18.0f / useHalf : 0.0f,
+                         estHalf, g_camRig.estimate.note.c_str(),
+                         (useHalf > 1e-6f) ? 100.0f * (estHalf - useHalf) / useHalf : 0.0f);
+            }
             return;
         }
         LOG_WARN("Camera rig requested but %s — framing with the display rig instead",
                  why.c_str());
     }
+
     g_cameraRigActive = false;
     ApplyAutoFitForLoadedScene();
+
+    // The display rig gets the block's focus too, when there is one: the orbit
+    // centre is the same concept on both rigs, and a producer that named the
+    // subject knows better than a centroid-after-outliers does. Applied after
+    // the auto-fit so the vHeight it computed still stands — only WHERE the
+    // display orbits is overridden, never how big it is.
+    if (cam.present && cam.hasFocus) {
+        // OpenCV -> app: the same half-turn about x the cloud took.
+        const float fx = cam.focusPoint[0], fy = -cam.focusPoint[1], fz = -cam.focusPoint[2];
+        float wx = fx, wy = fy, wz = fz;
+        if (cam.restPosition[0] || cam.restPosition[1] || cam.restPosition[2]) {
+            float rp[3], rq[4];
+            GsCameraRestPoseRub(cam, rp, rq);
+            wx += rp[0]; wy += rp[1]; wz += rp[2];
+        }
+        g_fitCenter[0] = wx; g_fitCenter[1] = wy; g_fitCenter[2] = wz;
+        g_fitValid = true;
+        g_input.cameraPosX = wx; g_input.cameraPosY = wy; g_input.cameraPosZ = wz;
+        LOG_INFO("Display rig [%s]: orbit centre from camera.focus.point (%.3f, %.3f, %.3f)",
+                 rigSource.c_str(), wx, wy, wz);
+    }
+
+    // A block that asks for the display rig AND carries a rest pose is naming
+    // the viewpoint to open on, which is otherwise the loader's yaw-0 anchor.
+    if (cam.present && cam.hasRigHint && cam.rigHint == GsRigKind::Display) {
+        float rp[3], rq[4];
+        GsCameraRestPoseRub(cam, rp, rq);
+        float yaw = 0.0f, pitch = 0.0f;
+        const XrQuaternionf rquat = {rq[0], rq[1], rq[2], rq[3]};
+        yaw_pitch_from_quat(rquat, &yaw, &pitch);
+        if (yaw != 0.0f || pitch != 0.0f) {
+            g_input.yaw = yaw;
+            g_input.pitch = pitch;
+            g_fitYaw = yaw;
+            LOG_INFO("Display rig: opening viewpoint from camera.rest "
+                     "(yaw %.1fdeg, pitch %.1fdeg)", yaw * 57.2957795f, pitch * 57.2957795f);
+        }
+    }
 }
 
 // Optional scene path from the command line (a positional argument or --src=);
@@ -3259,10 +3396,15 @@ int main(int argc, char** argv) {
                     NSString *rigLabel =
                         (g_cameraRigActive && g_camRig.valid)
                             ? [NSString stringWithFormat:
-                                   @"camera  f=%.0fpx  %dx%d  base=%.0fmm  pivot=%.2fm (%s)",
-                                   g_camRig.fy, g_camRig.width, g_camRig.height,
-                                   g_camRig.baselineM * 1000.0f, g_camRig.pivotM,
-                                   g_camRig.pivotSource.c_str()]
+                                   @"camera[%s]  f=%.0fpx[%s]  %dx%d  base=%.0fmm\n"
+                                   @"     focus[%s] %.2fm%s  est %.0fmm-eq",
+                                   g_camRig.rigSource.c_str(),
+                                   g_camRig.fy, g_camRig.intrinsicsSource.c_str(),
+                                   g_camRig.width, g_camRig.height,
+                                   g_camRig.baselineM * 1000.0f,
+                                   g_camRig.focusSource.c_str(), g_camRig.pivotM,
+                                   g_focusEasing ? " ~" : "",
+                                   g_camRig.estimate.valid ? g_camRig.estimate.focal35mm : 0.0f]
                             : [NSString stringWithFormat:@"display  vH=%.3fm",
                                    g_input.viewParams.virtualDisplayHeight];
 

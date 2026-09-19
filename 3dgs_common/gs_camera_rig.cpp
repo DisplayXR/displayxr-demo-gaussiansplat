@@ -184,6 +184,10 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
             } else {
                 out.hasBaseline = true; out.baselineM = v;
             }
+        } else if (key == "focus-weight") {
+            if (val == "centre" || val == "center") out.centreWeightedFocus = true;
+            else if (val == "frame" || val == "off") out.centreWeightedFocus = false;
+            else Warn(warnings, "--focus-weight must be 'centre' or 'frame'; ignored");
         } else if (key == "mode") {
             int v = 0;
             if (!ParseIntStrict(val, v) || v > 15) {
@@ -209,91 +213,286 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
 // Resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags) {
-    if (flags.hasRig) return flags.rig;
+GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags,
+                          std::string* source) {
+    if (flags.hasRig) {
+        if (source) *source = "--rig";
+        return flags.rig;
+    }
+    if (cam.present && cam.hasRigHint) {
+        if (source) *source = "camera.rig";
+        return cam.rigHint;
+    }
+    if (source) *source = cam.present ? "block present" : "no block";
     return cam.present ? GsRigKind::Camera : GsRigKind::Display;
 }
 
-float GsMedianForwardDepth(const std::vector<GsVertex>& vertices) {
-    if (vertices.empty()) return 0.0f;
-    std::vector<float> depth;
-    depth.reserve(vertices.size());
+bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
+                          GsIntrinsicsEstimate& out) {
+    out = GsIntrinsicsEstimate();
+    if (vertices.empty()) { out.note = "empty cloud"; return false; }
+
+    // Half-tangents about the rest camera, for everything in front of it.
+    // 0.05 m rather than 0 because a gaussian a millimetre from the lens
+    // produces an enormous tangent from a rounding error.
+    std::vector<float> tx, ty;
+    tx.reserve(vertices.size());
+    ty.reserve(vertices.size());
     for (const GsVertex& v : vertices) {
-        // RUB: +z is back, so forward depth is -z. Gaussians behind the camera
-        // (a lift always leaves a few) carry no information about where the
-        // subject is and would drag the median toward zero.
-        const float d = -v.position[2];
-        if (d > 0.0f && std::isfinite(d)) depth.push_back(d);
+        const float z = -v.position[2];            // app +z is BACK
+        if (!(z > 0.05f) || !std::isfinite(z)) continue;
+        const float a = v.position[0] / z, b = v.position[1] / z;
+        if (std::isfinite(a) && std::isfinite(b)) { tx.push_back(a); ty.push_back(b); }
     }
-    if (depth.empty()) return 0.0f;
-    const size_t mid = depth.size() / 2;
-    std::nth_element(depth.begin(), depth.begin() + (ptrdiff_t)mid, depth.end());
-    return depth[mid];
+    if (tx.size() < 1000) {
+        out.note = "too few gaussians in front of the camera (" +
+                   std::to_string(tx.size()) + ")";
+        return false;
+    }
+
+    // P1/P99, not the extremes: a lift always leaves strays far outside the
+    // frame and any one of them would set the focal by itself.
+    auto pct = [](std::vector<float>& v, double p) {
+        const size_t k = (size_t)(p * (double)(v.size() - 1));
+        std::nth_element(v.begin(), v.begin() + (ptrdiff_t)k, v.end());
+        return v[k];
+    };
+    out.tanLeft  = pct(tx, 0.01);
+    out.tanRight = pct(tx, 0.99);
+    out.tanDown  = pct(ty, 0.01);
+    out.tanUp    = pct(ty, 0.99);
+
+    float halfX = 0.5f * (out.tanRight - out.tanLeft);
+    float halfY = 0.5f * (out.tanUp - out.tanDown);
+    if (!(halfX > 1.0e-4f) || !(halfY > 1.0e-4f)) {
+        out.note = "degenerate angular extent";
+        return false;
+    }
+
+    // The aspect is trusted even when the focal is not: a cloud's shape says
+    // what orientation the photograph was, whatever its long tail does to the
+    // scale.
+    const float aspect = halfX / halfY;
+
+    // 36 mm is the full-frame width, so the 35 mm-equivalent focal is
+    // 18 mm / tan(hfov/2). This is the number the gate is expressed in
+    // because it is the one a photographer can sanity-check by eye.
+    out.focal35mm = 18.0f / halfX;
+    if (!(out.focal35mm >= kGsEstMinFocal35) || !(out.focal35mm <= kGsEstMaxFocal35)) {
+        out.usedFallback = true;
+        out.note = "implied " + std::to_string((int)(out.focal35mm + 0.5f)) +
+                   "mm-eq is outside [" + std::to_string((int)kGsEstMinFocal35) + ", " +
+                   std::to_string((int)kGsEstMaxFocal35) + "] — using " +
+                   std::to_string((int)kGsFallbackFocal35) + "mm-eq";
+        const float newHalfX = 18.0f / kGsFallbackFocal35;
+        const float k = newHalfX / halfX;
+        // Scale the window about its own centre so the measured asymmetry —
+        // the principal-point offset — survives the substitution.
+        const float cxTan = 0.5f * (out.tanRight + out.tanLeft);
+        const float cyTan = 0.5f * (out.tanUp + out.tanDown);
+        out.tanLeft  = cxTan + (out.tanLeft  - cxTan) * k;
+        out.tanRight = cxTan + (out.tanRight - cxTan) * k;
+        out.tanDown  = cyTan + (out.tanDown  - cyTan) * k;
+        out.tanUp    = cyTan + (out.tanUp    - cyTan) * k;
+        halfX = newHalfX;
+        halfY = halfX / aspect;
+        out.focal35mm = kGsFallbackFocal35;
+    }
+
+    // Nominal pixel dims. They carry no information the tangents do not — the
+    // block is specified in pixels, so the estimate has to be expressed in
+    // some — but the ASPECT is the measured one, which is what makes a
+    // portrait come out portrait.
+    if (aspect >= 1.0f) {
+        out.width = 2048;
+        out.height = (int)(2048.0f / aspect + 0.5f);
+    } else {
+        out.height = 2048;
+        out.width = (int)(2048.0f * aspect + 0.5f);
+    }
+    if (out.width < 2) out.width = 2;
+    if (out.height < 2) out.height = 2;
+
+    out.fx = (float)out.width / (out.tanRight - out.tanLeft);
+    out.fy = (float)out.height / (out.tanUp - out.tanDown);
+    // u = cx + fx*tx maps tanLeft -> 0, so cx = -fx*tanLeft. OpenCV's +y is
+    // DOWN while the app's is up, so v = cy - fy*ty maps tanUp -> 0.
+    out.cx = -out.fx * out.tanLeft;
+    out.cy = out.fy * out.tanUp;
+    out.valid = true;
+    if (out.note.empty())
+        out.note = std::to_string((int)(out.focal35mm + 0.5f)) + "mm-eq";
+    return true;
+}
+
+GsSceneMeasurements GsMeasureScene(const std::vector<GsVertex>& vertices) {
+    GsSceneMeasurements m;
+    if (vertices.empty()) return m;
+    GsEstimateIntrinsics(vertices, m.estimate);
+    m.medianDepthM       = GsMedianDisparityDepth(vertices, /*centreWeighted=*/false);
+    m.medianDepthCentreM = GsMedianDisparityDepth(vertices, /*centreWeighted=*/true);
+    m.valid = m.estimate.valid || m.medianDepthM > 0.0f;
+    return m;
+}
+
+float GsMedianDisparityDepth(const std::vector<GsVertex>& vertices, bool centreWeighted) {
+    if (vertices.empty()) return 0.0f;
+
+    // Centre weighting needs the frame's own extent to know what "centre"
+    // means, so measure it first. Without it, every gaussian counts.
+    float halfX = 0.0f, halfY = 0.0f, cxTan = 0.0f, cyTan = 0.0f;
+    if (centreWeighted) {
+        GsIntrinsicsEstimate e;
+        if (GsEstimateIntrinsics(vertices, e) && e.valid) {
+            halfX = 0.5f * (e.tanRight - e.tanLeft);
+            halfY = 0.5f * (e.tanUp - e.tanDown);
+            cxTan = 0.5f * (e.tanRight + e.tanLeft);
+            cyTan = 0.5f * (e.tanUp + e.tanDown);
+        } else {
+            centreWeighted = false;  // nothing to be central to
+        }
+    }
+
+    std::vector<float> disp;
+    disp.reserve(vertices.size());
+    for (const GsVertex& v : vertices) {
+        const float z = -v.position[2];
+        if (!(z > 0.05f) || !std::isfinite(z)) continue;
+        if (centreWeighted) {
+            const float a = v.position[0] / z - cxTan;
+            const float b = v.position[1] / z - cyTan;
+            // The middle half of the frame on each axis.
+            if (std::fabs(a) > 0.5f * halfX || std::fabs(b) > 0.5f * halfY) continue;
+        }
+        disp.push_back(1.0f / z);
+    }
+    if (disp.empty()) return 0.0f;
+    const size_t mid = disp.size() / 2;
+    std::nth_element(disp.begin(), disp.begin() + (ptrdiff_t)mid, disp.end());
+    const float m = disp[mid];
+    return (m > 1.0e-6f) ? (1.0f / m) : 0.0f;
+}
+
+void GsCameraRestPoseRub(const GsSceneCamera& cam, float outPosition[3],
+                         float outRotation[4]) {
+    OpenCvPoseToRub(cam.restPosition, cam.restRotation, outPosition, outRotation);
+}
+
+void GsCameraRig::SetFocusLocal(float x, float y, float z) {
+    focusLocal[0] = x;
+    focusLocal[1] = y;
+    // A focus at or behind the camera has no convergence plane; keep it in
+    // front and inside the sane range, so nothing downstream divides by it.
+    const float depth = Clampf(-z, kGsPivotMinM, kGsPivotMaxM);
+    focusLocal[2] = -depth;
+    pivotM = depth;
 }
 
 bool GsResolveCameraRig(const GsSceneCamera& cam,
                         const GsRigFlags& flags,
-                        float medianForwardDepthM,
-                        float boundsForwardDepthM,
+                        const GsRigResolveInput& in,
                         GsCameraRig& out,
                         std::string* why) {
     out = GsCameraRig();
 
-    // Intrinsics: the file first, the CLI on top. A forced --rig=camera on a
-    // scene with no block is legal, but only if the flags supply everything.
-    float fx = cam.present ? cam.fx : 0.0f;
-    float fy = cam.present ? cam.fy : 0.0f;
-    int   w  = cam.present ? cam.width  : 0;
-    int   h  = cam.present ? cam.height : 0;
-    if (flags.hasFx) fx = flags.fx;
-    if (flags.hasFy) fy = flags.fy;
-    if (flags.hasSize) { w = flags.width; h = flags.height; }
-    // A square-pixel camera is the norm; accept one focal for both.
-    if (fx > 0.0f && !(fy > 0.0f)) fy = fx;
-    if (fy > 0.0f && !(fx > 0.0f)) fx = fy;
+    // The cloud's own frustum is carried even when the block declares
+    // intrinsics, so the log can say whether the two agree. A disagreement is
+    // exactly a wrong zoom, and it is silent otherwise.
+    const bool haveCloud = in.measurements && in.measurements->valid;
+    if (haveCloud) out.estimate = in.measurements->estimate;
 
+    // ── Intrinsics: block -> flags -> estimate -> nominal ────────────────
+    float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
+    int   w = 0, h = 0;
+    if (cam.present) {
+        fx = cam.fx; fy = cam.fy; cx = cam.cx; cy = cam.cy;
+        w = cam.width; h = cam.height;
+        out.intrinsicsSource = "block";
+    }
+    // Flags override the block field by field: --cx alone on a block-bearing
+    // scene is a legitimate correction, not a request to discard the rest.
+    if (flags.hasFx || flags.hasFy || flags.hasSize || flags.hasCx || flags.hasCy) {
+        if (flags.hasSize) { w = flags.width; h = flags.height; }
+        if (flags.hasFx) fx = flags.fx;
+        if (flags.hasFy) fy = flags.fy;
+        if (fx > 0.0f && !(fy > 0.0f)) fy = fx;   // square pixels are the norm
+        if (fy > 0.0f && !(fx > 0.0f)) fx = fy;
+        if (w > 0 && h > 0) {
+            if (!flags.hasCx && !cam.present) cx = 0.5f * (float)w;
+            if (!flags.hasCy && !cam.present) cy = 0.5f * (float)h;
+        }
+        if (flags.hasCx) cx = flags.cx;
+        if (flags.hasCy) cy = flags.cy;
+        if (out.intrinsicsSource.empty()) out.intrinsicsSource = "flags";
+        else if (flags.hasFx || flags.hasFy || flags.hasSize || flags.hasCx || flags.hasCy)
+            out.intrinsicsSource = "block + flags";
+    }
+    if ((!(fx > 0.0f) || !(fy > 0.0f) || w <= 0 || h <= 0) && out.estimate.valid) {
+        // Nothing declared them, so recover them from the cloud. This is what
+        // lets a bare `.sog` with no block at all be framed as the photograph
+        // it was, instead of auto-fitted like an object.
+        fx = out.estimate.fx; fy = out.estimate.fy;
+        cx = out.estimate.cx; cy = out.estimate.cy;
+        w = out.estimate.width; h = out.estimate.height;
+        out.intrinsicsSource = out.estimate.usedFallback
+                                   ? "estimated (28mm fallback)" : "estimated";
+    }
     if (!(fx > 0.0f) || !(fy > 0.0f) || w <= 0 || h <= 0) {
         if (why)
-            *why = "no camera intrinsics (need a `camera` block, or --fx/--fy and --size=WxH)";
+            *why = "no camera intrinsics and none recoverable from the cloud "
+                   "(need a `camera` block, or --fx/--fy and --size=WxH)";
         return false;
     }
 
-    out.fx = fx;
-    out.fy = fy;
-    out.width = w;
-    out.height = h;
-    // Principal point: the file's, else the CLI's, else centred.
-    out.cx = flags.hasCx ? flags.cx : (cam.present ? cam.cx : 0.5f * (float)w);
-    out.cy = flags.hasCy ? flags.cy : (cam.present ? cam.cy : 0.5f * (float)h);
-    if (!cam.present && !flags.hasCx) out.cx = 0.5f * (float)w;
-    if (!cam.present && !flags.hasCy) out.cy = 0.5f * (float)h;
+    out.fx = fx; out.fy = fy; out.cx = cx; out.cy = cy;
+    out.width = w; out.height = h;
 
     out.baselineM = flags.hasBaseline ? flags.baselineM
                   : (cam.hasStereo ? cam.baselineM : kGsDefaultBaselineM);
 
-    // Pivot. `camera.ts` takes min(dConv, dSubject) — the nearer of the stored
-    // convergence plane and the median scene point — because the pivot is both
-    // the plane that stays put and the vertex of the comfort cone, and both
-    // want it on or in front of the subject. The `camera` block carries no
-    // convergence, so dConv is unknown (effectively infinite) and the min
-    // degenerates to dSubject: the cloud's own median forward depth.
-    if (flags.hasPivot) {
-        out.pivotM = flags.pivotM;
-        out.pivotSource = "--pivot";
-    } else if (medianForwardDepthM > 0.0f) {
-        out.pivotM = Clampf(medianForwardDepthM, kGsPivotMinM, kGsPivotMaxM);
-        out.pivotSource = "scene median depth";
-    } else if (boundsForwardDepthM > 0.0f) {
-        out.pivotM = Clampf(boundsForwardDepthM, kGsPivotMinM, kGsPivotMaxM);
-        out.pivotSource = "scene bounds";
-    } else {
-        out.pivotM = kGsFallbackPivotM;
-        out.pivotSource = "fallback";
-    }
+    out.dxrIpdFactor      = cam.hasDxrIpd      ? cam.dxrIpdFactor      : 1.0f;
+    out.dxrParallaxFactor = cam.hasDxrParallax ? cam.dxrParallaxFactor : 1.0f;
 
     if (cam.present) {
         OpenCvPoseToRub(cam.restPosition, cam.restRotation, out.restPosition,
                         out.restRotation);
+    }
+
+    // ── Focus: --pivot -> block -> median disparity -> bounds -> 2 m ─────
+    //
+    // The gallery's model takes min(dConv, dSubject) — the nearer of the
+    // stored convergence plane and the median scene point — because the focus
+    // is both the plane that stays put and the vertex of the comfort cone, and
+    // both want it on or in front of the subject. `camera.focus.point` is that
+    // decision, made by the producer, which is why it outranks anything this
+    // viewer can measure.
+    if (flags.hasPivot) {
+        out.SetFocusLocal(0.0f, 0.0f, -flags.pivotM);
+        out.focusSource = "--pivot";
+    } else if (cam.present && cam.hasFocus) {
+        // The block's point is OpenCV (+y down, +z forward); the cloud has
+        // already been righted to RUB, so the focus must take the same
+        // half-turn about x or it will sit mirrored behind the camera.
+        out.SetFocusLocal(cam.focusPoint[0], -cam.focusPoint[1], -cam.focusPoint[2]);
+        out.focusSource = cam.focusSourceLabel.empty()
+                              ? "block" : ("block (" + cam.focusSourceLabel + ")");
+    } else if (haveCloud) {
+        const float d = flags.centreWeightedFocus ? in.measurements->medianDepthCentreM
+                                                  : in.measurements->medianDepthM;
+        if (d > 0.0f) {
+            out.SetFocusLocal(0.0f, 0.0f, -d);
+            out.focusSource = flags.centreWeightedFocus ? "median-disparity (centre)"
+                                                        : "median-disparity";
+        }
+    }
+    if (out.focusSource.empty()) {
+        if (in.boundsForwardDepthM > 0.0f) {
+            out.SetFocusLocal(0.0f, 0.0f, -in.boundsForwardDepthM);
+            out.focusSource = "scene bounds";
+        } else {
+            out.SetFocusLocal(0.0f, 0.0f, -kGsFallbackPivotM);
+            out.focusSource = "fallback";
+        }
     }
 
     out.valid = true;
@@ -348,13 +547,14 @@ void GsCameraRig::PrincipalShiftTan(float& du, float& dv) const {
 }
 
 void GsCameraRig::SceneOrbitMatrix(float yawRad, float pitchRad, float out[16]) const {
-    // In the rig's own frame the pivot sits straight ahead at -pivot on z, so
-    // the rotation is T(0,0,-d) * R * T(0,0,+d): translate the pivot to the
-    // origin, turn, put it back. A non-identity rest pose is conjugated back
-    // through it so the pivot stays the point the camera is actually looking at.
+    // Rotate the scene about THE FOCUS POINT: T(f) * R * T(-f) — translate the
+    // focus to the origin, turn, put it back. Straight ahead at -pivot on z
+    // until a double-click moves it somewhere off-axis, which is exactly the
+    // case the general form exists for. A non-identity rest pose is conjugated
+    // back through it so the focus stays the point the camera is looking at.
     float local[16], rot[16], toPivot[16], fromPivot[16];
-    Mat4Translation(toPivot, 0.0f, 0.0f, -pivotM);
-    Mat4Translation(fromPivot, 0.0f, 0.0f, pivotM);
+    Mat4Translation(toPivot, focusLocal[0], focusLocal[1], focusLocal[2]);
+    Mat4Translation(fromPivot, -focusLocal[0], -focusLocal[1], -focusLocal[2]);
     Mat4FromYawPitch(rot, yawRad, pitchRad);
     Mat4Multiply(local, rot, fromPivot);
     Mat4Multiply(local, toPivot, local);

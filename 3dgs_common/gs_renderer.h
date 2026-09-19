@@ -20,7 +20,8 @@
 #include <cstdint>
 #include <vector>
 #include "gs_vulkan_utils.h"
-#include "gs_scene_loader.h"  // GsVertex (used by filterFloaters signature)
+#include "gs_scene_loader.h"
+#include "gs_camera_rig.h"  // GsSceneMeasurements  // GsVertex (used by filterFloaters signature)
 
 struct GsPickData {
     float px, py, pz;   // world-space position
@@ -63,9 +64,14 @@ struct GsRenderer {
     //! camera rig. Valid from the moment loadScene() returns until the next load.
     const GsSceneCamera& sceneCamera() const { return sceneCamera_; }
 
-    //! Median forward depth (-z) of the current cloud in metres, measured
-    //! before decimation; 0 when unknown. The camera rig's default pivot.
-    float sceneMedianForwardDepthM() const { return sceneMedianForwardDepthM_; }
+    //! What the current cloud says about itself — recovered intrinsics and
+    //! median-disparity depth — measured before decimation. Feeds the camera
+    //! rig's waterfall; `valid == false` when nothing could be measured.
+    const GsSceneMeasurements& sceneMeasurements() const { return sceneMeasurements_; }
+
+    //! Median-disparity depth in metres, 0 when unknown. Shorthand for the
+    //! field of sceneMeasurements() the rig uses most.
+    float sceneMedianForwardDepthM() const { return sceneMeasurements_.medianDepthM; }
 
     // Returns the number of Gaussians in the loaded scene.
     uint32_t gaussianCount() const;
@@ -266,7 +272,7 @@ private:
     std::string loadedScenePath_;
     std::string lastLoadError_;
     GsSceneCamera sceneCamera_;
-    float sceneMedianForwardDepthM_ = 0.0f;
+    GsSceneMeasurements sceneMeasurements_;
     uint32_t numGaussians_ = 0;
 
     // ── Derived dimensions ───────────────────────────────────────────────

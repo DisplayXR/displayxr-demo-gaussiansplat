@@ -751,11 +751,11 @@ bool GsRenderer::loadScene(const char* plyPath)
         return false;
     }
 
-    // Median forward depth of the cloud as loaded (before any decimation, so
-    // the number does not move with a perf knob). It stands in for the gallery
-    // camera model's `dSubject` and is what the camera rig pivots about when
-    // the file names no convergence — see gs_camera_rig.h.
-    sceneMedianForwardDepthM_ = GsMedianForwardDepth(vertices);
+    // Everything the rig waterfall might want from the cloud, measured ONCE
+    // while the vertices are still in hand (they go to the GPU and the CPU
+    // copy is dropped) and BEFORE any decimation, so no number here moves with
+    // a perf knob. See GsSceneMeasurements.
+    sceneMeasurements_ = GsMeasureScene(vertices);
 
     // Load-time opacity cull (perf): compact out near-transparent gaussians
     // before upload. scale_opacity[3] is the sigmoid'd opacity in [0,1]. These

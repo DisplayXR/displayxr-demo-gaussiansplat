@@ -568,6 +568,54 @@ bool ReadCameraBlock(const JsonValue& meta, GsSceneCamera& out) {
         }
     }
 
+    // ── v2 fields. Every one is optional and independently ignorable, so a
+    //    v1 block (or a v2 block from a producer that fills only some of it)
+    //    reaches exactly the same state it did before. ────────────────────
+    if (const JsonValue* r = cam->Find("rig")) {
+        if (r->kind == JsonValue::Kind::String) {
+            if (r->str == "camera") { c.hasRigHint = true; c.rigHint = GsRigKind::Camera; }
+            else if (r->str == "display") { c.hasRigHint = true; c.rigHint = GsRigKind::Display; }
+            else fprintf(stderr, "ParseSogFile: camera.rig '%s' is not 'camera' or "
+                                 "'display' — ignoring the hint\n", r->str.c_str());
+        }
+    }
+
+    if (const JsonValue* f = cam->Find("focus")) {
+        std::vector<float> v;
+        if (JsonFloatArray(f->Find("point"), 3, v)) {
+            // A focus behind the camera, or on it, cannot be a convergence
+            // plane; refuse it rather than divide by it downstream.
+            if (v[2] > 1.0e-3f && std::isfinite(v[0]) && std::isfinite(v[1])) {
+                c.hasFocus = true;
+                for (int i = 0; i < 3; i++) c.focusPoint[i] = v[i];
+            } else {
+                fprintf(stderr, "ParseSogFile: camera.focus.point is not in front of "
+                                "the camera (z=%.4f) — ignoring it\n", (double)v[2]);
+            }
+        }
+        if (const JsonValue* s = f->Find("source"))
+            if (s->kind == JsonValue::Kind::String) c.focusSourceLabel = s->str;
+        const JsonValue* sm = f->Find("subject_m");
+        const JsonValue* nm = f->Find("near_m");
+        const JsonValue* fm = f->Find("far_m");
+        if (sm && sm->IsNum() && sm->num > 0.0) { c.hasSubjectM = true; c.subjectM = (float)sm->num; }
+        if (nm && nm->IsNum() && nm->num > 0.0) { c.hasNearM = true;    c.nearM    = (float)nm->num; }
+        if (fm && fm->IsNum() && fm->num > 0.0) { c.hasFarM = true;     c.farM     = (float)fm->num; }
+    }
+
+    if (const JsonValue* d = cam->Find("dxr")) {
+        const JsonValue* ip = d->Find("ipd_factor");
+        const JsonValue* pf = d->Find("parallax_factor");
+        // Absolute scalars, so the only bound is sanity: a negative or absurd
+        // one would invert or explode the stereo rather than tune it.
+        if (ip && ip->IsNum() && ip->num >= 0.0 && ip->num <= 10.0) {
+            c.hasDxrIpd = true; c.dxrIpdFactor = (float)ip->num;
+        }
+        if (pf && pf->IsNum() && pf->num >= 0.0 && pf->num <= 10.0) {
+            c.hasDxrParallax = true; c.dxrParallaxFactor = (float)pf->num;
+        }
+    }
+
     c.present = true;
     out = c;
     printf("ParseSogFile: camera block: convention=%s fx=%.3f fy=%.3f cx=%.1f cy=%.1f "
@@ -575,6 +623,18 @@ bool ReadCameraBlock(const JsonValue& meta, GsSceneCamera& out) {
            c.convention.c_str(), (double)c.fx, (double)c.fy, (double)c.cx, (double)c.cy,
            c.width, c.height,
            c.hasStereo ? (std::to_string(c.baselineM) + " m").c_str() : "(none)");
+    if (c.hasRigHint || c.hasFocus || c.hasDxrIpd || c.hasDxrParallax) {
+        printf("ParseSogFile: camera v2: rig=%s focus=%s%s dxr.ipd=%s dxr.parallax=%s\n",
+               c.hasRigHint ? (c.rigHint == GsRigKind::Camera ? "camera" : "display") : "(unset)",
+               c.hasFocus ? "" : "(unset)",
+               c.hasFocus ? (std::string("(") + std::to_string(c.focusPoint[0]) + ", " +
+                             std::to_string(c.focusPoint[1]) + ", " +
+                             std::to_string(c.focusPoint[2]) + ")" +
+                             (c.focusSourceLabel.empty() ? "" : " src=" + c.focusSourceLabel)).c_str()
+                          : "",
+               c.hasDxrIpd ? std::to_string(c.dxrIpdFactor).c_str() : "(unset)",
+               c.hasDxrParallax ? std::to_string(c.dxrParallaxFactor).c_str() : "(unset)");
+    }
     fflush(stdout);
     return true;
 }
