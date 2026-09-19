@@ -487,6 +487,11 @@ static void UpdateCameraMovement(InputState& input, float dt, float displayHeigh
         input.cameraPosX = g_camRig.restPosition[0];
         input.cameraPosY = g_camRig.restPosition[1];
         input.cameraPosZ = g_camRig.restPosition[2];
+        // The focus goes back to whatever the waterfall chose, EASED rather
+        // than snapped: convergence is depth, and a jump in it reads as the
+        // whole scene lurching toward or away from the viewer.
+        for (int i = 0; i < 3; i++) g_focusTarget[i] = g_focusRest[i];
+        g_focusEasing = true;
         input.viewParams = ViewParams();
         input.viewParams.scaleFactor = 1.0f;
         input.resetViewRequested = false;
@@ -2632,6 +2637,9 @@ int main(int argc, char** argv) {
         // UpdateCameraMovement consumes resetViewRequested, so sample it first.
         const bool resetThisFrame = g_input.resetViewRequested;
         UpdateCameraMovement(g_input, deltaTime, xr.displayHeightM);
+        // One point, one easing: this moves the orbit centre, the pivot plane
+        // and the convergence together, because they are the same point.
+        StepFocusEase();
 
         if (resetThisFrame) {
             // Land any in-flight refit on the reset target, so the animation
@@ -2784,9 +2792,14 @@ int main(int argc, char** argv) {
                         // the TRACKED eye spread; metersToVirtual is 1 because a lifted
                         // scene is already metric.
                         camRigDesc.pose = cameraPose;
-                        camRigDesc.ipdFactor =
-                            g_camRig.IpdScale(g_camRigMeasuredIpdM) * g_input.viewParams.ipdFactor;
-                        camRigDesc.parallaxFactor = g_input.viewParams.parallaxFactor;
+                        // The block's dxr.* are ABSOLUTE scalars the producer chose,
+                        // multiplied onto the measured-IPD scaling and the user's own
+                        // depth control. Never normalised against convergence.
+                        camRigDesc.ipdFactor = g_camRig.IpdScale(g_camRigMeasuredIpdM) *
+                                               g_camRig.dxrIpdFactor *
+                                               g_input.viewParams.ipdFactor;
+                        camRigDesc.parallaxFactor = g_camRig.dxrParallaxFactor *
+                                                    g_input.viewParams.parallaxFactor;
                         camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters();
                         camRigDesc.verticalFov = g_camRig.VerticalFovRad(canvasAspect);
                         camRigDesc.metersToVirtual = 1.0f;
@@ -3087,10 +3100,15 @@ int main(int argc, char** argv) {
                         // physical mouse location on the display surface, pick nearest splat,
                         // then smoothly move & re-orient the virtual display to face back
                         // along the ray.
-                        // Double-click recentres the DISPLAY rig on a picked splat. On
-                        // the camera rig the viewpoint is the photograph's and is not the
-                        // user's to move, so the request is consumed below instead.
-                        if (g_input.teleportRequested && useRig && !camRig) {
+                        // Double-click picks a splat on BOTH rigs; what it then does
+                        // differs, because the two rigs mean different things by
+                        // "focus". The DISPLAY rig moves its orbit centre there (and
+                        // the display with it). The CAMERA rig moves the focus point —
+                        // so the pivot plane and the convergence follow it — and leaves
+                        // the camera exactly where it is: the viewpoint is the
+                        // photograph's and is not the user's to move (camera.ts, "the
+                        // window is FIXED in space").
+                        if (g_input.teleportRequested && useRig) {
                             g_input.teleportRequested = false;
                             NSSize viewSize = [[g_window contentView] bounds].size;
                             float ndcX = 2.0f * g_input.teleportMouseX / (float)viewSize.width - 1.0f;
@@ -3125,10 +3143,25 @@ int main(int argc, char** argv) {
                             cfov = {cfov.angleLeft * invE, cfov.angleRight * invE,
                                     cfov.angleUp * invE, cfov.angleDown * invE};
                             float ez = RigLocalEyeZ(cameraPose, cpose.position);
-                            float pickNear = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
-                            float pickFar = ez + 1000.0f * rigVH;
+                            float pickNear, pickFar;
+                            if (camRig) {
+                                pickNear = kGsCameraRigNearM;
+                                pickFar  = kGsCameraRigFarM;
+                            } else {
+                                pickNear = (ez - rigVH > 1.0e-4f) ? (ez - rigVH) : 1.0e-4f;
+                                pickFar  = ez + 1000.0f * rigVH;
+                            }
                             float pickView[16], pickProj[16];
                             mat4_view_from_xr_pose(pickView, cpose);
+                            // The click landed on an ORBITED scene, so the ray has to be
+                            // unprojected through the same transform the renderer used,
+                            // or it picks whatever was at those pixels before the drag.
+                            if (camRig && (g_input.yaw != 0.0f || g_input.pitch != 0.0f)) {
+                                float sceneM[16], combined[16];
+                                g_camRig.SceneOrbitMatrix(g_input.yaw, g_input.pitch, sceneM);
+                                mat4_multiply(combined, pickView, sceneM);
+                                memcpy(pickView, combined, sizeof(combined));
+                            }
                             mat4_from_xr_fov(pickProj, cfov, pickNear, pickFar);
 
                             XrVector3f rayOriginV, rayDirV;
@@ -3142,10 +3175,18 @@ int main(int argc, char** argv) {
                             // near plane (pickNear), and — in transparent/foreground mode —
                             // behind the ZDP (ez). Opaque mode shows everything behind the
                             // display, so no far reject there. A full miss returns false.
-                            float pickClipFar = g_transparentBg ? ez : 0.0f;
+                            float pickClipFar = camRig ? (g_transparentBg ? g_camRig.pivotM : 0.0f)
+                                                       : (g_transparentBg ? ez : 0.0f);
                             if (g_gsRenderer.pickGaussian(rayOrigin, rayDir, hitPos, 100.0f,
                                                           pickView,
                                                           pickNear, pickClipFar)) {
+                              if (camRig) {
+                                // Camera rig: move the FOCUS, not the camera. The pivot
+                                // plane and the convergence follow it because they are
+                                // the same point, and the easing makes that a glide.
+                                SetFocusTargetWorld(hitPos[0], hitPos[1], hitPos[2],
+                                                    "double-click");
+                              } else {
                                 // Both endpoints stored in the clean +Y-up WORLD frame (the
                                 // same frame as g_input.cameraPosX/Y/Z and the splats) so the
                                 // slerp interpolates consistently.
@@ -3161,6 +3202,7 @@ int main(int argc, char** argv) {
                                 g_input.transitioning = true;
                                 LOG_INFO("Focus on splat (%.3f, %.3f, %.3f)",
                                     hitPos[0], hitPos[1], hitPos[2]);
+                              }
                             }
                         } else if (g_input.teleportRequested) {
                             g_input.teleportRequested = false; // consume without Kooima
