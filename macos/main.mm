@@ -2340,11 +2340,25 @@ static void ApplyAutoFitForLoadedScene() {
 // display rig with a WARN rather than inventing intrinsics.
 static void ApplyRigForLoadedScene() {
     const GsSceneCamera& cam = g_gsRenderer.sceneCamera();
-    std::string rigSource;
-    const GsRigKind kind = GsSelectRigKind(cam, g_rigFlags, &rigSource);
 
-    // Coarse fallback focus for a --rig=camera override on a scene that carries
-    // no camera: the forward depth of the main object's centre.
+    // The last step of the waterfall: when nothing has declared a rig, ask the
+    // cloud whether it looks like a photograph. A `.spz` or `.ply` conversion
+    // of a lift carries no metadata at all, and framing one as an object gives
+    // it a crop at the wrong field of view.
+    const GsPhotoLiftSignature sig =
+        GsDetectPhotoLift(g_gsRenderer.sceneMeasurements(), g_gsRenderer.fitBounds());
+    LOG_INFO("Photo-lift signature: front=%.4f%% (need %.1f%%) focal=%.1fmm-eq [%s] "
+             "origin-outside=%.3f (need %.3f) -> %s%s%s",
+             sig.forwardFraction * 100.0f, kGsPhotoLiftMinForwardFrac * 100.0f,
+             sig.focal35mm, sig.focalGatePassed ? "lens" : "not a lens",
+             sig.originOutsideRatio, kGsPhotoLiftMinOriginOutside,
+             sig.isPhotoLift ? "PHOTO LIFT" : "object scan",
+             sig.failedTerm ? " (" : "",
+             sig.failedTerm ? (std::string(sig.failedTerm) + ")").c_str() : "");
+
+    std::string rigSource;
+    const GsRigKind kind = GsSelectRigKind(cam, g_rigFlags, &rigSource, &sig);
+
     // Only the main object's forward depth is wanted here, as a coarse focus
     // fallback for a --rig=camera override on a scene that declares none.
     float boundsDepth = 0.0f;

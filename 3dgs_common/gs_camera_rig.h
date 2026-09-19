@@ -82,6 +82,7 @@
 #include <vector>
 
 #include "gs_scene_loader.h"  // GsVertex, GsSceneCamera
+#include "gs_scene_fit.h"     // GsFitBounds — the photo-lift signature reads the object blob
 
 // GsRigKind is declared in gs_scene_loader.h, because the FILE can carry a rig
 // hint and the loader must be able to express it without depending on this
@@ -401,7 +402,75 @@ struct GsSceneMeasurements {
     GsIntrinsicsEstimate estimate;
     float medianDepthM       = 0.0f;  //!< median disparity, whole frame
     float medianDepthCentreM = 0.0f;  //!< median disparity, middle of the frame
+
+    //! Fraction of gaussians in front of the origin (forward z > 0.05).
+    //!
+    //! The single most telling thing about how a cloud was made. A photo lift
+    //! is unprojected FORWARD through one lens, so everything it contains is
+    //! in front of the camera; an object scan is captured from all around, so
+    //! a large share of it sits behind. Measured 1.0000 on both photo lifts
+    //! and 0.0226 / 0.6999 on the two object scans — see
+    //! kGsPhotoLiftMinForwardFrac.
+    float forwardFraction = 0.0f;
 };
+
+//! Why a cloud does or does not look like a photo lift.
+//!
+//! Three terms, all of which must hold. They are reported individually because
+//! "this framed as an object scan" and "this framed as a photograph" look
+//! identical from the outside until you know which term decided it.
+struct GsPhotoLiftSignature {
+    bool  isPhotoLift = false;
+
+    float forwardFraction = 0.0f;    //!< (a) share of the cloud in front of the origin
+    float focal35mm = 0.0f;          //!< (b) the angular-extent estimate
+    bool  focalGatePassed = false;   //!< (b) ... and whether it is a plausible lens
+    float originOutsideRatio = 0.0f; //!< (c) origin-to-blob distance / blob's largest extent
+
+    //! Which term said no, or nullptr when none did. Never a sentence — this
+    //! is printed inside a log line that already has the numbers.
+    const char* failedTerm = nullptr;
+};
+
+//! Minimum share of the cloud that must sit in front of the origin.
+//!
+//! Measured: both photo lifts 1.0000 (not one gaussian behind the camera),
+//! `butterfly.spz` 0.0226, `KAWS FAMILY.spz` 0.6999. So the threshold has
+//! ~29 points of daylight beneath it and the term is decisive on its own.
+//!
+//! 0.99 rather than the 0.995 first proposed: the failing side is bounded by
+//! measurement (nothing observed above 0.70), but the PASSING side is not —
+//! this sample cannot say how many stray behind-camera gaussians a lift is
+//! allowed to leave, because ours leave none. Relaxing to 0.99 doubles the
+//! tolerance for those strays at no cost to the separation, which is the
+//! safety factor going where the evidence is absent rather than where it is
+//! already overwhelming.
+constexpr float kGsPhotoLiftMinForwardFrac = 0.99f;
+
+//! How far outside the object blob the origin must sit, as a fraction of the
+//! blob's largest extent.
+//!
+//! A camera stands outside what it photographed; a scanned object surrounds
+//! the origin it was scanned about. Measured: photo lifts 0.144, and BOTH
+//! object scans exactly 0.000 — the origin is inside their blobs, so any
+//! positive threshold separates them perfectly.
+//!
+//! 0.05 rather than the 0.1 first proposed. At 0.1 the passing sample clears
+//! by only 1.44x, which is thin for a term meant to be a safety net; at 0.05
+//! it clears by 2.9x, and because the failing side is 0.000 the loosening
+//! costs literally nothing there. Tuning this to 0.14 to "fit the sample"
+//! would be the mistake.
+constexpr float kGsPhotoLiftMinOriginOutside = 0.05f;
+
+//! Does this cloud look like it was lifted from a photograph?
+//!
+//! The LAST step of the rig waterfall, consulted only when nothing else has an
+//! opinion — no `--rig=`, no `camera.rig`, no `camera` block at all. A `.spz`
+//! or `.ply` conversion of a photo lift carries no metadata whatsoever, and
+//! framing it as an object gives it a crop at the wrong field of view; this is
+//! how such a file still reaches the camera rig.
+GsPhotoLiftSignature GsDetectPhotoLift(const GsSceneMeasurements& m,
+                                       const GsFitBounds& bounds);
 
 //! Measure a righted (RUB) cloud. O(n), a few passes, once per load.
 GsSceneMeasurements GsMeasureScene(const std::vector<GsVertex>& vertices);
@@ -441,8 +510,11 @@ bool GsResolveCameraRig(const GsSceneCamera& cam,
 
 //! Which rig a scene should be framed with, and why.
 //!   --rig= -> camera.rig -> (block present ? camera : display)
+//! `sig` is the photo-lift signature, consulted only when nothing else has an
+//! opinion. Passing nullptr keeps the pre-autodetect behaviour exactly.
 GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags,
-                          std::string* source = nullptr);
+                          std::string* source = nullptr,
+                          const GsPhotoLiftSignature* sig = nullptr);
 
 //! The block's rest pose, righted from its OpenCV convention into app space
 //! (RUB), as `GsResolveCameraRig` does internally. Exposed because the DISPLAY
