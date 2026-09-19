@@ -65,7 +65,21 @@
 
 #include "gs_renderer_select.h"   // GsActiveRenderer (GS_RENDERER in linux/CMakeLists.txt)
 #include "gs_camera_rig.h"        // GsCameraRig / GsRigFlags — the photo-lifted rig
-#include "launch_args.h"          // dxr::ParseLaunchArgs — the shared --key=value grammar
+// dxr::ParseLaunchArgs — the shared --key=value grammar.
+//
+// X11 is why this include is fenced. <X11/X.h> defines `None` as the object-ID
+// macro `0L`, and launch_args.h declares `enum class LaunchSrcKind { None,
+// LocalPath, Url }` — so with Xlib included first the enumerator expands to a
+// numeric constant and the header does not parse ("expected identifier before
+// numeric constant"). The macro cannot simply be dropped: this file uses the
+// real X11 `None` for `g_wmDeleteAtom`. So it is pushed aside for exactly one
+// include and restored. macOS and Windows never see this because neither
+// includes Xlib. (This is the whole reason the Linux lane, and only the Linux
+// lane, went red when the shared parser was adopted here.)
+#pragma push_macro("None")
+#undef None
+#include "launch_args.h"
+#pragma pop_macro("None")
 
 // ============================================================================
 // Logging
