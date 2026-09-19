@@ -2530,7 +2530,11 @@ int main(int argc, char** argv) {
         for (int i = 1; i < argc; i++)
             if (argv[i]) args.emplace_back(argv[i]);
         g_launch = dxr::ParseLaunchArgs(args);
-        for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+        // The shared parser meets this viewer's own flags and says so; that is
+        // not a problem worth a WARN, because they ARE handled — just by the
+        // second pass below. See GsIsOwnFlagWarning.
+        for (const std::string& w : g_launch.warnings)
+            if (!GsIsOwnFlagWarning(w)) LOG_WARN("launch: %s", w.c_str());
         for (const std::string& e : g_launch.errors)   LOG_ERROR("launch: %s", e.c_str());
         // A local `--src=` and the legacy positional both name a scene; the
         // explicit flag wins. A URL src is a Windows-only capability here (no

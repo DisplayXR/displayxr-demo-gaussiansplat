@@ -1608,7 +1608,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const std::string url(raw, n);
         LOG_INFO("WM_COPYDATA launch URL received (%zu bytes)", n);
         const dxr::LaunchArgs a = dxr::ParseLaunchArgs({url});
-        for (const std::string& w : a.warnings) LOG_WARN("launch: %s", w.c_str());
+        for (const std::string& w : a.warnings)
+            if (!GsIsOwnFlagWarning(w)) LOG_WARN("launch: %s", w.c_str());
         if (!a.ok()) {
             for (const std::string& e : a.errors) LOG_ERROR("launch: %s", e.c_str());
             ToastF("Refused: %s", a.errors.empty() ? "bad launch URL" : a.errors[0].c_str());
@@ -3668,7 +3669,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
              g_launch.hasDpr ? 1 : 0, g_launch.dpr,
              g_launch.type.c_str(), g_launch.title.c_str(), g_launch.fromProtocol ? 1 : 0,
              (unsigned long long)g_launch.maxBytes, g_launch.noCache ? 1 : 0);
-    for (const std::string& w : g_launch.warnings) LOG_WARN("launch: %s", w.c_str());
+    // The shared parser meets this viewer's own flags and says so; that is not
+    // a problem worth a WARN, because they ARE handled — just by the rig pass.
+    for (const std::string& w : g_launch.warnings)
+        if (!GsIsOwnFlagWarning(w)) LOG_WARN("launch: %s", w.c_str());
 
     // The rig flags are a SECOND pass over the same command line
     // (GsParseRigFlags leaves tokens it does not own alone, and the launch
