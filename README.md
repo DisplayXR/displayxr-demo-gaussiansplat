@@ -443,6 +443,43 @@ any page on an origin the user once approved, so its allowlist is widened
 separately from the local one. A local `.sog` (positional path, `--src=` with a
 file path, the Open dialog, drag-and-drop) loads normally.
 
+## Performance knobs (`DXR_GS_*`)
+
+Every renderer-side performance lever is an **environment variable**, read once
+when the renderer initialises, on all four platforms and on both splat
+renderers (`GsRenderer`, the compute compositor used on x86 Windows/Linux, and
+`GsAdrenoRenderer`, the graphics/TBDR path used on Android, Apple Silicon and
+Windows-on-ARM). They are environment variables and not command-line flags so
+they can never collide with the viewer's scene/URL argument parsing.
+
+On **Android** each one also falls back to its historical `debug.dxr.gs.*`
+system property when the environment variable is unset, so
+`adb shell setprop debug.dxr.gs.scale 0.6` keeps working exactly as before.
+
+**Every optimisation defaults to the setting that does not change a pixel.**
+The two enabled-by-default levers are lossless by construction — they only
+remove work the fragment stage was already discarding — and the ones that can
+change the image are off until you ask for them.
+
+| Variable | Default | Lossy? | What it does |
+|---|---|---|---|
+| `DXR_GS_EXTENT` | `opacity` | no | Quad/tile extent is `sqrt(2·λ·ln(255·opacity))`, clamped to the historical 3σ — the radius beyond which the fragment shader's own `alpha < 1/255` test discards everything. Set to `3sigma` to restore the old formula. Bites on faint splats (`opacity < 0.353`); a dense opaque scene clamps to 3σ and is unaffected. |
+| `DXR_GS_INVISIBLE_CULL` | `1` | no | Drop gaussians whose effective opacity is below `1/255`. `alpha ≤ opacity` at every pixel, so these can never pass the fragment test. `0` disables. |
+| `DXR_GS_SCALE` | `1.0` | **yes** | Render the whole pipeline at `scale ×` the eye viewport, then upscale-blit. Range `(0.05, 1.0]`. Measured a *regression* on macOS/MoltenVK (the render pass still clears and stores the full-size attachment) — measure before trusting it on a new backend. |
+| `DXR_GS_KEEP` | `1.0` | **yes** | Load-time decimation: keep this fraction of gaussians, hash-selected so the thinning is spatially uniform regardless of file order. |
+| `DXR_GS_CULL_ALPHA` | `0` | **yes** | Load-time cull of gaussians below this opacity. Unlike `DXR_GS_INVISIBLE_CULL` this removes splats that *are* visible. |
+| `DXR_GS_MAX_RADIUS_FRAC` | `0` (off) | **yes** | Cap the on-screen splat radius at this fraction of the render height, to bound the overdraw of sky-sized mega-splats. |
+| `DXR_GS_COMPACT` | `0` (off) | no | Draw only the gaussians that survived preprocess, via `vkCmdDrawIndirect` (graphics path only; the compute path already compacts through its prefix sum). Lossless, but measured *slower* on macOS/MoltenVK and it removes almost nothing at a rest pose. |
+| `DXR_GS_DUMP` | unset | no | Write the internal render target (pre-blit, pre-upscale) to this path as a PNG, once, then stop. For diffing two runs. |
+| `DXR_GS_DUMP_FRAME` | `240` | no | Which eye `DXR_GS_DUMP` fires on. |
+
+Two more exist on the macOS build for benchmarking only: `DXR_GS_NOORBIT`
+pins the camera (the 10 s idle turntable otherwise changes the workload
+between samples) and `DXR_GS_WINDOW=WxH` sizes the window. The renderer logs
+one `GsAdreno: knobs …` / `GsRenderer: knobs …` line per session with the
+resolved values — a timing measurement without that line is not reproducible.
+Per-stage GPU timings come from the throttled `GS_TS` line.
+
 ## Agent tools (MCP)
 
 When the runtime's MCP capability is enabled (`DISPLAYXR_MCP=1` or the
