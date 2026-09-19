@@ -21,6 +21,11 @@ struct GsVertex {
 };
 static_assert(sizeof(GsVertex) == 240, "GsVertex must be 240 bytes");
 
+//! Which rig frames a scene. Lives here rather than in gs_camera_rig.h so the
+//! loader can carry the file's own hint without depending on the rig module
+//! (gs_camera_rig.h includes THIS header, not the other way round).
+enum class GsRigKind { Display, Camera };
+
 //! The recording camera a photo-lifted scene was predicted through.
 //!
 //! Filled from the OPTIONAL top-level `camera` block of a SOG `meta.json`
@@ -64,6 +69,46 @@ struct GsSceneCamera {
     //! lift has no baseline and the viewer falls back to a nominal one.
     bool  hasStereo = false;
     float baselineM = 0.0f;
+
+    // ── v2 additions. All optional; a v1 block leaves every one of them
+    //    unset and behaves exactly as it did. ─────────────────────────────
+
+    //! `camera.rig` — the file's own hint about which rig suits it. A
+    //! photo-lifted scene that nevertheless wants the display rig (a product
+    //! shot lifted from a photograph, say) can say so without the user
+    //! passing a flag. Unset means "camera", since carrying the block at all
+    //! is already that request.
+    bool       hasRigHint = false;
+    GsRigKind  rigHint    = GsRigKind::Camera;
+
+    //! `camera.focus.point` — THE focus, in rest-camera space, in the block's
+    //! OpenCV convention (+y down, +z forward). One point serves three roles
+    //! that must never disagree: the orbit centre, the pivot plane that stays
+    //! put under head motion, and the convergence depth. On BOTH rigs.
+    //!
+    //! The loader stores it verbatim; the rig module rights it into app space
+    //! alongside the rest pose.
+    bool  hasFocus = false;
+    float focusPoint[3] = {0.0f, 0.0f, 0.0f};
+
+    //! `camera.focus.source` — how the producer arrived at that point
+    //! ("convergence", "manual", "auto"). Reported, never acted on: the
+    //! viewer's behaviour must not depend on a producer's self-description.
+    std::string focusSourceLabel;
+
+    //! `camera.focus.{subject_m,near_m,far_m}` — informational scene facts.
+    //! Not used to frame anything; they exist so a viewer can say something
+    //! true about the scene's depth range without measuring it.
+    bool  hasSubjectM = false; float subjectM = 0.0f;
+    bool  hasNearM    = false; float nearM    = 0.0f;
+    bool  hasFarM     = false; float farM     = 0.0f;
+
+    //! `camera.dxr.{ipd_factor,parallax_factor}` — ABSOLUTE scalars the
+    //! producer wants applied on top of the measured-IPD scaling, so an asset
+    //! whose depth reads too strong can be calmed at source. Absolute, never
+    //! normalised against convergence (see GsCameraRig::IpdScale). Default 1.
+    bool  hasDxrIpd      = false; float dxrIpdFactor      = 1.0f;
+    bool  hasDxrParallax = false; float dxrParallaxFactor = 1.0f;
 };
 
 // Parse a binary PLY file and return GPU-ready vertices.

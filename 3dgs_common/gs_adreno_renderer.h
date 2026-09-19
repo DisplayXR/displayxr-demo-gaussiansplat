@@ -35,7 +35,8 @@
 
 #pragma once
 
-#include "gs_scene_loader.h"  // GsVertex, GsSceneCamera
+#include "gs_scene_loader.h"
+#include "gs_camera_rig.h"  // GsSceneMeasurements  // GsVertex, GsSceneCamera
 
 #include <vulkan/vulkan.h>
 #include <string>
@@ -73,9 +74,14 @@ struct GsAdrenoRenderer {
     //! camera rig. Valid from the moment loadScene() returns until the next load.
     const GsSceneCamera& sceneCamera() const { return sceneCamera_; }
 
-    //! Median forward depth (-z) of the current cloud in metres, measured
-    //! before decimation; 0 when unknown. The camera rig's default pivot.
-    float sceneMedianForwardDepthM() const { return sceneMedianForwardDepthM_; }
+    //! What the current cloud says about itself — recovered intrinsics and
+    //! median-disparity depth — measured before decimation. Feeds the camera
+    //! rig's waterfall; `valid == false` when nothing could be measured.
+    const GsSceneMeasurements& sceneMeasurements() const { return sceneMeasurements_; }
+
+    //! Median-disparity depth in metres, 0 when unknown. Shorthand for the
+    //! field of sceneMeasurements() the rig uses most.
+    float sceneMedianForwardDepthM() const { return sceneMeasurements_.medianDepthM; }
     uint32_t gaussianCount() const { return numGaussians_; }
 
     // Robust scene centroid + per-axis extent (outlier-trimmed): per axis takes
@@ -175,7 +181,7 @@ private:
     std::string loadedScenePath_;
     std::string lastLoadError_;
     GsSceneCamera sceneCamera_;
-    float sceneMedianForwardDepthM_ = 0.0f;
+    GsSceneMeasurements sceneMeasurements_;
     uint32_t numGaussians_ = 0;
 
     // Internal render scale (1.0 = full res). Default 0.6 on Android — the
