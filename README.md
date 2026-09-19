@@ -76,14 +76,38 @@ sources tried in order, and **the viewer logs and HUD-displays which level it
 landed on**, because a wrong answer and a right one look identical until you
 know which level produced it.
 
-| decision | 1st | 2nd | 3rd | 4th |
-|---|---|---|---|---|
-| **rig** | `--rig=` | `camera.rig` | block present → camera | → display |
+| decision | 1st | 2nd | 3rd | 4th | 5th |
+|---|---|---|---|---|---|
+| **rig** | `--rig=` | `camera.rig` | block present → camera | **photo-lift signature → camera** | → display |
 | **intrinsics** | `camera.intrinsics` | `--fx --fy --cx --cy --size` | estimated from the cloud | 28 mm-eq at the measured aspect |
 | **focus** | `--pivot=` | `camera.focus.point` | median disparity of the cloud | scene bounds, then 2 m |
 
 Flags outrank the block field by field, so `--cx` alone is a correction to an
 otherwise good camera rather than a request to discard it.
+
+**A file with no block at all can still reach the camera rig.** A `.spz` or
+`.ply` conversion of a gallery lift carries no metadata whatsoever, and framing
+one as an object gives it a crop at the wrong field of view. So when nothing has
+declared a rig, the viewer asks the cloud itself, and takes the camera rig only
+if all three of these hold:
+
+| | test | measured: photo lifts | measured: object scans |
+|---|---|---|---|
+| (a) | ≥ 99 % of gaussians in front of the origin | **100.0000 %** | 2.26 % · 70.00 % |
+| (b) | the angular-extent focal is a plausible lens (14–85 mm-eq) | 21.0 mm ✓ | 15.7 mm ✓ · 28.0 mm ✗ |
+| (c) | the origin lies ≥ 0.05 × the blob's extent outside it | **0.144** | 0.000 · 0.000 |
+
+(a) is the decisive one and says what the other two only corroborate: a lift is
+unprojected *forward* through one lens, so everything it contains is in front of
+the camera, while a scan is captured from all around and much of it sits behind.
+(c) says the same thing from the other side — a camera stands outside what it
+photographed, whereas a scanned object surrounds the origin it was scanned
+about. The viewer logs all three with their thresholds, and on a miss says which
+one decided, because "framed as an object" and "framed as a photograph" look
+identical from outside until you know.
+
+`--rig=display` overrides it, and a scene that declares anything at all never
+reaches this step.
 
 **Intrinsics can be recovered from the cloud**, which is why a block with no
 `intrinsics` is still a useful block. A photo-lifted cloud remembers its camera

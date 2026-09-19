@@ -235,7 +235,7 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
 // ─────────────────────────────────────────────────────────────────────────────
 
 GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags,
-                          std::string* source) {
+                          std::string* source, const GsPhotoLiftSignature* sig) {
     if (flags.hasRig) {
         if (source) *source = "--rig";
         return flags.rig;
@@ -244,8 +244,19 @@ GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags,
         if (source) *source = "camera.rig";
         return cam.rigHint;
     }
-    if (source) *source = cam.present ? "block present" : "no block";
-    return cam.present ? GsRigKind::Camera : GsRigKind::Display;
+    if (cam.present) {
+        if (source) *source = "block present";
+        return GsRigKind::Camera;
+    }
+    // Nothing declared anything. A `.spz` or `.ply` conversion of a photo lift
+    // carries no metadata at all, and framing it as an object gives it a crop
+    // at the wrong field of view — so ask the cloud what it looks like.
+    if (sig && sig->isPhotoLift) {
+        if (source) *source = "auto: photo-lift signature";
+        return GsRigKind::Camera;
+    }
+    if (source) *source = "no block";
+    return GsRigKind::Display;
 }
 
 bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
@@ -352,6 +363,11 @@ GsSceneMeasurements GsMeasureScene(const std::vector<GsVertex>& vertices) {
     GsEstimateIntrinsics(vertices, m.estimate);
     m.medianDepthM       = GsMedianDisparityDepth(vertices, /*centreWeighted=*/false);
     m.medianDepthCentreM = GsMedianDisparityDepth(vertices, /*centreWeighted=*/true);
+    {
+        size_t inFront = 0;
+        for (const GsVertex& v : vertices) if (-v.position[2] > 0.05f) inFront++;
+        m.forwardFraction = (float)((double)inFront / (double)vertices.size());
+    }
     m.valid = m.estimate.valid || m.medianDepthM > 0.0f;
     return m;
 }
@@ -407,6 +423,46 @@ void GsCameraRig::SetFocusLocal(float x, float y, float z) {
     const float depth = Clampf(-z, kGsPivotMinM, kGsPivotMaxM);
     focusLocal[2] = -depth;
     pivotM = depth;
+}
+
+GsPhotoLiftSignature GsDetectPhotoLift(const GsSceneMeasurements& m,
+                                       const GsFitBounds& bounds) {
+    GsPhotoLiftSignature s;
+    s.forwardFraction = m.forwardFraction;
+    s.focal35mm = m.estimate.focal35mm;
+    // A lens, not a fallback: `usedFallback` means the measured focal fell
+    // outside 14-85 mm-eq and a nominal 28 was substituted, which is precisely
+    // the case where the cloud's angular extent is NOT telling us about a lens.
+    s.focalGatePassed = m.estimate.valid && !m.estimate.usedFallback;
+
+    float blobMax = 0.0f;
+    if (bounds.valid) {
+        for (int a = 0; a < 3; a++) blobMax = std::max(blobMax, bounds.extent[a]);
+        // Distance from the origin to the blob's box; zero when inside it.
+        double d2 = 0.0;
+        for (int a = 0; a < 3; a++) {
+            const double half = 0.5 * (double)bounds.extent[a];
+            const double delta = std::fabs((double)bounds.center[a]) - half;
+            if (delta > 0.0) d2 += delta * delta;
+        }
+        if (blobMax > 1.0e-9f)
+            s.originOutsideRatio = (float)(std::sqrt(d2) / (double)blobMax);
+    }
+
+    // All three, in the order that makes a failure cheapest to read: the
+    // decisive one first.
+    if (!(s.forwardFraction >= kGsPhotoLiftMinForwardFrac)) {
+        s.failedTerm = "not all in front of the origin";
+    } else if (!s.focalGatePassed) {
+        s.failedTerm = "angular extent is not a plausible lens";
+    } else if (!bounds.valid) {
+        s.failedTerm = "no object blob to stand outside of";
+    } else if (!(s.originOutsideRatio >= kGsPhotoLiftMinOriginOutside)) {
+        s.failedTerm = "camera sits inside the subject";
+    } else {
+        s.isPhotoLift = true;
+    }
+    return s;
 }
 
 bool GsResolveCameraRig(const GsSceneCamera& cam,
