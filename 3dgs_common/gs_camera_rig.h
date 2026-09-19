@@ -128,6 +128,13 @@ struct GsRigFlags {
     bool  hasSize = false; int width = 0, height = 0;   //!< --size=WxH
     bool  hasBaseline = false; float baselineM = 0.0f;
     bool  hasPivot = false;    float pivotM = 0.0f;
+
+    //! Initial rendering-mode index (`--mode=`), i.e. what the 0/1/2/3 keys
+    //! select: 0 is the 2D passthrough the runtime advertises first, 1 the
+    //! first 3D mode, and so on. Not a rig property — it lives here because
+    //! this is the viewer's own flag namespace, and launching straight into a
+    //! known mode is what makes a rest view reproducible from a script.
+    bool  hasMode = false;     int mode = 0;
 };
 
 //! Parse the rig flags out of argv.
@@ -147,6 +154,7 @@ struct GsRigFlags {
 //!   --size=WxH        eye-image size in pixels
 //!   --baseline=<m>    capture baseline, metres
 //!   --pivot=<m>       pivot / convergence depth, metres
+//!   --mode=<index>    initial rendering mode (0 = 2D passthrough, 1 = first 3D)
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);
 
@@ -201,12 +209,41 @@ struct GsCameraRig {
     //! ABSOLUTE eye-separation scale for XrCameraRigDXR::ipdFactor, so the
     //! runtime's two eyes end up `baselineM` apart in world units.
     //!
+    //! `measuredEyeSeparationM` is the spread the runtime actually reports for
+    //! this display (XrViewDisplayRawDXR::rawEyes), because ipdFactor scales
+    //! THAT, not some nominal. Passing <= 0 falls back to a nominal 63 mm face,
+    //! which is only right by luck: the sim display reports 60 mm and a real
+    //! panel reports whatever it tracked, so a fixed divisor would render the
+    //! stereo pair at up to a few percent of the wrong baseline.
+    //!
     //! NOT normalised against convergence: on the camera rig the ipd and the
     //! parallax are absolute scales, and folding 1/convergence into them (the
     //! trick that makes a display<->camera toggle disturbance-free) would make
     //! the stereo depth of a photo-lifted scene depend on where the pivot
     //! happened to land.
-    float IpdScale() const;
+    float IpdScale(float measuredEyeSeparationM) const;
+
+    //! The pose to DECLARE as XrCameraRigDXR::pose.
+    //!
+    //! NOT the same point as `restPosition`, and it depends on how many views
+    //! the active rendering mode asks for.
+    //!
+    //! MULTI-VIEW (`monoView == false`): the descriptor's pose is the camera
+    //! the runtime straddles with the tracked eye pair — the head CENTRE —
+    //! while the block's `rest` is the LEFT capture camera, because that is
+    //! where a single-camera lift puts the origin. So the rig sits half a
+    //! baseline to the right of rest, which lands the left rendered view on the
+    //! left capture camera and the right one on the right: at rest the two
+    //! views ARE the captured pair. (It also makes the comfort cone symmetric
+    //! about the head rather than lopsided about one eye — camera.ts clampEye
+    //! measures from (B/2, 0) for exactly this reason.)
+    //!
+    //! MONO (`monoView == true`): there is no pair to straddle, so the one view
+    //! should be the photograph itself — the LEFT capture camera, i.e. `rest`
+    //! unchanged. This is what the gallery's 2D tier does (`restEye()` is the
+    //! origin), and it is the difference between "the 2D view IS the photo" and
+    //! "the 2D view is a synthesised half-baseline-right of the photo".
+    void RigPose(bool monoView, float outPosition[3], float outRotation[4]) const;
 
     //! Tangent-space shift for an off-centre principal point: add `du` to both
     //! horizontal fov tangents and `dv` to both vertical ones. Zero for a

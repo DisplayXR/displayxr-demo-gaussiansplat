@@ -197,6 +197,36 @@ static dxr::LaunchArgs g_launch;        //!< shared flags (--src/--vh/--pose/...
 static GsRigFlags      g_rigFlags;      //!< rig flags (--rig/--fx/--size/...)
 static GsCameraRig     g_camRig;        //!< resolved camera rig, valid while active
 static bool            g_cameraRigActive = false;
+//! Eye spread the runtime last reported for this display, metres (the raw
+//! channel's rawEyes[]). The camera rig's ipdFactor scales THAT, so measuring
+//! it is what makes the rendered pair exactly the capture baseline instead of
+//! whatever a nominal face happens to be. 0 until the first locate lands.
+static float           g_camRigMeasuredIpdM = 0.0f;
+
+// ── Anchoring the camera rig's REST view to the capture camera ───────────────
+//
+// XrCameraRigDXR is defined against the DISPLAY: its eye displacement is the
+// tracked eye measured from the panel's axis, and this panel's nominal viewer
+// does not sit on that axis — it is 10 cm above the panel centre, as a seated
+// viewer is. The rig faithfully renders that: at rest, with nothing tracked, it
+// puts the eye 10 cm above the declared camera and shears the window to match.
+// For a head-tracked scene that is exactly right. For a PHOTO it is not: the
+// rest view has to be the photograph, not a synthesised viewpoint 10 cm above
+// the camera that took it.
+//
+// So the app anchors the rest: it samples the untracked eye centroid and the
+// untracked frustum centre once, then cancels both. Head motion is unaffected —
+// it is a DELTA from that rest, and subtracting a constant leaves every delta
+// intact. The effect is that the camera rig measures head motion FROM THE
+// PHOTOGRAPH'S VIEWPOINT rather than from wherever this panel's nominal viewer
+// happens to sit, which is the only reading of "the render IS the left photo"
+// that survives being shown on a real display.
+//
+// Sampled rather than assumed, because the offset is a property of the panel
+// (the display processor reports it) and no two panels agree on it.
+static bool  g_camRigRestSampled = false;
+static float g_camRigRestEyeXY[2] = {0.0f, 0.0f};  //!< display-space x,y of the untracked centroid
+static float g_camRigRestTan[2]   = {0.0f, 0.0f};  //!< tangent centre of the untracked frustum
 
 typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
@@ -2287,6 +2317,15 @@ int main(int argc, char** argv) {
         }
     }
 
+    // `--mode=` wins over the env var: it is the explicit, per-launch request,
+    // and it is what makes a rest view reproducible from a script (mode 0 is
+    // the 2D passthrough, so a capture of it is one view rather than a
+    // composite the display processor has already mixed).
+    if (g_rigFlags.hasMode) {
+        g_input.currentRenderingMode = (uint32_t)g_rigFlags.mode;
+        LOG_INFO("Initial rendering mode from --mode=%d", g_rigFlags.mode);
+    }
+
     // Step 1: Initialize OpenXR FIRST — xrGetSystemProperties needs only
     // instance + system id, and returns the 3D panel desktop position the
     // window below is created at (INV-1.3 ordering: instance → system →
@@ -2403,6 +2442,27 @@ int main(int argc, char** argv) {
         float deltaTime = std::chrono::duration<float>(now - lastTime).count();
         lastTime = now;
         g_frameCount++;
+
+        // DXR_GS_CAPTURE_FRAME=<n>: fire the 'I' atlas capture once, on frame n,
+        // and log the path. A dev aid for autonomous verification on macOS,
+        // where `screencapture` needs a TCC grant the harness does not have and
+        // silently returns an all-black image when it is missing — the runtime
+        // readback needs no such permission and gives the PRE-display-processor
+        // tiles, which is the honest thing to measure a rest view against.
+        // Unset (the default) does nothing at all.
+        {
+            static long s_captureFrame = -2;
+            if (s_captureFrame == -2) {
+                const char* e = getenv("DXR_GS_CAPTURE_FRAME");
+                s_captureFrame = e ? strtol(e, nullptr, 10) : -1;
+                if (s_captureFrame >= 0)
+                    LOG_INFO("DXR_GS_CAPTURE_FRAME=%ld — will capture the atlas once",
+                             s_captureFrame);
+            }
+            if (s_captureFrame >= 0 && (long)g_frameCount == s_captureFrame) {
+                g_input.captureAtlasRequested = true;
+            }
+        }
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
         // Handle load request (from L key or Open button)
@@ -2526,11 +2586,35 @@ int main(int argc, char** argv) {
                     // yaw/pitch here as well would double-apply the rotation.
                     const bool camRig = g_cameraRigActive && g_camRig.valid;
                     XrPosef cameraPose;
+                    // Does the ACTIVE mode render one view or a pair? Known before the
+                    // locate (it is a property of the mode, not of the result), and the
+                    // camera rig's pose depends on it: a pair straddles the head centre,
+                    // a single view IS the photograph. Same expression the post-locate
+                    // monoMode uses.
+                    const bool camMonoMode =
+                        (xr.renderingModeCount > 0 &&
+                         g_input.currentRenderingMode < xr.renderingModeCount)
+                            ? !xr.renderingModeDisplay3D[g_input.currentRenderingMode]
+                            : false;
                     if (camRig) {
-                        cameraPose.orientation = {g_camRig.restRotation[0], g_camRig.restRotation[1],
-                                                  g_camRig.restRotation[2], g_camRig.restRotation[3]};
-                        cameraPose.position = {g_camRig.restPosition[0], g_camRig.restPosition[1],
-                                               g_camRig.restPosition[2]};
+                        // The HEAD CENTRE, half a baseline right of the block's `rest`
+                        // (which is the LEFT capture camera) — so at rest the two
+                        // rendered views land on the two capture cameras; in a mono mode
+                        // it stays on `rest`. See GsCameraRig::RigPose.
+                        float rigPos[3], rigRot[4];
+                        g_camRig.RigPose(camMonoMode, rigPos, rigRot);
+                        cameraPose.orientation = {rigRot[0], rigRot[1], rigRot[2], rigRot[3]};
+                        // Move the declared camera by MINUS the rest eye offset, in the
+                        // camera's own frame, so the rest eye lands back on the capture
+                        // camera. See g_camRigRestEyeXY.
+                        if (g_camRigRestSampled) {
+                            float ox, oy, oz;
+                            quat_rotate_vec3(cameraPose.orientation,
+                                             -g_camRigRestEyeXY[0], -g_camRigRestEyeXY[1], 0.0f,
+                                             &ox, &oy, &oz);
+                            rigPos[0] += ox; rigPos[1] += oy; rigPos[2] += oz;
+                        }
+                        cameraPose.position = {rigPos[0], rigPos[1], rigPos[2]};
                     } else {
                         quat_from_yaw_pitch(g_input.yaw, g_input.pitch, &cameraPose.orientation);
                         cameraPose.position = {g_input.cameraPosX, g_input.cameraPosY, g_input.cameraPosZ};
@@ -2563,7 +2647,8 @@ int main(int argc, char** argv) {
                         // the TRACKED eye spread; metersToVirtual is 1 because a lifted
                         // scene is already metric.
                         camRigDesc.pose = cameraPose;
-                        camRigDesc.ipdFactor = g_camRig.IpdScale() * g_input.viewParams.ipdFactor;
+                        camRigDesc.ipdFactor =
+                            g_camRig.IpdScale(g_camRigMeasuredIpdM) * g_input.viewParams.ipdFactor;
                         camRigDesc.parallaxFactor = g_input.viewParams.parallaxFactor;
                         camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters();
                         camRigDesc.verticalFov = g_camRig.VerticalFovRad(canvasAspect);
@@ -2661,6 +2746,19 @@ int main(int argc, char** argv) {
                                 xr.eyePositions[v][1] = viewRigRaw.rawEyes[v].y;
                                 xr.eyePositions[v][2] = viewRigRaw.rawEyes[v].z;
                             }
+                            // The raw channel is the only place the UNSCALED eye spread
+                            // appears, and it is what the camera rig's absolute ipdFactor
+                            // is a multiplier on. Measured once per locate (it tracks a
+                            // real face), used on the next — one frame of lag on a number
+                            // that barely moves, versus a nominal that is simply wrong
+                            // (this sim display reports 60 mm, not 63).
+                            if (viewRigRaw.eyeCountOutput >= 2) {
+                                const float dx = viewRigRaw.rawEyes[1].x - viewRigRaw.rawEyes[0].x;
+                                const float dy = viewRigRaw.rawEyes[1].y - viewRigRaw.rawEyes[0].y;
+                                const float dz = viewRigRaw.rawEyes[1].z - viewRigRaw.rawEyes[0].z;
+                                const float sep = sqrtf(dx * dx + dy * dy + dz * dz);
+                                if (sep > 1.0e-4f) g_camRigMeasuredIpdM = sep;
+                            }
                         } else {
                             for (uint32_t v = 0; v < modeViewCount && v < 8; v++) {
                                 xr.eyePositions[v][0] = views[v].pose.position.x;
@@ -2725,7 +2823,65 @@ int main(int argc, char** argv) {
                             }
 
                             float camShiftU = 0.0f, camShiftV = 0.0f;
-                            if (camRig) g_camRig.PrincipalShiftTan(camShiftU, camShiftV);
+                            if (camRig) {
+                                g_camRig.PrincipalShiftTan(camShiftU, camShiftV);
+                                // Sample the rest anchor once, on an UNTRACKED frame:
+                                // the eye centroid the panel reports with no lock, and
+                                // the frustum centre the rig produced from it. Both are
+                                // then cancelled below and in the pose. (Untracked only —
+                                // sampling a tracked frame would bake a real head
+                                // position in as if it were the rest.)
+                                if (!g_camRigRestSampled && eyeCount > 0 &&
+                                    eyeTrackingState.isTracking != XR_TRUE) {
+                                    float sx = 0.0f, sy = 0.0f;
+                                    uint32_t n = 0;
+                                    if (useRig && viewRigRaw.eyeCountOutput > 0) {
+                                        for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
+                                            sx += viewRigRaw.rawEyes[v].x;
+                                            sy += viewRigRaw.rawEyes[v].y;
+                                            n++;
+                                        }
+                                    }
+                                    if (n > 0) {
+                                        g_camRigRestEyeXY[0] = sx / (float)n;
+                                        g_camRigRestEyeXY[1] = sy / (float)n;
+                                    }
+                                    const XrFovf& f0 = srcViews[0].fov;
+                                    g_camRigRestTan[0] = 0.5f * (tanf(f0.angleRight) + tanf(f0.angleLeft));
+                                    g_camRigRestTan[1] = 0.5f * (tanf(f0.angleUp) + tanf(f0.angleDown));
+                                    g_camRigRestSampled = true;
+                                    LOG_INFO("Camera rig rest anchor: eye=(%.4f, %.4f) m, "
+                                             "frustum centre tan=(%.5f, %.5f) — cancelled so the "
+                                             "rest view is the capture camera",
+                                             g_camRigRestEyeXY[0], g_camRigRestEyeXY[1],
+                                             g_camRigRestTan[0], g_camRigRestTan[1]);
+                                    }
+                                camShiftU -= g_camRigRestTan[0];
+                                camShiftV -= g_camRigRestTan[1];
+                            }
+                            // One-shot: what we DECLARED vs what came back. The camera
+                            // rig lives or dies on the returned frustum matching the
+                            // photo's, and a silent aspect disagreement is exactly the
+                            // "wrong zoom" this rig exists to prevent.
+                            if (camRig) {
+                                static bool s_fovLogged = false;
+                                if (!s_fovLogged && eyeCount > 0) {
+                                    s_fovLogged = true;
+                                    const XrFovf& f = srcViews[0].fov;
+                                    LOG_INFO("Camera rig fov: declared vFOV=%.3fdeg "
+                                             "(half-tan %.5f, photo half-tan h=%.5f v=%.5f) "
+                                             "-> returned L=%.3f R=%.3f U=%.3f D=%.3f deg "
+                                             "(half-tan h=%.5f v=%.5f) canvasAspect=%.4f",
+                                             g_camRig.VerticalFovRad(canvasAspect) * 57.2957795f,
+                                             tanf(0.5f * g_camRig.VerticalFovRad(canvasAspect)),
+                                             g_camRig.TanHalfPhotoW(), g_camRig.TanHalfPhotoH(),
+                                             f.angleLeft * 57.2957795f, f.angleRight * 57.2957795f,
+                                             f.angleUp * 57.2957795f, f.angleDown * 57.2957795f,
+                                             0.5f * (tanf(f.angleRight) - tanf(f.angleLeft)),
+                                             0.5f * (tanf(f.angleUp) - tanf(f.angleDown)),
+                                             canvasAspect);
+                                }
+                            }
                             float camSceneOrbit[16];
                             const bool camOrbiting =
                                 camRig && (g_input.yaw != 0.0f || g_input.pitch != 0.0f);
