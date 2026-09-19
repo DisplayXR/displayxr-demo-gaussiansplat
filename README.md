@@ -58,9 +58,8 @@ waterfall chose.
 The viewer supports **both** framing models, selected by scene type.
 
 **Display rig** — object-centric scenes (the bundled `butterfly.spz`, product
-and model turntables). Auto-fit the scene's AABB to the virtual display and
-orbit the display around the subject. This is the viewer's original behaviour
-and it is unchanged.
+and model turntables). Find the main object, centre the display on it and size
+the display to frame it; orbit the display around it. See [the fit](#the-display-rig-fit).
 
 **Camera rig** — open scenes lifted from a photograph (an ML-SHARP `.sog` from
 the DisplayXR Gallery). The splat's origin **is** the left capture camera
@@ -105,6 +104,53 @@ lifted cloud spans the union of what both cameras saw plus whatever the model
 extrapolated, so its angular centre drifts off the optical axis in an unrelated
 direction. Measured on the harbour asset, applying it costs about seven points
 of grey MAE (32.5/29.3 against the photographs, versus 23.6/23.6 centred).
+
+### The display-rig fit
+
+Two questions, one answer each: **where** to put the display (the orbit centre,
+which is also the pivot and the convergence — one point, as on the camera rig)
+and **how big** to make it (`virtualDisplayHeight`).
+
+**Where** is an opacity-weighted voxel flood-fill from the densest voxel: a
+figure is a contiguous 3D blob, and the walls and floor around it are separated
+by air the fill cannot cross, so it finds the subject rather than the room.
+Floaters — training artefacts scattered far outside the model — are trimmed
+first (`KAWS FAMILY.spz` throws ~3 % of its splats out to ±240 while the model
+spans ±15). If the fill finds nothing, a [p5, p95] box is the documented
+fallback.
+
+**This used to be implemented twice, differently**, and the two renderer legs
+are chosen at compile time — so the same asset framed one way on Windows and
+another on a Mac, a tablet or a Windows-on-ARM box. On `butterfly.spz` they
+disagreed by **47 %** (1.979 vs 1.343 vH on the same viewport). There is now
+one implementation, `3dgs_common/gs_scene_fit.{h,cpp}`, and every platform gets
+the flood-fill answer. **Windows does not move; macOS and Android move to the
+Windows framing.**
+
+**How big** is the old width-aware rule — the subject caps at `fill` of the
+viewport on both axes — plus a **depth budget**. The fit centre is the ZDP, so
+content `d` off that plane is disparity on the panel; capping that disparity
+bounds how deep a scene may be before it has to be pushed back. The model is
+scale-free (everything is a ratio of the display height), so doubling a scene
+does not change how it is framed. Over budget **grows `vHeight`; it never moves
+the pivot**, because the pivot is the orbit centre and the convergence and those
+three stay one point.
+
+On `KAWS FAMILY.spz` the cluster is nearly as deep (3.725) as it is wide
+(3.880): the flat rule framed it at 2.796 with its far end well behind the
+screen, and the budget pulls it back to **7.449**. On `butterfly.spz` — a
+shallow object — the depth term asks for 0.891 and never binds.
+
+| flag | |
+|---|---|
+| `--fit=depth` | default: shared bounds + the disparity budget |
+| `--fit=flood` | shared bounds, old flat x/y rule (KAWS 2.796) |
+| `--fit=legacy` | **this platform's old framing**, for regression checks — the graphics leg's raw [p5, p95], the compute leg's flood-fill |
+| `--fit-disparity=<vH>` | the budget ceiling as a fraction of the display height, default `0.03`. The one knob that moves a depth-bound fit: `0.06` takes KAWS from 7.449 to 4.190. |
+
+The fit does not run at all on the camera rig — a photograph is framed by its
+own camera, and a flood-fill over an open scene finds no subject to frame
+(on `ports.sog` it fills 18 of 262 144 voxels).
 
 ### How the rig reaches the runtime
 
@@ -256,6 +302,8 @@ not carry a `camera` block — and they override it when it does.
 | `--focus-weight=centre` | Take the median-disparity focus from the middle of the frame only. Right for a portrait, wrong for a landscape, so it is off by default. |
 | `--mode=<index>` | Initial rendering mode — `0` is the runtime's 2D passthrough, `1` the first 3D mode. Makes a rest view reproducible from a script. |
 | `--window=WxH` | Open the window at this size in points. The camera rig derives its horizontal FOV from the canvas aspect, so this is a real input to the framing — it is how a portrait asset gets checked. |
+| `--fit=legacy\|flood\|depth` | Display-rig fit mode, default `depth`. See [the fit](#the-display-rig-fit). |
+| `--fit-disparity=<vH>` | Depth-budget ceiling as a fraction of the display height, default `0.03`. |
 
 Framing the DisplayXR Gallery's `ports` scene through its own camera:
 
