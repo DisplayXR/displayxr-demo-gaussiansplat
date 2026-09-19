@@ -216,6 +216,8 @@ add_library(gs_renderer STATIC
     gs_sog_loader.cpp
     gs_camera_rig.h
     gs_camera_rig.cpp
+    gs_scene_fit.h
+    gs_scene_fit.cpp
     gs_vulkan_utils.h
     gs_vulkan_utils.cpp
     ${SHADER_HEADERS}
@@ -237,3 +239,22 @@ target_link_libraries(gs_renderer PUBLIC
 # zlib (a SOG bundle is a PKZip: raw inflate per member) plus the WebP decoder.
 target_link_libraries(gs_renderer PRIVATE ${SPZ_ZLIB_TARGET} ${SOG_WEBP_TARGET})
 target_include_directories(gs_renderer PRIVATE "${libwebp_SOURCE_DIR}/src")
+
+# ── gs_fit_probe — the scene fit on a command line ───────────────────────
+# Desktop only, and NOT part of any shipped artifact: it exists so the framing
+# numbers can be compared across assets and viewports without a GPU, a window
+# or an installed runtime. It links gs_renderer for the loaders (.ply / .spz /
+# .sog all live there) but calls no Vulkan entry point at run time.
+#
+# Android builds this directory through android/src/main/cpp/CMakeLists.txt,
+# which compiles a CURATED source list and never sees this file.
+if(NOT ANDROID)
+    add_executable(gs_fit_probe gs_fit_probe.cpp)
+    target_link_libraries(gs_fit_probe PRIVATE gs_renderer)
+    set_target_properties(gs_fit_probe PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    if(MSVC)
+        set_target_properties(gs_fit_probe PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+endif()

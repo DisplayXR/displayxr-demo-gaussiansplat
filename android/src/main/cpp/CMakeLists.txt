@@ -152,6 +152,10 @@ add_library(gausssplat_vk_android SHARED
     # nothing about which symbols the archive needs.
     ${GS_COMMON}/gs_sog_loader.cpp
     ${GS_COMMON}/gs_camera_rig.cpp
+    # Renderer-independent display-rig fit (bounds + vHeight). Shared with the
+    # desktop legs so the framing is identical on every platform; this leg has
+    # to list it explicitly because the source list here is CURATED, not a glob.
+    ${GS_COMMON}/gs_scene_fit.cpp
     ${GS_COMMON}/gs_vulkan_utils.cpp
     ${SHADER_HEADERS})
 
