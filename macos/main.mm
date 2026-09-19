@@ -308,6 +308,10 @@ static NSUInteger g_savedWindowStyle = 0;
 // permanently at session create and cannot be toggled at runtime. A plain bool
 // is fine — macOS pumps events and renders on the same main thread.
 static bool g_transparentBg = false;
+// --opaque / DXR_GS_OPAQUE=1: an opaque window + layer and NO transparent-bg
+// session flag, so the scene sits on black instead of compositing the desktop
+// through it. For eyeballing framing and for screenshots; default off.
+static bool g_forceOpaque = false;
 
 // 3DGS state
 static GsActiveRenderer g_gsRenderer;
@@ -738,7 +742,7 @@ static void OpenLoadDialog() {
     // through alpha < 1 regions. The runtime's Metal compositor also sets
     // this when transparentBackgroundEnabled = XR_TRUE, but the demo owns
     // layer creation, so set it here too. Harmless when opaque (alpha = 1).
-    layer.opaque = NO;
+    layer.opaque = g_forceOpaque ? YES : NO;
     return layer;
 }
 - (BOOL)wantsLayer { return YES; }
@@ -973,8 +977,8 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
     // transparent-bg path (Ctrl+T): the runtime's Metal compositor sets the
     // CAMetalLayer non-opaque but does NOT touch the app-owned NSWindow, so
     // the demo must. Harmless when opaque (renderer outputs alpha = 1).
-    [g_window setOpaque:NO];
-    [g_window setBackgroundColor:[NSColor clearColor]];
+    [g_window setOpaque:g_forceOpaque ? YES : NO];
+    [g_window setBackgroundColor:g_forceOpaque ? [NSColor blackColor] : [NSColor clearColor]];
     // Do NOT [g_window center] — that would drag the window back onto the
     // screen containing (0,0) and defeat the INV-1.3 panel placement above.
 
@@ -991,7 +995,7 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
     // transparency to it), so it must be NO by then for the desktop to show
     // through transparent (alpha<1) regions.
     if ([g_metalView.layer isKindOfClass:[CAMetalLayer class]]) {
-        ((CAMetalLayer *)g_metalView.layer).opaque = NO;
+        ((CAMetalLayer *)g_metalView.layer).opaque = g_forceOpaque ? YES : NO;
     }
 
     // Accept drag-and-drop of .ply / .spz files
@@ -1849,10 +1853,12 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     // flag at session create; it cannot be flipped at runtime. The Ctrl+T
     // toggle only changes the renderer's output alpha (opaque mode emits
     // alpha = 1 throughout, so it composites fully opaque despite this flag).
-    macBinding.transparentBackgroundEnabled = XR_TRUE;
+    // The runtime's Metal compositor re-asserts a non-opaque layer whenever this
+    // is XR_TRUE, which would override --opaque.
+    macBinding.transparentBackgroundEnabled = g_forceOpaque ? XR_FALSE : XR_TRUE;
     if (xr.hasCocoaWindowBinding && g_metalView) {
         vkBinding.next = &macBinding;
-        LOG_INFO("Using XR_DXR_cocoa_window_binding (transparent-bg ENABLED)");
+        LOG_INFO("Using XR_DXR_cocoa_window_binding (transparent-bg %s)", g_forceOpaque ? "DISABLED (--opaque)" : "ENABLED");
     }
 
     XrSessionCreateInfo si = {XR_TYPE_SESSION_CREATE_INFO};
@@ -2487,6 +2493,10 @@ static void TryAutoLoadBundledScene() {
 // ============================================================================
 
 int main(int argc, char** argv) {
+    // --opaque must be known before InitializeOpenXR (it decides the session's
+    // transparent-bg flag) and before the window/layer are created.
+    g_forceOpaque = (getenv("DXR_GS_OPAQUE") != nullptr);
+    for (int i = 1; i < argc; i++) if (strcmp(argv[i], "--opaque") == 0) g_forceOpaque = true;
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
 
