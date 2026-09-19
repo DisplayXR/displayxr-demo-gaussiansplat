@@ -21,7 +21,8 @@
 #include <vector>
 #include "gs_vulkan_utils.h"
 #include "gs_scene_loader.h"
-#include "gs_camera_rig.h"  // GsSceneMeasurements  // GsVertex (used by filterFloaters signature)
+#include "gs_camera_rig.h"  // GsSceneMeasurements
+#include "gs_scene_fit.h"   // GsFitBounds  // GsVertex (used by filterFloaters signature)
 
 struct GsPickData {
     float px, py, pz;   // world-space position
@@ -67,6 +68,16 @@ struct GsRenderer {
     //! What the current cloud says about itself — recovered intrinsics and
     //! median-disparity depth — measured before decimation. Feeds the camera
     //! rig's waterfall; `valid == false` when nothing could be measured.
+    //! Where the DISPLAY rig should centre, and how big the subject is, from
+    //! the shared scene-fit module. Measured once at load (see the note at
+    //! the call site); `valid == false` when there was nothing to measure.
+    const GsFitBounds& fitBounds() const { return fitBounds_; }
+
+    //! The same, computed the way THIS leg historically did it — the
+    //! `--fit=legacy` A/B. Equal to fitBounds() on the compute leg; the
+    //! [5%, 95%] percentile box on the graphics leg.
+    const GsFitBounds& fitBoundsLegacy() const { return fitBoundsLegacy_; }
+
     const GsSceneMeasurements& sceneMeasurements() const { return sceneMeasurements_; }
 
     //! Median-disparity depth in metres, 0 when unknown. Shorthand for the
@@ -108,22 +119,6 @@ struct GsRenderer {
                       const float viewerOffsetLocal[3],
                       uint32_t numCandidates = 8) const;
 
-    // Locate the main object via voxel-density flood-fill from the peak
-    // voxel. Voxelizes splats into a gridSize³ grid (opacity-weighted),
-    // finds the densest voxel, BFS-fills to neighbors at ≥ threshold × peak.
-    // The threshold is auto-adapted so the filled region falls between
-    // ~1 % and ~30 % of the grid. Returns the world-space bbox of the
-    // filled region.
-    //
-    // Works because the main object occupies a contiguous 3D blob, while
-    // walls/floor/ceiling are physically separated by air gaps that the
-    // flood-fill cannot cross at typical voxel sizes (≤ object–wall gap).
-    //
-    // gridSize: voxels per axis (64 is a good default — 25 cm voxels for
-    //           a 16 m scene, well under typical room air-gap distance).
-    // Returns false if no scene loaded or peak density is zero.
-    bool getMainObjectBounds(uint32_t gridSize,
-                             float outCenter[3], float outExtent[3]) const;
 
     // Robust scene centroid + per-axis extent, excluding outlier gaussians.
     // For each axis, takes the positions at the loPct / hiPct quantiles
@@ -273,6 +268,8 @@ private:
     std::string lastLoadError_;
     GsSceneCamera sceneCamera_;
     GsSceneMeasurements sceneMeasurements_;
+    GsFitBounds fitBounds_;
+    GsFitBounds fitBoundsLegacy_;
     uint32_t numGaussians_ = 0;
 
     // ── Derived dimensions ───────────────────────────────────────────────

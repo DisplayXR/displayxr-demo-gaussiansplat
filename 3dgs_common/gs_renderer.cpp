@@ -13,6 +13,7 @@
 #include "gs_spz_loader.h"
 #include "gs_sog_loader.h"
 #include "gs_camera_rig.h"
+#include "gs_scene_fit.h"
 #include <cstdio>
 
 // On Android, printf() to stdout is NOT captured by logcat — only
@@ -801,6 +802,25 @@ bool GsRenderer::loadScene(const char* plyPath)
                     dropped, total, (double)cullKeepFrac_, kept);
         }
     }
+
+    // ── Scene fit, measured HERE and nowhere else ───────────────────────────
+    //
+    // Both renderers drop the CPU vertex array after upload, and the graphics
+    // leg's surviving arrays carry no opacity — so the opacity-weighted
+    // flood-fill cannot be run after load on that leg at all. The bounds are
+    // therefore measured while the vertices are in hand, and cached.
+    //
+    // AFTER the opacity cull and the decimation, deliberately: the flood-fill
+    // has always run over the post-cull set, so measuring it earlier would
+    // change its answer whenever a perf knob is in play. (That is the opposite
+    // of GsMeasureScene, which runs BEFORE the culls precisely so the camera
+    // rig's pivot does NOT move with a perf knob. Two measurements, two
+    // reasons, both load-bearing.)
+    fitBounds_ = GsResolveFitBounds(vertices.data(), vertices.size(), 64u);
+    // This leg shipped the flood-fill, so `--fit=legacy` and `--fit=flood`
+    // are the same picture here. Kept explicit so the A/B means the same
+    // thing on both legs.
+    fitBoundsLegacy_ = fitBounds_;
 
     numGaussians_ = (uint32_t)vertices.size();
     numPrefixSumIter_ = (uint32_t)std::ceil(std::log2((double)numGaussians_));
@@ -1890,242 +1910,12 @@ bool GsRenderer::getRobustSceneBounds(float loPct, float hiPct,
     return true;
 }
 
-// ═════════════════════════════════════════════════════════════════════════
-// getMainObjectBounds — voxelize splats into an opacity-weighted density
-// grid, find the peak voxel, BFS-flood-fill at adaptive threshold, return
-// the world-space bbox of the filled region. Walls/floor are physically
-// air-separated from the figure so the flood-fill stays on the figure.
-// ═════════════════════════════════════════════════════════════════════════
-
-bool GsRenderer::getMainObjectBounds(uint32_t gridSize,
-                                     float outCenter[3], float outExtent[3]) const
-{
-    if (pickData_.empty() || gridSize < 4) return false;
-    const uint32_t G = gridSize;
-    const size_t totalVoxels = (size_t)G * G * G;
-
-    // 1. Scene bounds via 5–95 percentile (ignores extreme outliers).
-    float vmin[3], vmax[3];
-    {
-        std::vector<float> coord(pickData_.size());
-        for (int axis = 0; axis < 3; axis++) {
-            for (size_t i = 0; i < pickData_.size(); i++) {
-                const auto& g = pickData_[i];
-                coord[i] = (axis == 0) ? g.px : (axis == 1) ? g.py : g.pz;
-            }
-            size_t loIdx = (size_t)(0.05f * (float)(coord.size() - 1));
-            size_t hiIdx = (size_t)(0.95f * (float)(coord.size() - 1));
-            if (hiIdx <= loIdx) hiIdx = loIdx + 1;
-            std::nth_element(coord.begin(), coord.begin() + loIdx, coord.end());
-            float lo = coord[loIdx];
-            std::nth_element(coord.begin() + loIdx + 1, coord.begin() + hiIdx, coord.end());
-            float hi = coord[hiIdx];
-            vmin[axis] = lo;
-            vmax[axis] = hi;
-            if (vmax[axis] - vmin[axis] < 1e-6f) return false;
-        }
-    }
-
-    // 2. Voxelize: opacity-weighted density per cell (idx = (x*G + y)*G + z).
-    std::vector<float> density(totalVoxels, 0.0f);
-    float invSize[3];
-    for (int a = 0; a < 3; a++) invSize[a] = (float)G / (vmax[a] - vmin[a]);
-    for (const auto& g : pickData_) {
-        float p[3] = {g.px, g.py, g.pz};
-        int idx[3];
-        bool inside = true;
-        for (int a = 0; a < 3; a++) {
-            int i = (int)((p[a] - vmin[a]) * invSize[a]);
-            if (i < 0 || i >= (int)G) { inside = false; break; }
-            idx[a] = i;
-        }
-        if (!inside) continue;
-        density[((size_t)idx[0] * G + (size_t)idx[1]) * G + (size_t)idx[2]] += g.opacity;
-    }
-
-    // 3. Find peak voxel.
-    float peakDensity = 0.0f;
-    size_t peakIdx = 0;
-    for (size_t i = 0; i < totalVoxels; i++) {
-        if (density[i] > peakDensity) { peakDensity = density[i]; peakIdx = i; }
-    }
-    if (peakDensity < 1e-6f) return false;
-
-    // 4. Flood-fill helper: BFS from peak including 6-neighbors with
-    //    density >= absThreshold. Returns the bool grid + count.
-    auto floodFill = [&](float absThreshold, std::vector<bool>& filled) -> size_t {
-        std::fill(filled.begin(), filled.end(), false);
-        if (density[peakIdx] < absThreshold) return 0;
-        filled[peakIdx] = true;
-        std::vector<size_t> queue;
-        queue.reserve(4096);
-        queue.push_back(peakIdx);
-        size_t count = 1, head = 0;
-        const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
-        while (head < queue.size()) {
-            size_t idx = queue[head++];
-            int z = (int)(idx % G);
-            int y = (int)((idx / G) % G);
-            int x = (int)(idx / ((size_t)G * G));
-            for (int d = 0; d < 6; d++) {
-                int nx = x + dirs[d][0];
-                int ny = y + dirs[d][1];
-                int nz = z + dirs[d][2];
-                if (nx < 0 || nx >= (int)G || ny < 0 || ny >= (int)G ||
-                    nz < 0 || nz >= (int)G) continue;
-                size_t nidx = ((size_t)nx * G + (size_t)ny) * G + (size_t)nz;
-                if (filled[nidx] || density[nidx] < absThreshold) continue;
-                filled[nidx] = true;
-                queue.push_back(nidx);
-                count++;
-            }
-        }
-        return count;
-    };
-
-    // 5. Adaptive threshold search. Try thresholds from loose to tight; pick
-    //    the first one whose fill is in the [1 %, 30 %] range. If none fits
-    //    (e.g. tight object scene where everything connects), fall back to
-    //    the loosest-but-still-valid result.
-    const size_t minFill = std::max((size_t)16, totalVoxels / 100);
-    const size_t maxFill = totalVoxels / 3;
-    const float thresholds[] = {0.01f, 0.02f, 0.05f, 0.10f, 0.20f, 0.30f, 0.50f, 0.70f};
-
-    std::vector<bool> filled(totalVoxels, false);
-    std::vector<bool> bestFilled(totalVoxels, false);
-    size_t bestCount = 0;
-    float bestThresh = 0.30f;
-    for (float t : thresholds) {
-        size_t count = floodFill(t * peakDensity, filled);
-        if (count >= minFill && count <= maxFill) {
-            bestFilled = filled;
-            bestCount = count;
-            bestThresh = t;
-            break;
-        }
-        // Also remember the largest fill that's at most maxFill, in case
-        // nothing falls into the sweet spot.
-        if (count > bestCount && count <= maxFill) {
-            bestFilled = filled;
-            bestCount = count;
-            bestThresh = t;
-        }
-    }
-    if (bestCount == 0) return false;
-
-    // 6. Bbox of filled voxels in voxel coords, then convert to world.
-    int minVox[3] = {(int)G, (int)G, (int)G};
-    int maxVox[3] = {-1, -1, -1};
-    for (size_t idx = 0; idx < totalVoxels; idx++) {
-        if (!bestFilled[idx]) continue;
-        int z = (int)(idx % G);
-        int y = (int)((idx / G) % G);
-        int x = (int)(idx / ((size_t)G * G));
-        if (x < minVox[0]) minVox[0] = x; if (x > maxVox[0]) maxVox[0] = x;
-        if (y < minVox[1]) minVox[1] = y; if (y > maxVox[1]) maxVox[1] = y;
-        if (z < minVox[2]) minVox[2] = z; if (z > maxVox[2]) maxVox[2] = z;
-    }
-    float denseCenter[3], denseExt[3];
-    for (int a = 0; a < 3; a++) {
-        float voxSize = (vmax[a] - vmin[a]) / (float)G;
-        float denseMinW = vmin[a] + (float)minVox[a] * voxSize;
-        float denseMaxW = vmin[a] + (float)(maxVox[a] + 1) * voxSize;
-        denseCenter[a] = 0.5f * (denseMinW + denseMaxW);
-        denseExt[a] = denseMaxW - denseMinW;
-    }
-
-    // 7. Branch on regime: a high fill ratio means the dense cluster
-    //    occupies most of the scene's 5–95 bbox, so we have a single tight
-    //    object (butterfly) — use full min/max so sparse extremities like
-    //    antennae aren't clipped. A low fill ratio means the dense cluster
-    //    is a small central region inside a larger scene (KAWS gallery,
-    //    Leila room) — use the exact bbox of gaussians within the flood-
-    //    fill voxels (tighter than the voxel-aligned bbox).
-    float fillRatio = (float)bestCount / (float)totalVoxels;
-    const float kSingleObjectFillThresh = 0.02f;
-    const float kComfort = 1.10f;  // 10 % margin on the object bbox
-
-    bool isSingleObject = (fillRatio > kSingleObjectFillThresh);
-    if (isSingleObject) {
-        // Full min/max bounding box of all gaussians.
-        float fullMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
-        float fullMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-        for (const auto& g : pickData_) {
-            if (g.px < fullMin[0]) fullMin[0] = g.px;
-            if (g.px > fullMax[0]) fullMax[0] = g.px;
-            if (g.py < fullMin[1]) fullMin[1] = g.py;
-            if (g.py > fullMax[1]) fullMax[1] = g.py;
-            if (g.pz < fullMin[2]) fullMin[2] = g.pz;
-            if (g.pz > fullMax[2]) fullMax[2] = g.pz;
-        }
-        for (int a = 0; a < 3; a++) {
-            outCenter[a] = 0.5f * (fullMin[a] + fullMax[a]);
-            outExtent[a] = (fullMax[a] - fullMin[a]) * kComfort;
-        }
-    } else {
-        // Gaussian-precise bbox + opacity-weighted centroid for in-flood-
-        // fill gaussians. Center on the centroid (pulls toward the densest
-        // part of the object — e.g. the can in a Leila scene — away from
-        // sparse appendages like a chain extending upward). Extent is
-        // symmetric around the centroid covering the full precise bbox so
-        // sparse extensions stay visible at the frame edge but don't
-        // dominate the framing center.
-        float preciseMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
-        float preciseMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-        double sumW = 0.0;
-        double centroidSum[3] = {0.0, 0.0, 0.0};
-        for (const auto& g : pickData_) {
-            int xi = (int)((g.px - vmin[0]) * invSize[0]);
-            int yi = (int)((g.py - vmin[1]) * invSize[1]);
-            int zi = (int)((g.pz - vmin[2]) * invSize[2]);
-            if (xi < 0 || xi >= (int)G || yi < 0 || yi >= (int)G ||
-                zi < 0 || zi >= (int)G) continue;
-            size_t vid = ((size_t)xi * G + (size_t)yi) * G + (size_t)zi;
-            if (!bestFilled[vid]) continue;
-            if (g.px < preciseMin[0]) preciseMin[0] = g.px;
-            if (g.px > preciseMax[0]) preciseMax[0] = g.px;
-            if (g.py < preciseMin[1]) preciseMin[1] = g.py;
-            if (g.py > preciseMax[1]) preciseMax[1] = g.py;
-            if (g.pz < preciseMin[2]) preciseMin[2] = g.pz;
-            if (g.pz > preciseMax[2]) preciseMax[2] = g.pz;
-            double w = g.opacity;
-            sumW += w;
-            centroidSum[0] += w * g.px;
-            centroidSum[1] += w * g.py;
-            centroidSum[2] += w * g.pz;
-        }
-        // Defensive fall-back (shouldn't trigger in practice).
-        if (preciseMin[0] > preciseMax[0] || sumW < 1e-6) {
-            for (int a = 0; a < 3; a++) {
-                outCenter[a] = denseCenter[a];
-                outExtent[a] = denseExt[a] * kComfort;
-            }
-        } else {
-            float centroid[3] = {(float)(centroidSum[0] / sumW),
-                                 (float)(centroidSum[1] / sumW),
-                                 (float)(centroidSum[2] / sumW)};
-            for (int a = 0; a < 3; a++) {
-                outCenter[a] = centroid[a];
-                float halfMax = std::max(preciseMax[a] - centroid[a],
-                                         centroid[a] - preciseMin[a]);
-                outExtent[a] = 2.0f * halfMax * kComfort;
-            }
-        }
-    }
-
-    printf("GsRenderer: main object %zu/%zu voxels (%.2f%% of grid, threshold %.2fx peak) — %s\n",
-           bestCount, totalVoxels,
-           100.0 * (double)fillRatio, bestThresh,
-           isSingleObject ? "SINGLE OBJECT (5-95 bbox + 1.1x)"
-                          : "SCENE w/ central object (dense bbox + 1.4x)");
-    return true;
-}
-
-// ═════════════════════════════════════════════════════════════════════════
-// findBestYaw — test numCandidates evenly-spaced yaws and return the one
-// with the highest opacity-weighted gaussian mass in front of the viewer.
-// Operates on pickData_, so call after loadScene() succeeds.
-// ═════════════════════════════════════════════════════════════════════════
+// The opacity-weighted voxel flood-fill that used to live here moved to
+// 3dgs_common/gs_scene_fit.cpp, so that both renderer legs frame a scene the
+// same way — they did not, and disagreed by 47% on butterfly.spz. It is
+// called once at load (see the fit block in loadScene) because the CPU
+// vertices, and on the graphics leg the opacities, are gone by the time
+// anything wants a framing.
 
 float GsRenderer::findBestYaw(const float displayCenter[3],
                               const float viewerOffsetLocal[3],

@@ -118,6 +118,9 @@ constexpr float kGsDefaultBaselineM = 0.063f;
 //! Pivot used when neither `--pivot=` nor the cloud offers anything better.
 constexpr float kGsFallbackPivotM = 2.0f;
 
+//! Which display-rig fit to run. See GsRigFlags::fitMode.
+enum class GsFitMode { Legacy, Flood, Depth };
+
 //! A scene rotation about the pivot, radians. What a drag produces.
 struct GsOrbit {
     float yaw   = 0.0f;
@@ -161,6 +164,23 @@ struct GsRigFlags {
     //! makes "does a portrait asset frame correctly" a thing you can check
     //! rather than assert.
     bool  hasWindow = false;   int windowW = 0, windowH = 0;
+
+    //! `--fit=legacy|flood|depth` — which display-rig fit to use. Default
+    //! `depth`. A kill switch, not a preference: `legacy` reproduces the
+    //! framing THIS PLATFORM shipped (which differed between the two renderer
+    //! legs by 47% on butterfly.spz — that divergence is the reason the shared
+    //! module exists), `flood` is the shared flood-fill with the old flat
+    //! x/y rule, and `depth` adds the on-panel disparity budget. Having all
+    //! three live means a framing regression can be bisected on a running
+    //! viewer instead of argued about.
+    GsFitMode fitMode = GsFitMode::Depth;
+    bool      hasFitMode = false;
+
+    //! `--fit-disparity=<vH>` — the depth budget's ceiling as a fraction of
+    //! the virtual display height (GsFitComfort::maxDisparityVH, default
+    //! 0.03). The one knob that moves a depth-bound fit, so it is the one
+    //! worth being able to turn without a rebuild.
+    bool  hasFitDisparity = false; float fitDisparityVH = 0.0f;
 };
 
 //! Intrinsics recovered from the cloud itself, for a scene that declares none.
@@ -228,6 +248,8 @@ bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
 //!   --focus-weight=centre|frame   restrict the median-disparity focus to the
 //!                                 middle of the frame (default: frame)
 //!   --window=WxH      open the window at this size in points
+//!   --fit=legacy|flood|depth      display-rig fit mode (default depth)
+//!   --fit-disparity=<vH>          depth budget ceiling (default 0.03)
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);
 

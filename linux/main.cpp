@@ -301,8 +301,13 @@ static void ApplyRigForLoadedScene() {
         // Coarse fallback pivot for a --rig=camera override on a scene that
         // carries no camera: the forward depth of the main object's centre.
         float boundsDepth = 0.0f;
-        float c[3], e[3];
-        if (g_gsRenderer.getMainObjectBounds(64u, c, e) && -c[2] > 0.0f) boundsDepth = -c[2];
+        // Only the main object's forward depth is wanted here, as a coarse
+        // focus fallback; the fit bounds were measured at load by the shared
+        // module (gs_scene_fit.h).
+        {
+            const GsFitBounds& fb = g_gsRenderer.fitBounds();
+            if (fb.valid && -fb.center[2] > 0.0f) boundsDepth = -fb.center[2];
+        }
 
         // The v2 waterfall takes everything the cloud says in one struct,
         // measured at load: the vertices are long gone by now.

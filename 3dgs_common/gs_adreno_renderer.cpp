@@ -15,6 +15,7 @@
 #include "gs_spz_loader.h"
 #include "gs_sog_loader.h"
 #include "gs_camera_rig.h"
+#include "gs_scene_fit.h"
 
 #include <cstdio>
 #include <cstring>
@@ -304,6 +305,37 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
         posY_[i] = verts[i].position[1];
         posZ_[i] = verts[i].position[2];
     }
+    // ── Scene fit, measured HERE and nowhere else ───────────────────────────
+    //
+    // Both renderers drop the CPU vertex array after upload, and the graphics
+    // leg's surviving arrays carry no opacity — so the opacity-weighted
+    // flood-fill cannot be run after load on that leg at all. The bounds are
+    // therefore measured while the vertices are in hand, and cached.
+    //
+    // AFTER the opacity cull and the decimation, deliberately: the flood-fill
+    // has always run over the post-cull set, so measuring it earlier would
+    // change its answer whenever a perf knob is in play. (That is the opposite
+    // of GsMeasureScene, which runs BEFORE the culls precisely so the camera
+    // rig's pivot does NOT move with a perf knob. Two measurements, two
+    // reasons, both load-bearing.)
+    fitBounds_ = GsResolveFitBounds(verts.data(), verts.size(), 64u);
+    // This leg shipped the [5%, 95%] percentile box — no flood-fill, no
+    // floater trim — which is why the two legs framed butterfly.spz 47%
+    // apart. Cached separately so `--fit=legacy` can reproduce the framing
+    // this platform actually shipped. Runs over posX_/posY_/posZ_, i.e. the
+    // RAW post-cull set the old path used, not the module's trimmed one.
+    {
+        float lc[3], le[3];
+        if (getRobustSceneBounds(0.05f, 0.95f, lc, le)) {
+            fitBoundsLegacy_.valid = true;
+            fitBoundsLegacy_.source = GsBoundsSource::Percentile;
+            for (int i = 0; i < 3; i++) {
+                fitBoundsLegacy_.center[i] = lc[i];
+                fitBoundsLegacy_.extent[i] = le[i];
+            }
+        }
+    }
+
     // Outlier-trimmed [p2,p98] bbox (drives the sort depth quantization range).
     {
         std::vector<float> c(numGaussians_);
@@ -1032,16 +1064,7 @@ bool GsAdrenoRenderer::getRobustSceneBounds(float loPct, float hiPct,
     return true;
 }
 
-// ════════════════════ getMainObjectBounds / pickGaussian ════════════════════
-
-bool GsAdrenoRenderer::getMainObjectBounds(uint32_t /*gridSize*/,
-                                           float outCenter[3], float outExtent[3]) const {
-    // No voxel flood-fill on the graphics leg: the robust [5%,95%] percentile
-    // bounds already exclude stray floaters and frame the main cluster well
-    // enough for auto-framing. (GsRenderer's flood-fill is a refinement, not a
-    // correctness requirement.)
-    return getRobustSceneBounds(0.05f, 0.95f, outCenter, outExtent);
-}
+// ════════════════════════════ pickGaussian ═══════════════════════════════
 
 bool GsAdrenoRenderer::pickGaussian(const float rayOrigin[3], const float rayDir[3],
                                     float hitPos[3], float maxDistance,

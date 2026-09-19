@@ -189,6 +189,22 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
             } else {
                 out.hasBaseline = true; out.baselineM = v;
             }
+        } else if (key == "fit") {
+            if (val == "legacy") { out.hasFitMode = true; out.fitMode = GsFitMode::Legacy; }
+            else if (val == "flood") { out.hasFitMode = true; out.fitMode = GsFitMode::Flood; }
+            else if (val == "depth") { out.hasFitMode = true; out.fitMode = GsFitMode::Depth; }
+            else Warn(warnings, "--fit must be 'legacy', 'flood' or 'depth'; ignored");
+        } else if (key == "fit-disparity") {
+            float v = 0.0f;
+            // Above ~0.2 vH the "budget" is wider than the disparity of a
+            // point at infinity and stops bounding anything; below 0 it is
+            // meaningless. Refuse both rather than silently do nothing.
+            if (!ParseFloatStrict(val, v) || !(v > 0.0f) || v > 0.5f) {
+                Warn(warnings, "--fit-disparity must be a fraction of the display "
+                               "height in (0, 0.5]; ignored");
+            } else {
+                out.hasFitDisparity = true; out.fitDisparityVH = v;
+            }
         } else if (key == "focus-weight") {
             if (val == "centre" || val == "center") out.centreWeightedFocus = true;
             else if (val == "frame" || val == "off") out.centreWeightedFocus = false;
