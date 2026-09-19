@@ -41,8 +41,17 @@ A test scene, `butterfly.spz`, is bundled and auto-loads at startup.
 On the **camera rig** (below) some of these mean something else, because the
 viewpoint is the photograph's and is not the user's to move: a left-click drag
 turns the *scene* about the pivot instead of rotating the display, capped at a
-15° comfort cone; the idle turntable and the double-click recentre are off; and
-Space returns to the capture camera.
+15° comfort cone; the idle turntable is off; and Space returns to the capture
+camera.
+
+**Double-click focuses on both rigs**, and it is the same gesture meaning the
+same thing — *look at that* — with a different consequence. The display rig
+moves its orbit centre to the picked splat. The camera rig moves the **focus
+point**, so the pivot plane and the convergence follow it there while the
+camera stays exactly where it is. Both are eased (0.18 per frame, the gallery's
+own constant): convergence is depth, and a jump in it reads as the whole scene
+lurching toward the viewer. Space eases the focus back to whatever the
+waterfall chose.
 
 ## Two rigs: display and camera
 
@@ -61,17 +70,41 @@ recording camera's intrinsics — *the render IS the left photo*. No auto-fit, n
 turntable: a photo-lifted cloud has no support more than ~15° off the capture
 axis, so spinning it shows floaters rather than parallax.
 
-Which one you get is decided by the scene and overridden by you:
+### The waterfall
 
-| | |
-|---|---|
-| `camera` block present in a `.sog` | camera rig |
-| no `camera` block (every `.ply`, every `.spz`) | display rig |
-| `--rig=camera` / `--rig=display` | forces either, whatever the file says |
+Nothing here is a single switch — each of the three decisions is a list of
+sources tried in order, and **the viewer logs and HUD-displays which level it
+landed on**, because a wrong answer and a right one look identical until you
+know which level produced it.
 
-A forced `--rig=camera` on a scene with no block needs the intrinsics on the
-command line; if they are missing the viewer says so and stays on the display
-rig rather than inventing a camera.
+| decision | 1st | 2nd | 3rd | 4th |
+|---|---|---|---|---|
+| **rig** | `--rig=` | `camera.rig` | block present → camera | → display |
+| **intrinsics** | `camera.intrinsics` | `--fx --fy --cx --cy --size` | estimated from the cloud | 28 mm-eq at the measured aspect |
+| **focus** | `--pivot=` | `camera.focus.point` | median disparity of the cloud | scene bounds, then 2 m |
+
+Flags outrank the block field by field, so `--cx` alone is a correction to an
+otherwise good camera rather than a request to discard it.
+
+**Intrinsics can be recovered from the cloud**, which is why a block with no
+`intrinsics` is still a useful block. A photo-lifted cloud remembers its camera
+whether or not anyone wrote it down: every gaussian was unprojected along a ray
+through the lens, so the P1/P99 angular extent about the rest camera *is* the
+frustum it was fitted in. On the gallery's harbour asset that recovers the
+half-tangents to **+0.18 %** (21 mm-eq against a true 21 mm-eq) and renders to
+within **0.1/255** of the declared camera. Percentiles rather than extremes,
+because a lift always leaves strays far outside the frame and any one of them
+would set the focal by itself; gated on the implied 35 mm-equivalent focal
+landing in 14–85 mm, falling back to 28 mm-eq with the measured **aspect** kept,
+since a cloud's shape says what orientation the photograph was even when its
+tail ruins the scale.
+
+One deliberate exception: the estimator's measured **asymmetry is discarded and
+the principal point centred**. The asymmetry is real but it is not the lens — a
+lifted cloud spans the union of what both cameras saw plus whatever the model
+extrapolated, so its angular centre drifts off the optical axis in an unrelated
+direction. Measured on the harbour asset, applying it costs about seven points
+of grey MAE (32.5/29.3 against the photographs, versus 23.6/23.6 centred).
 
 ### How the rig reaches the runtime
 
@@ -111,16 +144,37 @@ Readers that predate it ignore it, which is every reader shipping today:
 ```json
 "camera": {
   "convention": "opencv",
+  "rig": "camera",
   "rest": { "position": [0,0,0], "rotation": [0,0,0,1] },
   "intrinsics": { "fx": 1194.666, "fy": 1194.666, "cx": 1024.0, "cy": 576.0,
                   "width": 2048, "height": 1152 },
-  "stereo": { "baseline_m": 0.063 }
+  "stereo": { "baseline_m": 0.063 },
+  "focus": { "point": [0,0,1.683], "subject_m": 2.14, "near_m": 0.73,
+             "far_m": 66.2, "source": "convergence" },
+  "dxr": { "ipd_factor": 1.0, "parallax_factor": 1.0 }
 }
 ```
 
 `rotation` is xyzw, camera→world. Intrinsics are in pixels of **one eye's**
 image (`width`×`height`); `cx` may be off-centre. `stereo` is optional — the
 second capture camera sits at +x · `baseline_m`.
+
+Everything except `convention` is optional, and a v1 block (the first four
+keys) behaves exactly as it always did:
+
+- **`rig`** — `"camera"` or `"display"`. A product shot lifted from a
+  photograph is still a product shot, and this lets the producer say so without
+  the user passing a flag.
+- **`focus.point`** — **THE** focus, in rest-camera space. One point does three
+  jobs, on both rigs: the orbit centre, the pivot plane that stays put under
+  head motion, and the convergence depth. They are stored as one field because
+  a viewer that orbits about one place and converges at another shows the user
+  two different scenes depending on whether they are moving. `subject_m`,
+  `near_m` and `far_m` alongside it are informational scene facts; `source`
+  records how the producer chose the point and is reported, never acted on.
+- **`dxr.ipd_factor` / `dxr.parallax_factor`** — absolute scalars applied on top
+  of the measured-IPD scaling, so an asset whose depth reads too strong can be
+  calmed at source. Absolute: never normalised against convergence.
 
 A block whose `convention` is not `opencv`, or whose intrinsics are missing or
 degenerate, is ignored with a warning and the scene falls back to the display
@@ -198,7 +252,8 @@ not carry a `camera` block — and they override it when it does.
 | `--cx=<px>` `--cy=<px>` | Principal point in the same pixels. Default: centred. An off-centre `cx` is a stereo lift's deconvergence. |
 | `--size=WxH` | Eye-image size in pixels, e.g. `--size=2048x1152`. Needed with `--fx` when the file has no block. |
 | `--baseline=<m>` | Capture baseline in metres. Default 0.063. The second capture camera sits at +x · this. |
-| `--pivot=<m>` | Pivot / convergence depth in metres, i.e. the plane that stays put under head motion. Default: the cloud's median forward depth. |
+| `--pivot=<m>` | Focus depth in metres — the plane that stays put under head motion, the orbit centre and the convergence, which are one thing. Default: `camera.focus.point`, else the cloud's median disparity. |
+| `--focus-weight=centre` | Take the median-disparity focus from the middle of the frame only. Right for a portrait, wrong for a landscape, so it is off by default. |
 | `--mode=<index>` | Initial rendering mode — `0` is the runtime's 2D passthrough, `1` the first 3D mode. Makes a rest view reproducible from a script. |
 
 Framing the DisplayXR Gallery's `ports` scene through its own camera:
