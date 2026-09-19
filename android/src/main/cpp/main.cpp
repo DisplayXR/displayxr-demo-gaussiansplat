@@ -1058,7 +1058,21 @@ load_butterfly(struct android_app *app)
 	g_camera_rig_active = false;
 	{
 		const GsSceneCamera &cam = g_gs.sceneCamera();
-		if (GsSelectRigKind(cam, g_rig_flags) == GsRigKind::Camera) {
+		// The last step of the waterfall: when nothing has declared a rig,
+		// ask the cloud whether it looks like a photograph. This arm has no
+		// command line at all, so on Android it is the ONLY way a block-less
+		// lift can reach the camera rig.
+		const GsPhotoLiftSignature sig =
+		    GsDetectPhotoLift(g_gs.sceneMeasurements(), g_gs.fitBounds());
+		LOGI("Photo-lift signature: front=%.4f%% (need %.1f%%) focal=%.1fmm-eq [%s] "
+		     "origin-outside=%.3f (need %.3f) -> %s%s%s",
+		     sig.forwardFraction * 100.0f, kGsPhotoLiftMinForwardFrac * 100.0f,
+		     sig.focal35mm, sig.focalGatePassed ? "lens" : "not a lens",
+		     sig.originOutsideRatio, kGsPhotoLiftMinOriginOutside,
+		     sig.isPhotoLift ? "PHOTO LIFT" : "object scan",
+		     sig.failedTerm ? " (" : "",
+		     sig.failedTerm ? (std::string(sig.failedTerm) + ")").c_str() : "");
+		if (GsSelectRigKind(cam, g_rig_flags, nullptr, &sig) == GsRigKind::Camera) {
 			float bounds_depth = 0.0f;
 			float bc[3], be[3];
 			// Only the main object's forward depth is wanted here, as a
