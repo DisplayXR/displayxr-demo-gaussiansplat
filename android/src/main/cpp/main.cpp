@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "gs_adreno_renderer.h"
+#include "gs_camera_rig.h"   // GsCameraRig — the photo-lifted rig, FILE-driven here
 
 // XR_DXR_view_rig (#396 W7): vendored DisplayXR extension header.
 #include <openxr/XR_DXR_view_rig.h>
@@ -181,6 +182,36 @@ static void mark_user_input() { g_last_input_ms.store(now_ms(), std::memory_orde
 // (the screen roughly spans the scene — desktop auto-fit semantics).
 bool g_has_view_rig = false;
 std::atomic<float> g_rig_vh{1.0f};
+
+// ── The CAMERA rig (3dgs_common/gs_camera_rig.h) ────────────────────────────
+// Everything above is the DISPLAY rig: auto-fit the scene to a virtual display
+// and orbit that display around it. A scene lifted from a photograph wants the
+// other model — framed through the camera it was predicted from — and says so
+// by carrying a `camera` block in its SOG meta.json.
+//
+// FILE-DRIVEN ONLY on this arm. There is no argv and no file picker here (the
+// bundled asset is the scene), so there are no `--rig=` / `--fx=` overrides to
+// parse: GsRigFlags stays default-constructed and GsSelectRigKind therefore
+// answers purely from the file. A .spz/.ply — which is every asset this arm
+// ships today — declares no camera, so g_camera_rig_active stays false and
+// every path below is exactly what it was.
+GsRigFlags  g_rig_flags;        //!< all-unset: "take it from the file"
+GsCameraRig g_cam_rig;          //!< resolved camera rig, valid while active
+bool        g_camera_rig_active = false;
+//! Eye spread the runtime last reported (the raw channel's rawEyes[]). The
+//! camera rig's ipdFactor is an ABSOLUTE multiplier on THAT, so measuring it is
+//! what makes the rendered pair exactly the capture baseline rather than
+//! whatever nominal face the panel assumes. 0 until the first locate lands.
+float       g_cam_rig_measured_ipd_m = 0.0f;
+// Rest anchor: XrCameraRigDXR is defined against the DISPLAY, whose nominal
+// viewer does not sit on the panel axis, so at rest the rig puts the eye off
+// the declared camera and shears the window to match. Correct for a tracked
+// scene, wrong for a PHOTO. Sample the untracked eye centroid + frustum centre
+// once and cancel both; head motion is a DELTA from that rest and survives
+// intact. Sampled, not assumed — the offset is a property of the panel.
+bool        g_cam_rig_rest_sampled = false;
+float       g_cam_rig_rest_eye_xy[2] = {0.0f, 0.0f};
+float       g_cam_rig_rest_tan[2] = {0.0f, 0.0f};
 
 // Tablet gesture state (fed via MainActivity.dispatchTouchEvent → nativeOnTouch +
 // a GestureDetector, runtime#499). All applied to the DISPLAY rig pose / vH at
@@ -1017,6 +1048,40 @@ load_butterfly(struct android_app *app)
 	}
 	LOGI("Loaded butterfly.spz: %u gaussians", g_gs.gaussianCount());
 
+	// Which rig frames this scene? The file decides (there are no CLI overrides
+	// on this arm) — a `camera` block means the camera rig, its absence means
+	// the display rig and the auto-fit below. A camera rig that cannot be
+	// resolved falls back to the display rig with a WARN rather than inventing
+	// intrinsics. The auto-fit block that follows still runs either way: under
+	// the camera rig its outputs (g_rig_vh, g_scene_center) are simply never
+	// read, so leaving it alone keeps this diff to the paths that changed.
+	g_camera_rig_active = false;
+	{
+		const GsSceneCamera &cam = g_gs.sceneCamera();
+		if (GsSelectRigKind(cam, g_rig_flags) == GsRigKind::Camera) {
+			float bounds_depth = 0.0f;
+			float bc[3], be[3];
+			if (g_gs.getMainObjectBounds(64u, bc, be) && -bc[2] > 0.0f) {
+				bounds_depth = -bc[2];
+			}
+			std::string why;
+			if (GsResolveCameraRig(cam, g_rig_flags, g_gs.sceneMedianForwardDepthM(),
+			                       bounds_depth, g_cam_rig, &why)) {
+				g_camera_rig_active = true;
+				g_cam_rig_rest_sampled = false;  // a new scene, a new camera
+				g_spin_angle = 0.0f;             // no turntable on a photo lift
+				LOGI("Camera rig: fx=%.3f fy=%.3f cx=%.1f cy=%.1f %dx%d "
+				     "baseline=%.4fm pivot=%.3fm (%s)",
+				     g_cam_rig.fx, g_cam_rig.fy, g_cam_rig.cx, g_cam_rig.cy,
+				     g_cam_rig.width, g_cam_rig.height, g_cam_rig.baselineM,
+				     g_cam_rig.pivotM, g_cam_rig.pivotSource.c_str());
+			} else {
+				LOGW("Camera rig requested but %s — framing with the display rig",
+				     why.c_str());
+			}
+		}
+	}
+
 	// Auto-frame (W7): recenter on the robust scene centroid (so the splat
 	// straddles the display plane at the origin) and derive the virtual
 	// display height so the scene caps at 80% of the view in BOTH axes.
@@ -1295,14 +1360,81 @@ render_frame()
 		refit_update(frame_dt_s());
 		const float rig_vh = g_rig_vh.load(std::memory_order_relaxed) /
 		                     g_zoom.load(std::memory_order_relaxed);
+		const bool cam_rig = g_camera_rig_active && g_cam_rig.valid;
 		XrPosef rig_pose = {};
-		orbit_quat_from_yaw_pitch(g_orbit_yaw.load(std::memory_order_relaxed),
-		                          g_orbit_pitch.load(std::memory_order_relaxed),
-		                          &rig_pose.orientation);
-		rig_pose.position = {0.0f, 0.0f, 0.0f};
+		if (cam_rig) {
+			// The HEAD CENTRE, half a baseline right of the block's `rest`
+			// (which is the LEFT capture camera) — so at rest the two rendered
+			// views land on the two capture cameras. This arm is stereo-fixed
+			// (kViewCount = 2), so the mono branch of RigPose can never apply.
+			// The drag does NOT come in here: on the camera rig it turns the
+			// SCENE (folded into the model matrix below), never the camera,
+			// whose eyes are the tracker's.
+			float rig_pos[3], rig_rot[4];
+			g_cam_rig.RigPose(/*monoView=*/false, rig_pos, rig_rot);
+			rig_pose.orientation = {rig_rot[0], rig_rot[1], rig_rot[2], rig_rot[3]};
+			// Move the declared camera by MINUS the rest eye offset, expressed
+			// in the camera's own frame, so the rest eye lands back on the
+			// capture camera. See g_cam_rig_rest_eye_xy.
+			if (g_cam_rig_rest_sampled) {
+				// q * (vx, vy, 0) — the anchor is a shift in the image plane,
+				// so vz is identically zero and drops out of the cross products.
+				const float vx = -g_cam_rig_rest_eye_xy[0];
+				const float vy = -g_cam_rig_rest_eye_xy[1];
+				const float qx = rig_rot[0], qy = rig_rot[1];
+				const float qz = rig_rot[2], qw = rig_rot[3];
+				const float tX = 2.0f * (-qz * vy);
+				const float tY = 2.0f * (qz * vx);
+				const float tZ = 2.0f * (qx * vy - qy * vx);
+				rig_pos[0] += vx + qw * tX + (qy * tZ - qz * tY);
+				rig_pos[1] += vy + qw * tY + (qz * tX - qx * tZ);
+				rig_pos[2] += qw * tZ + (qx * tY - qy * tX);
+			}
+			rig_pose.position = {rig_pos[0], rig_pos[1], rig_pos[2]};
+		} else {
+			orbit_quat_from_yaw_pitch(g_orbit_yaw.load(std::memory_order_relaxed),
+			                          g_orbit_pitch.load(std::memory_order_relaxed),
+			                          &rig_pose.orientation);
+			rig_pose.position = {0.0f, 0.0f, 0.0f};
+		}
 		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrCameraRigDXR camera_rig = {XR_TYPE_CAMERA_RIG_DXR};
 		XrViewDisplayRawDXR view_raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
-		if (g_has_view_rig) {
+		if (g_has_view_rig && cam_rig) {
+			// DECLARE, never compute. The photo's intrinsics become an
+			// XR_DXR_view_rig CAMERA descriptor and the runtime returns
+			// render-ready XrView{pose, fov}; the app does no Kooima.
+			//
+			// ipdFactor / parallaxFactor on this rig are ABSOLUTE scales, not
+			// the display rig's [0,1] factors, and they stay absolute: the eye
+			// separation is the capture baseline in world metres, never
+			// normalised against the convergence distance. IpdScale() divides
+			// by the MEASURED eye spread because the runtime scales the tracked
+			// eyes; metersToVirtual is 1 because a lifted scene is metric.
+			//
+			// Canvas aspect the runtime derives the horizontal FOV from. Same
+			// priority the auto-fit uses and for the same reason: g_fit_vp_* is
+			// the window-derived viewport and is the only source that tracks
+			// ORIENTATION (display_info reports the NATIVE landscape panel
+			// whichever way up the tablet is held). Per-view rect last — exact
+			// for an isotropically-scaled mode, which both current modes are.
+			float canvas_aspect = 1.0f;
+			if (g_fit_vp_w > 0.0f && g_fit_vp_h > 0.0f) {
+				canvas_aspect = g_fit_vp_w / g_fit_vp_h;
+			} else if (g_panel_px_w > 0 && g_panel_px_h > 0) {
+				canvas_aspect = (float)g_panel_px_w / (float)g_panel_px_h;
+			} else if (g_views[0].height > 0) {
+				canvas_aspect = (float)g_views[0].width / (float)g_views[0].height;
+			}
+			camera_rig.pose = rig_pose;
+			camera_rig.ipdFactor = g_cam_rig.IpdScale(g_cam_rig_measured_ipd_m);
+			camera_rig.parallaxFactor = 1.0f;
+			camera_rig.convergenceDiopters = g_cam_rig.ConvergenceDiopters();
+			camera_rig.verticalFov = g_cam_rig.VerticalFovRad(canvas_aspect);
+			camera_rig.metersToVirtual = 1.0f;
+			locate_info.next = &camera_rig;
+			view_state.next = &view_raw;
+		} else if (g_has_view_rig) {
 			display_rig.pose = rig_pose;
 			display_rig.virtualDisplayHeight = rig_vh;
 			display_rig.ipdFactor = 1.0f;
@@ -1335,14 +1467,70 @@ render_frame()
 				logged_rig = true;
 			}
 
+			float cam_shift_u = 0.0f, cam_shift_v = 0.0f;
+			if (cam_rig) {
+				// The raw channel is the only place the UNSCALED eye spread
+				// appears, and the camera rig's absolute ipdFactor multiplies
+				// exactly that. Measured once per locate, used on the next —
+				// one frame of lag on a number that barely moves, versus a
+				// nominal that is simply wrong for whatever face was tracked.
+				if (view_raw.eyeCountOutput >= 2) {
+					const float dx = view_raw.rawEyes[1].x - view_raw.rawEyes[0].x;
+					const float dy = view_raw.rawEyes[1].y - view_raw.rawEyes[0].y;
+					const float dz = view_raw.rawEyes[1].z - view_raw.rawEyes[0].z;
+					const float sep = std::sqrt(dx * dx + dy * dy + dz * dz);
+					if (sep > 1.0e-4f) g_cam_rig_measured_ipd_m = sep;
+				}
+
+				// Sample the rest anchor once, on an UNTRACKED frame only:
+				// sampling a tracked frame would bake a real head position in
+				// as if it were the photograph's viewpoint.
+				if (!g_cam_rig_rest_sampled && g_has_view_rig &&
+				    view_raw.isTracking != XR_TRUE) {
+					float sx = 0.0f, sy = 0.0f;
+					uint32_t n = 0;
+					for (uint32_t e = 0; e < view_raw.eyeCountOutput &&
+					                     e < XR_VIEW_RIG_MAX_RAW_EYES_DXR; ++e) {
+						sx += view_raw.rawEyes[e].x;
+						sy += view_raw.rawEyes[e].y;
+						++n;
+					}
+					if (n > 0) {
+						g_cam_rig_rest_eye_xy[0] = sx / (float)n;
+						g_cam_rig_rest_eye_xy[1] = sy / (float)n;
+					}
+					const XrFovf &f0 = views[0].fov;
+					g_cam_rig_rest_tan[0] =
+					    0.5f * (std::tan(f0.angleRight) + std::tan(f0.angleLeft));
+					g_cam_rig_rest_tan[1] =
+					    0.5f * (std::tan(f0.angleUp) + std::tan(f0.angleDown));
+					g_cam_rig_rest_sampled = true;
+					LOGI("Camera rig rest anchor: eye=(%.4f,%.4f) m frustum-tan=(%.5f,%.5f)",
+					     g_cam_rig_rest_eye_xy[0], g_cam_rig_rest_eye_xy[1],
+					     g_cam_rig_rest_tan[0], g_cam_rig_rest_tan[1]);
+				}
+
+				// The ONE intrinsic XrCameraRigDXR cannot carry: an off-centre
+				// principal point (it has verticalFov and nothing else about the
+				// image plane). Applied on top of the render-ready fov rather
+				// than re-derived — it is the ASSET's own calibration — and it
+				// is exactly zero for the centred principal point assets have
+				// today. The rest frustum centre is cancelled in the same term.
+				g_cam_rig.PrincipalShiftTan(cam_shift_u, cam_shift_v);
+				cam_shift_u -= g_cam_rig_rest_tan[0];
+				cam_shift_v -= g_cam_rig_rest_tan[1];
+			}
+
 			// Auto-spin idle gate: only advance the turntable after 10 s of no touch
 			// (including from startup), so the scene is still until the user has been
 			// idle. Seed the timer on the first frame so startup counts as "fresh".
+			// Never on the camera rig: a photo-lifted cloud has no support more
+			// than ~15 deg off the capture axis, so a turntable shows floaters.
 			{
 				int64_t now = now_ms();
 				int64_t last = g_last_input_ms.load(std::memory_order_relaxed);
 				if (last == 0) { last = now; g_last_input_ms.store(now, std::memory_order_relaxed); }
-				if (now - last > 10000) g_spin_angle += g_spin_speed;
+				if (!cam_rig && now - last > 10000) g_spin_angle += g_spin_speed;
 			}
 
 			// Long-press reset: ease the pivot back to the framed centroid (orbit/zoom
@@ -1360,7 +1548,11 @@ render_frame()
 			// (in 3D) becomes the new pivot (g_scene_center), so orbit AND the auto-
 			// spin rotate about the tapped feature at its true depth — the Android
 			// analogue of the desktop double-click focus. Shared CPU picker.
-			if (g_focus_pending.exchange(false, std::memory_order_acquire)) {
+			// Consumed unconditionally (the flag must not latch), acted on only
+			// under the display rig: the camera rig's model matrix ignores
+			// g_scene_center — a photo lift is framed by the capture camera,
+			// not by a pivot the user picked.
+			if (g_focus_pending.exchange(false, std::memory_order_acquire) && !cam_rig) {
 				// Center eye = average of the located views' poses + off-axis fovs.
 				XrVector3f cpos = {0, 0, 0};
 				XrFovf cfov = {0, 0, 0, 0};
@@ -1423,7 +1615,26 @@ render_frame()
 			}
 
 			// Splat model (recenter + spin) — same for both eyes.
-			const Mat4 splat_model = build_splat_model(g_spin_angle);
+			//
+			// On the CAMERA rig this same slot carries the SCENE ORBIT instead:
+			// a rotation about the pivot, pre-multiplied into the view (`view *
+			// scene`) rather than moving the camera, because the eyes are the
+			// tracker's and displacing them would fight it. The 1-finger drag
+			// feeds it with the sign FLIPPED — the display rig's drag orbits
+			// the camera, the camera rig's turntable convention moves the scene
+			// with the finger — and ClampOrbit holds it inside the comfort cone
+			// (beyond ~15 deg a photo lift has grain, not parallax). Recenter
+			// and turntable are both absent here by construction: the splat's
+			// origin IS the capture camera, so there is nothing to recenter on.
+			Mat4 splat_model{};
+			if (cam_rig) {
+				float orbit_yaw = -g_orbit_yaw.load(std::memory_order_relaxed);
+				float orbit_pitch = -g_orbit_pitch.load(std::memory_order_relaxed);
+				g_cam_rig.ClampOrbit(orbit_yaw, orbit_pitch);
+				g_cam_rig.SceneOrbitMatrix(orbit_yaw, orbit_pitch, splat_model.m);
+			} else {
+				splat_model = build_splat_model(g_spin_angle);
+			}
 			auto pf_r0 = pf_now();
 			pf_setup = pf_ms(pf_t1, pf_r0);  // xrBeginFrame + xrLocateViews (IPC for view_rig)
 			for (uint32_t i = 0; i < kViewCount; ++i) {
@@ -1448,15 +1659,39 @@ render_frame()
 				// where ez = rig-local eye Z. The splat shader culls
 				// geometrically on p_view.z (it ignores ndc.z), so these flow
 				// into renderEye's explicit view-space culls.
-				const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
-				float near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
-				float far_z = ez + 1000.0f * rig_vh;
+				float near_z, far_z;
+				XrFovf fov = views[i].fov;
+				if (cam_rig) {
+					// Tangent-space window shift for the asset's own principal
+					// point, minus the cancelled rest frustum centre.
+					if (cam_shift_u != 0.0f) {
+						fov.angleLeft = std::atan(std::tan(fov.angleLeft) + cam_shift_u);
+						fov.angleRight = std::atan(std::tan(fov.angleRight) + cam_shift_u);
+					}
+					if (cam_shift_v != 0.0f) {
+						fov.angleUp = std::atan(std::tan(fov.angleUp) + cam_shift_v);
+						fov.angleDown = std::atan(std::tan(fov.angleDown) + cam_shift_v);
+					}
+					// Scene-absolute planes, not vH-relative: on this rig there
+					// is no virtual display to anchor them to. FAR is
+					// deliberately far past any content (a deconverged lift puts
+					// the sky at the depth worker's cap) and a splat rasteriser
+					// sorts rather than depth-tests, so the huge near:far ratio
+					// costs no precision. This arm never renders transparent, so
+					// there is no ZDP-clipped variant to choose.
+					near_z = kGsCameraRigNearM;
+					far_z = kGsCameraRigFarM;
+				} else {
+					const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
+					near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
+					far_z = ez + 1000.0f * rig_vh;
+				}
 				if (far_z < near_z + 1.0e-4f) {
 					far_z = near_z + 1.0e-4f;
 				}
 				Mat4 viewM = view_matrix_from_pose(views[i].pose);
 				Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
-				Mat4 projM = mat4_from_xr_fov(views[i].fov, near_z, far_z);
+				Mat4 projM = mat4_from_xr_fov(fov, near_z, far_z);
 				g_gs.renderEye(
 				    g_views[i].images[img_idx].image, g_swapchain_format,
 				    g_views[i].width, g_views[i].height,
@@ -1475,7 +1710,10 @@ render_frame()
 
 				projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
 				projection_views[i].pose = views[i].pose;
-				projection_views[i].fov = views[i].fov;
+				// `fov` is the located one everywhere except the camera rig,
+				// where it also carries the principal-point shift — submit what
+				// was actually projected with.
+				projection_views[i].fov = fov;
 				projection_views[i].subImage.swapchain = g_views[i].swapchain;
 				projection_views[i].subImage.imageRect.offset = {0, 0};
 				projection_views[i].subImage.imageRect.extent = {
