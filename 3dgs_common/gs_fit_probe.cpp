@@ -31,8 +31,11 @@
  *     --fill=<f>                  fill fraction (default 0.88, the value both
  *                                 main.mm and main.cpp pass)
  *     --viewport=<W>x<H>          replace the default landscape+portrait pair
+ *     --selftest                  check the module's load-bearing claims and
+ *                                 exit; needs no asset
  */
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -100,6 +103,59 @@ bool LoadScene(const std::string& path, std::vector<GsVertex>& verts,
     return false;
 }
 
+//! The three claims gs_scene_fit.h makes that a reader has to take on trust
+//! otherwise. Exact comparisons where the claim is exactness.
+int SelfTest()
+{
+    int bad = 0;
+    auto check = [&](bool ok, const char* what) {
+        printf("  %-58s %s\n", what, ok ? "ok" : "FAIL");
+        if (!ok) bad++;
+    };
+
+    // 1. At the rest pose the projection is the identity on the extents, so
+    //    the flat fit is bit-for-bit the pre-existing one.
+    GsFitBounds b;
+    b.valid = true;
+    b.source = GsBoundsSource::FloodFillObject;
+    b.center[0] = 0.1f;  b.center[1] = -0.2f; b.center[2] = 0.3f;
+    b.extent[0] = 2.01040053f; b.extent[1] = 1.74130869f; b.extent[2] = 0.445532233f;
+
+    GsFitComfort comfort;
+    const GsFitFrameResult rest =
+        GsFitFrameEx(b, 1280.0f, 720.0f, 0.88f, 0.0f, 0.0f, comfort);
+    check(rest.screenW == b.extent[0] && rest.screenH == b.extent[1] &&
+          rest.screenD == b.extent[2],
+          "yaw=pitch=0 projects the extents onto themselves");
+    check(rest.vHeightFlat ==
+              AutoFitVHeightXY(b.extent[0], b.extent[1], 1280.0f, 720.0f, 0.88f),
+          "flat term == dxr::AutoFitVHeight on those extents");
+
+    // 2. A quarter turn swaps the on-screen width with the depth.
+    const GsFitFrameResult side =
+        GsFitFrameEx(b, 1280.0f, 720.0f, 0.88f, 1.5707963268f, 0.0f, comfort);
+    check(std::fabs(side.screenW - b.extent[2]) < 1e-5f &&
+          std::fabs(side.screenD - b.extent[0]) < 1e-5f &&
+          side.screenH == b.extent[1],
+          "yaw=90deg swaps on-screen width and depth");
+
+    // 3. The budget is exactly where the disparity model says it is: a point
+    //    at the budget half-depth lands on maxDisparityVH, both sides.
+    float dFront = 0.0f, dBehind = 0.0f;
+    GsFitDepthBudgetVH(comfort, dFront, dBehind);
+    const float k = comfort.viewerDistanceVH, s = comfort.eyeSeparationVH;
+    const float dispFront  = s * dFront  / (k - dFront);
+    const float dispBehind = s * dBehind / (k + dBehind);
+    check(std::fabs(dispFront - comfort.maxDisparityVH) < 1e-6f,
+          "front budget sits exactly on the disparity cap");
+    check(std::fabs(dispBehind - comfort.maxDisparityVH) < 1e-6f,
+          "rear budget sits exactly on the disparity cap");
+    check(dFront < dBehind, "front budget is the tighter of the two");
+
+    printf("%s\n", bad ? "SELFTEST FAILED" : "selftest ok");
+    return bad ? 1 : 0;
+}
+
 bool ParseArgFloat(const char* arg, const char* key, float& out)
 {
     const size_t klen = strlen(key);
@@ -118,6 +174,7 @@ int main(int argc, char** argv)
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
+        if (strcmp(a, "--selftest") == 0) return SelfTest();
         float v = 0.0f;
         if (ParseArgFloat(a, "--yaw=", v))        { yawDeg = v; continue; }
         if (ParseArgFloat(a, "--pitch=", v))      { pitchDeg = v; continue; }
