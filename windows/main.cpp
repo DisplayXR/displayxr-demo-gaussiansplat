@@ -610,9 +610,13 @@ static void ApplyRigForLoadedScene_locked() {
         float c[3], e[3];
         if (g_gsRenderer.getMainObjectBounds(64u, c, e) && -c[2] > 0.0f) boundsDepth = -c[2];
 
+        // The v2 waterfall takes everything the cloud says in one struct,
+        // measured at load: the vertices are long gone by now.
+        GsRigResolveInput rigIn;
+        rigIn.measurements = &g_gsRenderer.sceneMeasurements();
+        rigIn.boundsForwardDepthM = boundsDepth;
         std::string why;
-        if (GsResolveCameraRig(cam, g_rigFlags, g_gsRenderer.sceneMedianForwardDepthM(),
-                               boundsDepth, g_camRig, &why)) {
+        if (GsResolveCameraRig(cam, g_rigFlags, rigIn, g_camRig, &why)) {
             g_cameraRigActive.store(true, std::memory_order_relaxed);
             // The content ROI is still owed to the depth budget; only the
             // FRAMING half of ApplyAutoFitForLoadedScene_locked is skipped.
@@ -649,7 +653,7 @@ static void ApplyRigForLoadedScene_locked() {
                      "pivot=%.3fm (%s) vFOV=%.1fdeg principal-shift=(%.5f, %.5f)",
                      g_camRig.fx, g_camRig.fy, g_camRig.cx, g_camRig.cy,
                      g_camRig.width, g_camRig.height, g_camRig.baselineM,
-                     g_camRig.pivotM, g_camRig.pivotSource.c_str(),
+                     g_camRig.pivotM, g_camRig.focusSource.c_str(),
                      g_camRig.VerticalFovRad((float)g_camRig.width / (float)g_camRig.height) *
                          57.2957795f, du, dv);
             return;
@@ -3202,7 +3206,7 @@ static void RenderThreadFunc(
                                             L"\nRig: camera  f=%.0fpx  %dx%d  base=%.0fmm  pivot=%.2fm (%hs)",
                                             g_camRig.fy, g_camRig.width, g_camRig.height,
                                             g_camRig.baselineM * 1000.0f, g_camRig.pivotM,
-                                            g_camRig.pivotSource.c_str());
+                                            g_camRig.focusSource.c_str());
                                     } else {
                                         swprintf(rigBuf, 192, L"\nRig: display  vH=%.3fm",
                                             inputSnapshot.viewParams.virtualDisplayHeight);
