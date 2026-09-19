@@ -473,6 +473,16 @@ change the image are off until you ask for them.
 | `DXR_GS_DUMP` | unset | no | Write the internal render target (pre-blit, pre-upscale) to this path as a PNG, once, then stop. For diffing two runs. |
 | `DXR_GS_DUMP_FRAME` | `240` | no | Which eye `DXR_GS_DUMP` fires on. |
 
+**Which lever actually moves a big scene.** Measured on a 1.18 M-gaussian
+photo-lifted capture (macOS/MoltenVK, pinned pose, one eye): the splat draw is
+**proportional to the gaussian count and independent of resolution** — 30.4 ms
+at 1280x720 and 30.1 ms at 1920x1080, halving to 15.2 ms for half the
+gaussians. Clamping every splat to a ~5x5 px quad removes only 8 %. So on a
+large scene `DXR_GS_KEEP` is the only lever with real leverage; the
+fragment-side ones (`DXR_GS_EXTENT`, `DXR_GS_MAX_RADIUS_FRAC`, `DXR_GS_SCALE`)
+have almost nothing to take. Small scenes (~180 k) behave differently — there
+the GPU is under-occupied and the per-gaussian cost hides.
+
 Two more exist on the macOS build for benchmarking only: `DXR_GS_NOORBIT`
 pins the camera (the 10 s idle turntable otherwise changes the workload
 between samples) and `DXR_GS_WINDOW=WxH` sizes the window. The renderer logs
