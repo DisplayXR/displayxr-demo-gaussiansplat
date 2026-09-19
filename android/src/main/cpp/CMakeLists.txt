@@ -57,6 +57,50 @@ add_library(spz_lib STATIC
 target_include_directories(spz_lib PUBLIC ${spz_SOURCE_DIR}/src/cc)
 target_link_libraries(spz_lib PRIVATE z zstd_lib)    # NDK sysroot zlib + fetched zstd
 
+# libwebp — required by the SOG reader: a `.sog` bundle stores every splat
+# attribute as a WebP texture (means / quats / scales / sh0 / shN), and nothing
+# already in the tree decodes WebP (stb_image does not, and the drift guard
+# forbids re-vendoring an image decoder here anyway — see
+# .github/workflows/no-vendored-math.yml). Fetched the same way zstd is: a
+# release tarball pinned by SHA256 (a moving branch is what the SPZ comment
+# above records the pain of), from the project's own download host rather than
+# GitHub's generated archives.
+#
+# DECODE ONLY. Every WEBP_BUILD_* tool is forced OFF — they pull libpng /
+# giflib / SDL, none of which a build machine is required to have — and we link
+# `webpdecoder`, the decoder-only library, not `webp`. WEBP_BUILD_EXTRAS off
+# also keeps its `set_version` / stub-file machinery out of the way. The
+# targets inherit this directory's CMAKE_MSVC_RUNTIME_LIBRARY (static CRT), the
+# same mechanism zlib and zstd rely on.
+# Keep this block identical to 3dgs_common/CMakeLists.txt.
+set(WEBP_BUILD_ANIM_UTILS OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_CWEBP      OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_DWEBP      OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_GIF2WEBP   OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_IMG2WEBP   OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_VWEBP      OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPINFO   OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_LIBWEBPMUX OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_WEBPMUX    OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_EXTRAS     OFF CACHE BOOL "" FORCE)
+set(WEBP_BUILD_FUZZTEST   OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(libwebp
+    URL      https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-1.5.0.tar.gz
+    URL_HASH SHA256=7d6fab70cf844bf6769077bd5d7a74893f8ffd4dfb42861745750c63c2a5c92c
+)
+FetchContent_MakeAvailable(libwebp)
+if(TARGET webpdecoder)
+    set(SOG_WEBP_TARGET webpdecoder)
+else()
+    # Older libwebp releases only expose the combined library.
+    set(SOG_WEBP_TARGET webp)
+endif()
+if(MSVC)
+    set_target_properties(${SOG_WEBP_TARGET} PROPERTIES
+        MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+    )
+endif()
+
 # ── 3DGS compute shaders → SPIR-V header arrays ───────────────────────────
 # Compiled from the SHARED 3dgs_common/shaders. var name = <name>_comp_data,
 # header = <name>.comp.h (matches the #includes in gs_renderer.cpp).
@@ -102,6 +146,12 @@ add_library(gausssplat_vk_android SHARED
     ${GS_COMMON}/gs_adreno_renderer.cpp
     ${GS_COMMON}/gs_scene_loader.cpp
     ${GS_COMMON}/gs_spz_loader.cpp
+    # gs_scene_loader.cpp dispatches .sog to ParseSogFile and the camera rig to
+    # GsMedianForwardDepth, so both are link-time requirements of the loader
+    # even though this leg has no file picker — the bundled asset alone decides
+    # nothing about which symbols the archive needs.
+    ${GS_COMMON}/gs_sog_loader.cpp
+    ${GS_COMMON}/gs_camera_rig.cpp
     ${GS_COMMON}/gs_vulkan_utils.cpp
     ${SHADER_HEADERS})
 
@@ -109,6 +159,7 @@ target_include_directories(gausssplat_vk_android PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_BINARY_DIR}                 # generated *.comp.h
     ${GS_COMMON}                                # gs_renderer.h, ...
+    ${libwebp_SOURCE_DIR}/src                   # webp/decode.h for gs_sog_loader
     ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
 
 set_target_properties(gausssplat_vk_android PROPERTIES
@@ -117,7 +168,10 @@ set_target_properties(gausssplat_vk_android PROPERTIES
 target_link_libraries(gausssplat_vk_android
     native_app_glue
     spz_lib
-    z                                           # gs_spz_loader peels gzip itself
+    z                                           # gs_spz_loader peels gzip itself;
+                                                # gs_sog_loader raw-inflates each
+                                                # PKZip member with the same zlib
+    ${SOG_WEBP_TARGET}                          # SOG attribute textures are WebP
     OpenXR::openxr_loader
     vulkan
     android
