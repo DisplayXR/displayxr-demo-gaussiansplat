@@ -512,40 +512,46 @@ bool ReadCameraBlock(const JsonValue& meta, GsSceneCamera& out) {
         return true;
     }
 
-    const JsonValue* intr = cam->Find("intrinsics");
-    if (!intr || intr->kind != JsonValue::Kind::Object) {
-        fprintf(stderr, "ParseSogFile: camera block has no 'intrinsics' — ignoring it\n");
-        return true;
-    }
-    const JsonValue* fx = intr->Find("fx");
-    const JsonValue* fy = intr->Find("fy");
-    const JsonValue* cx = intr->Find("cx");
-    const JsonValue* cy = intr->Find("cy");
-    const JsonValue* iw = intr->Find("width");
-    const JsonValue* ih = intr->Find("height");
-    if (!fx || !fy || !iw || !ih || !fx->IsNum() || !fy->IsNum() || !iw->IsNum() ||
-        !ih->IsNum()) {
-        fprintf(stderr,
-                "ParseSogFile: camera.intrinsics is missing fx/fy/width/height "
-                "— ignoring the camera block\n");
-        return true;
-    }
-
     GsSceneCamera c;
     c.convention = convention;
-    c.fx = (float)fx->num;
-    c.fy = (float)fy->num;
-    c.width  = (int)iw->num;
-    c.height = (int)ih->num;
-    // A centred principal point is the norm; an absent cx/cy means exactly that.
-    c.cx = (cx && cx->IsNum()) ? (float)cx->num : (float)c.width * 0.5f;
-    c.cy = (cy && cy->IsNum()) ? (float)cy->num : (float)c.height * 0.5f;
-    if (!(c.fx > 0.0f) || !(c.fy > 0.0f) || c.width <= 0 || c.height <= 0) {
-        fprintf(stderr,
-                "ParseSogFile: camera.intrinsics are degenerate "
-                "(fx=%.3f fy=%.3f %dx%d) — ignoring the camera block\n",
-                (double)c.fx, (double)c.fy, c.width, c.height);
-        return true;
+
+    // Intrinsics are OPTIONAL as of v2. They were mandatory only because there
+    // was nothing else to fall back on; the viewer can now recover a frustum
+    // from the cloud's own angular extent (GsEstimateIntrinsics), and it does
+    // that better than it guesses. So a block carrying only `rest` and
+    // `stereo` is a legitimate, useful block: it still says "frame me as the
+    // photograph I am", which is the decision the block exists to record.
+    // Degenerate or half-written intrinsics are dropped to that same path
+    // rather than taking the whole block down with them.
+    const JsonValue* intr = cam->Find("intrinsics");
+    if (intr && intr->kind == JsonValue::Kind::Object) {
+        const JsonValue* fx = intr->Find("fx");
+        const JsonValue* fy = intr->Find("fy");
+        const JsonValue* cx = intr->Find("cx");
+        const JsonValue* cy = intr->Find("cy");
+        const JsonValue* iw = intr->Find("width");
+        const JsonValue* ih = intr->Find("height");
+        if (fx && fy && iw && ih && fx->IsNum() && fy->IsNum() && iw->IsNum() && ih->IsNum()) {
+            const float pfx = (float)fx->num, pfy = (float)fy->num;
+            const int   pw  = (int)iw->num,   ph  = (int)ih->num;
+            if (pfx > 0.0f && pfy > 0.0f && pw > 0 && ph > 0) {
+                c.fx = pfx; c.fy = pfy; c.width = pw; c.height = ph;
+                // A centred principal point is the norm; an absent cx/cy means
+                // exactly that.
+                c.cx = (cx && cx->IsNum()) ? (float)cx->num : (float)pw * 0.5f;
+                c.cy = (cy && cy->IsNum()) ? (float)cy->num : (float)ph * 0.5f;
+            } else {
+                fprintf(stderr, "ParseSogFile: camera.intrinsics are degenerate "
+                                "(fx=%.3f fy=%.3f %dx%d) — recovering them from the cloud\n",
+                        (double)pfx, (double)pfy, pw, ph);
+            }
+        } else {
+            fprintf(stderr, "ParseSogFile: camera.intrinsics is missing fx/fy/width/height "
+                            "— recovering them from the cloud\n");
+        }
+    } else if (intr) {
+        fprintf(stderr, "ParseSogFile: camera.intrinsics is not an object "
+                        "— recovering them from the cloud\n");
     }
 
     if (const JsonValue* rest = cam->Find("rest")) {
@@ -618,11 +624,17 @@ bool ReadCameraBlock(const JsonValue& meta, GsSceneCamera& out) {
 
     c.present = true;
     out = c;
-    printf("ParseSogFile: camera block: convention=%s fx=%.3f fy=%.3f cx=%.1f cy=%.1f "
-           "%dx%d baseline=%s\n",
-           c.convention.c_str(), (double)c.fx, (double)c.fy, (double)c.cx, (double)c.cy,
-           c.width, c.height,
-           c.hasStereo ? (std::to_string(c.baselineM) + " m").c_str() : "(none)");
+    if (c.fx > 0.0f) {
+        printf("ParseSogFile: camera block: convention=%s fx=%.3f fy=%.3f cx=%.1f cy=%.1f "
+               "%dx%d baseline=%s\n",
+               c.convention.c_str(), (double)c.fx, (double)c.fy, (double)c.cx, (double)c.cy,
+               c.width, c.height,
+               c.hasStereo ? (std::to_string(c.baselineM) + " m").c_str() : "(none)");
+    } else {
+        printf("ParseSogFile: camera block: convention=%s intrinsics=(none, will be "
+               "recovered from the cloud) baseline=%s\n", c.convention.c_str(),
+               c.hasStereo ? (std::to_string(c.baselineM) + " m").c_str() : "(none)");
+    }
     if (c.hasRigHint || c.hasFocus || c.hasDxrIpd || c.hasDxrParallax) {
         printf("ParseSogFile: camera v2: rig=%s focus=%s%s dxr.ipd=%s dxr.parallax=%s\n",
                c.hasRigHint ? (c.rigHint == GsRigKind::Camera ? "camera" : "display") : "(unset)",
