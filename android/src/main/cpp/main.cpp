@@ -1061,8 +1061,12 @@ load_butterfly(struct android_app *app)
 		if (GsSelectRigKind(cam, g_rig_flags) == GsRigKind::Camera) {
 			float bounds_depth = 0.0f;
 			float bc[3], be[3];
-			if (g_gs.getMainObjectBounds(64u, bc, be) && -bc[2] > 0.0f) {
-				bounds_depth = -bc[2];
+			// Only the main object's forward depth is wanted here, as a
+			// coarse focus fallback; the fit bounds were measured at load
+			// by the shared module (gs_scene_fit.h).
+			const GsFitBounds &fb = g_gs.fitBounds();
+			if (fb.valid && -fb.center[2] > 0.0f) {
+				bounds_depth = -fb.center[2];
 			}
 			// The v2 waterfall takes everything the cloud says in one
 			// struct, measured at load: the vertices are long gone by now.

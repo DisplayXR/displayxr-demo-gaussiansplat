@@ -61,6 +61,7 @@
 #include "gs_renderer_select.h"   // GsActiveRenderer = graphics on Apple Silicon (default)
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"       // GsCameraRig / GsRigFlags — the photo-lifted rig
+#include "gs_scene_fit.h"        // the shared, depth-aware display-rig fit
 #include "launch_args.h"         // dxr::ParseLaunchArgs — the shared --key=value grammar
 #include "atlas_capture.h"
 #include "auto_fit.h"             // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
@@ -434,6 +435,13 @@ struct AppXrSession;
 static void UpdateTopBarButtonTitles(AppXrSession& xr);
 static void ApplyAutoFitForLoadedScene();
 static void ApplyRigForLoadedScene();
+// Defined with the fit, below; RefitForViewport runs the same three modes and
+// is declared earlier in the file.
+static const GsFitBounds& ActiveFitBounds();
+static GsFitFrameResult RunFit(const GsFitBounds& bounds,
+                               float viewportW, float viewportH,
+                               float yaw, float pitch);
+static const char* FitModeName();
 
 // ============================================================================
 // Input timestamp helper
@@ -2161,7 +2169,11 @@ static void RefitForViewport(float dtSeconds) {
     const bool fromCanvas = GetAutoFitViewport(vpW, vpH);
     const float aspect = (vpH > 0.0f) ? (vpW / vpH) : 0.0f;
     if (dxr::AutoFitAspectChanged(g_fitAspect, aspect)) {
-        const float vh = dxr::AutoFitVHeight(g_fitExtentW, g_fitExtentH, vpW, vpH, kAutoFitFill);
+        // Re-run the WHOLE fit against the cached bounds, not a width/height
+        // rule against cached extents: the depth term reads all three axes and
+        // the pose, so re-deriving flat here would drop it on every resize.
+        const GsFitFrameResult fr = RunFit(ActiveFitBounds(), vpW, vpH, g_input.yaw, g_input.pitch);
+        const float vh = fr.valid ? fr.vHeight : 0.0f;
         if (vh > 1e-3f) {
             // Retarget rather than restart: a resize that settles in two steps
             // must not snap back to where it started.
@@ -2169,11 +2181,15 @@ static void RefitForViewport(float dtSeconds) {
             const float prev = g_fitVHeight;
             g_fitAspect = aspect;
             g_fitVHeight = vh;  // Space-reset target follows the live viewport
-            LOG_INFO("Auto-fit refit: viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s "
-                     "base %.3f -> %.3f (zoom preserved)",
-                     vpW, vpH, fromCanvas ? "runtime canvas, m" : "view bounds, pt", aspect,
-                     (aspect > 0.0f && g_fitExtentW / aspect > g_fitExtentH) ? "width" : "height",
-                     prev, vh);
+            g_fitExtentW = fr.screenW;
+            g_fitExtentH = fr.screenH;
+            LOG_INFO("Fit refit: mode=%s viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s "
+                     "base %.3f -> %.3f (flat %.3f, depth asks %.3f, budgetOK=%s; "
+                     "zoom preserved)",
+                     FitModeName(), vpW, vpH,
+                     fromCanvas ? "runtime canvas, m" : "view bounds, pt", aspect,
+                     fr.boundBy, prev, vh, fr.vHeightFlat, fr.vHeightDepth,
+                     fr.depthBudgetSatisfied ? "yes" : "NO");
         }
     }
     float animated = 0.0f;
@@ -2187,51 +2203,104 @@ static void RefitForViewport(float dtSeconds) {
 // kept identity (forward = world −Z): splats have no canonical front, and
 // any heuristic (PCA, etc.) can pick the wrong side; the user can rotate
 // with mouse drag from a predictable starting pose.
+// The bounds the current --fit mode frames, and the comfort model it frames
+// them with. Both legs cache two candidate bounds at load; this picks.
+static const GsFitBounds& ActiveFitBounds() {
+    return (g_rigFlags.fitMode == GsFitMode::Legacy) ? g_gsRenderer.fitBoundsLegacy()
+                                                     : g_gsRenderer.fitBounds();
+}
+
+static GsFitComfort ActiveFitComfort() {
+    GsFitComfort c;
+    if (g_rigFlags.hasFitDisparity) c.maxDisparityVH = g_rigFlags.fitDisparityVH;
+    return c;
+}
+
+//! Run the display-rig fit for a viewport, in whichever mode is selected.
+//!
+//! `legacy` and `flood` differ only in WHICH bounds they frame — both use the
+//! old flat x/y rule, which is `dxr::AutoFitVHeight` and is reproduced here by
+//! taking GsFitFrameEx's own flat term (the module guarantees the two agree to
+//! the bit at yaw = pitch = 0, and away from rest the flat term is the
+//! pose-projected one, which is strictly better and is what a refit-on-orbit
+//! would want anyway). `depth` additionally lets the disparity budget bound it.
+static GsFitFrameResult RunFit(const GsFitBounds& bounds,
+                               float viewportW, float viewportH,
+                               float yaw, float pitch) {
+    GsFitFrameResult r = GsFitFrameEx(bounds, viewportW, viewportH, kAutoFitFill,
+                                      yaw, pitch, ActiveFitComfort());
+    if (g_rigFlags.fitMode != GsFitMode::Depth && r.valid) {
+        r.vHeight = r.vHeightFlat;
+        r.boundBy = (r.screenH > 0.0f && viewportH > 0.0f &&
+                     (r.screenW * viewportH / viewportW) > r.screenH) ? "width" : "height";
+        r.depthBudgetSatisfied = true;
+    }
+    return r;
+}
+
+static const char* FitModeName() {
+    switch (g_rigFlags.fitMode) {
+        case GsFitMode::Legacy: return "legacy";
+        case GsFitMode::Flood:  return "flood";
+        default:                return "depth";
+    }
+}
+
+static const char* FitSourceName(GsBoundsSource s) {
+    switch (s) {
+        case GsBoundsSource::FloodFillObject: return "flood/object";
+        case GsBoundsSource::FloodFillScene:  return "flood/scene";
+        case GsBoundsSource::Percentile:      return "percentile";
+        default:                              return "none";
+    }
+}
+
 static void ApplyAutoFitForLoadedScene() {
-    float center[3], extent[3];
-    // Voxel-density flood-fill from the peak voxel: locates the main object
-    // by spatial connectivity (figure is a contiguous 3D blob, walls/floor
-    // are separated by air gaps that the flood-fill can't cross). 64³ grid.
-    if (g_gsRenderer.getMainObjectBounds(64u, center, extent)) {
-        g_fitCenter[0] = center[0];
-        g_fitCenter[1] = center[1];
-        g_fitCenter[2] = center[2];
-        // Shared width-aware rule (displayxr-common common/auto_fit.h):
-        // vHeight = max(H, W / aspect) / fill — the scene caps at `fill` of
-        // the viewport in BOTH axes, so a wide scene no longer overflows
-        // horizontally. See kAutoFitFill for why fill is 0.88, not 0.80.
+    // The bounds were measured at LOAD, by the shared module, on the same
+    // post-cull point set on every platform — see the note in the renderers.
+    // This is the change that makes butterfly.spz frame identically on a Mac,
+    // a tablet and a Windows box; they used to disagree by 47%.
+    const GsFitBounds& bounds = ActiveFitBounds();
+    if (bounds.valid) {
+        g_fitCenter[0] = bounds.center[0];
+        g_fitCenter[1] = bounds.center[1];
+        g_fitCenter[2] = bounds.center[2];
+
         float viewportW = 0.0f, viewportH = 0.0f;
         const bool fromCanvas = GetAutoFitViewport(viewportW, viewportH);
-        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, kAutoFitFill);
+        // Fit at the pose the viewer will actually be at. At load that is
+        // yaw = pitch = 0 and the depth term reduces to the world axes, but
+        // passing the pose rather than assuming it is what makes a
+        // refit-on-orbit possible later.
+        g_fitYaw = 0.0f;
+        const GsFitFrameResult fr = RunFit(bounds, viewportW, viewportH, g_fitYaw, 0.0f);
+
+        float vh = fr.valid ? fr.vHeight : 0.0f;
         if (!(vh > 1e-3f)) vh = kDefaultVirtualDisplayHeightM; // degenerate scene
         g_fitVHeight = vh;
-        // Cache the CONTENT half of the fit and the viewport this base was
-        // derived for, so RefitForViewport can re-derive on an aspect change
-        // without re-measuring the splats. A load lands the base immediately —
-        // the framing IS the load's result, so there is nothing to animate.
-        g_fitExtentW = extent[0];
-        g_fitExtentH = extent[1];
+        // The BOUNDS are what the refit re-derives from, not a pair of
+        // extents: the depth term needs all three axes and the pose, so
+        // caching only width/height would silently drop it on every resize.
+        g_fitExtentW = fr.screenW;
+        g_fitExtentH = fr.screenH;
         g_fitAspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
         g_fitTransition.start(vh, vh, 0.0f);
-
-        // EXPERIMENT: yaw scan disabled to test if RUB load convention now
-        // gives a natural yaw=0 facing (matching SuperSplat's default).
-        // float viewerOffset[3] = {0.0f, 0.1f, 0.6f};
-        // g_fitYaw = g_gsRenderer.findBestYaw(g_fitCenter, viewerOffset, 8);
-        g_fitYaw = 0.0f;
-
         g_fitValid = true;
-        const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
-        const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s fill=%.2f vHeight=%.3f yaw=%.0fdeg",
-                 center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2],
+
+        LOG_INFO("Fit: mode=%s bounds=%s center=(%.3f, %.3f, %.3f) "
+                 "screen=(%.3f, %.3f) depth=%.3f viewport=%.3fx%.3f (%s) "
+                 "bound=%s vHeight=%.3f (flat %.3f, depth asks %.3f) "
+                 "shift=%.3f budgetOK=%s",
+                 FitModeName(), FitSourceName(bounds.source),
+                 bounds.center[0], bounds.center[1], bounds.center[2],
+                 fr.screenW, fr.screenH, fr.screenD,
                  viewportW, viewportH, fromCanvas ? "runtime canvas, m" : "view bounds, pt",
-                 aspect, widthBound ? "width" : "height",
-                 kAutoFitFill, vh, g_fitYaw * 57.2957795f);
+                 fr.boundBy, vh, fr.vHeightFlat, fr.vHeightDepth,
+                 fr.pivotDepthShift, fr.depthBudgetSatisfied ? "yes" : "NO");
     } else {
         g_fitValid = false;
+        LOG_WARN("Fit: mode=%s found no bounds to frame — falling back to vHeight %.3f",
+                 FitModeName(), kDefaultVirtualDisplayHeightM);
     }
 
     g_input.cameraPosX = g_fitValid ? g_fitCenter[0] : 0.0f;
@@ -2266,10 +2335,13 @@ static void ApplyRigForLoadedScene() {
 
     // Coarse fallback focus for a --rig=camera override on a scene that carries
     // no camera: the forward depth of the main object's centre.
+    // Only the main object's forward depth is wanted here, as a coarse focus
+    // fallback for a --rig=camera override on a scene that declares none.
     float boundsDepth = 0.0f;
-    float c[3], e[3];
-    const bool haveBounds = g_gsRenderer.getMainObjectBounds(64u, c, e);
-    if (haveBounds && -c[2] > 0.0f) boundsDepth = -c[2];
+    {
+        const GsFitBounds& fb = g_gsRenderer.fitBounds();
+        if (fb.valid && -fb.center[2] > 0.0f) boundsDepth = -fb.center[2];
+    }
 
     if (kind == GsRigKind::Camera) {
         GsRigResolveInput in;

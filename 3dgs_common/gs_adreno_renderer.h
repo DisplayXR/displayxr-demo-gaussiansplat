@@ -36,7 +36,8 @@
 #pragma once
 
 #include "gs_scene_loader.h"
-#include "gs_camera_rig.h"  // GsSceneMeasurements  // GsVertex, GsSceneCamera
+#include "gs_camera_rig.h"  // GsSceneMeasurements
+#include "gs_scene_fit.h"   // GsFitBounds  // GsVertex, GsSceneCamera
 
 #include <vulkan/vulkan.h>
 #include <string>
@@ -77,6 +78,16 @@ struct GsAdrenoRenderer {
     //! What the current cloud says about itself — recovered intrinsics and
     //! median-disparity depth — measured before decimation. Feeds the camera
     //! rig's waterfall; `valid == false` when nothing could be measured.
+    //! Where the DISPLAY rig should centre, and how big the subject is, from
+    //! the shared scene-fit module. Measured once at load (see the note at
+    //! the call site); `valid == false` when there was nothing to measure.
+    const GsFitBounds& fitBounds() const { return fitBounds_; }
+
+    //! The same, computed the way THIS leg historically did it — the
+    //! `--fit=legacy` A/B. Equal to fitBounds() on the compute leg; the
+    //! [5%, 95%] percentile box on the graphics leg.
+    const GsFitBounds& fitBoundsLegacy() const { return fitBoundsLegacy_; }
+
     const GsSceneMeasurements& sceneMeasurements() const { return sceneMeasurements_; }
 
     //! Median-disparity depth in metres, 0 when unknown. Shorthand for the
@@ -95,18 +106,6 @@ struct GsAdrenoRenderer {
     bool getRobustSceneBounds(float loPct, float hiPct,
                               float outCenter[3], float outExtent[3]) const;
 
-    // Drop-in parity with GsRenderer for the shared desktop demo harness
-    // (windows/macos main). The graphics renderer keeps only CPU splat centers
-    // (posX/Y/Z_), so these are honest but simpler than GsRenderer's
-    // opacity-weighted versions:
-    //  - getMainObjectBounds delegates to the robust [5%,95%] percentile bounds
-    //    (no voxel flood-fill); gridSize is ignored.
-    //  - pickGaussian does a nearest-center ray test over the cached centers,
-    //    gated by a scene-relative hit radius (clean misses return false, so a
-    //    double-tap on empty space doesn't latch onto a far floater), and
-    //    honouring the same [clipNear,clipFar] view-depth window as renderEye.
-    bool getMainObjectBounds(uint32_t gridSize,
-                             float outCenter[3], float outExtent[3]) const;
     bool pickGaussian(const float rayOrigin[3], const float rayDir[3],
                       float hitPos[3], float maxDistance = 100.0f,
                       const float viewMatrix[16] = nullptr,
@@ -182,6 +181,8 @@ private:
     std::string lastLoadError_;
     GsSceneCamera sceneCamera_;
     GsSceneMeasurements sceneMeasurements_;
+    GsFitBounds fitBounds_;
+    GsFitBounds fitBoundsLegacy_;
     uint32_t numGaussians_ = 0;
 
     // Internal render scale (1.0 = full res). Default 0.6 on Android — the

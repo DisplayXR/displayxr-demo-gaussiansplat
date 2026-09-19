@@ -27,7 +27,8 @@
 #include "xr_session.h"
 #include "gs_renderer_select.h"   // GsActiveRenderer = compute (x64) or graphics (_M_ARM64)
 #include "gs_scene_loader.h"
-#include "gs_camera_rig.h"  // GsCameraRig / GsRigFlags — the photo-lifted rig
+#include "gs_camera_rig.h"
+#include "gs_scene_fit.h"  // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "display3d_view.h"
 #include "view_rig_math.h"
 #include "clip_policy.h"   // dxr::ResolveClipPlanes / ChainRearDepthBudget / RearDepthBudgetStateName (#100)
@@ -488,16 +489,66 @@ static void CacheSceneAabbForContentRoi_locked() {
 //
 // The DISPLAY-rig half of the framing: ApplyRigForLoadedScene_locked below is
 // what every load path actually calls.
+// The bounds the current --fit mode frames, and the comfort model it frames
+// them with. Both legs cache two candidate bounds at load; this picks.
+static const GsFitBounds& ActiveFitBounds() {
+    return (g_rigFlags.fitMode == GsFitMode::Legacy) ? g_gsRenderer.fitBoundsLegacy()
+                                                     : g_gsRenderer.fitBounds();
+}
+
+static GsFitComfort ActiveFitComfort() {
+    GsFitComfort c;
+    if (g_rigFlags.hasFitDisparity) c.maxDisparityVH = g_rigFlags.fitDisparityVH;
+    return c;
+}
+
+//! Run the display-rig fit for a viewport, in whichever mode is selected.
+//! `legacy`/`flood` differ only in WHICH bounds they frame — both keep the old
+//! flat x/y rule; `depth` additionally lets the disparity budget bound it.
+static GsFitFrameResult RunFit(const GsFitBounds& bounds,
+                               float viewportW, float viewportH,
+                               float yaw, float pitch) {
+    GsFitFrameResult r = GsFitFrameEx(bounds, viewportW, viewportH, AutoFitFill(),
+                                      yaw, pitch, ActiveFitComfort());
+    if (g_rigFlags.fitMode != GsFitMode::Depth && r.valid) {
+        r.vHeight = r.vHeightFlat;
+        r.boundBy = (r.screenH > 0.0f && viewportH > 0.0f &&
+                     (r.screenW * viewportH / viewportW) > r.screenH) ? "width" : "height";
+        r.depthBudgetSatisfied = true;
+    }
+    return r;
+}
+
+static const char* FitModeName() {
+    switch (g_rigFlags.fitMode) {
+        case GsFitMode::Legacy: return "legacy";
+        case GsFitMode::Flood:  return "flood";
+        default:                return "depth";
+    }
+}
+
+static const char* FitSourceName(GsBoundsSource s) {
+    switch (s) {
+        case GsBoundsSource::FloodFillObject: return "flood/object";
+        case GsBoundsSource::FloodFillScene:  return "flood/scene";
+        case GsBoundsSource::Percentile:      return "percentile";
+        default:                              return "none";
+    }
+}
+
 static void ApplyAutoFitForLoadedScene_locked() {
     CacheSceneAabbForContentRoi_locked();
 
-    float center[3], extent[3];
-    // Voxel-density flood-fill — see the macOS demo for rationale.
-    bool ok = g_gsRenderer.getMainObjectBounds(64u, center, extent);
+    // Measured at LOAD by the shared module, on the same post-cull point set
+    // on every platform — the change that makes this arm and the macOS/Android
+    // one frame a scene the same way. They used to disagree by 47%.
+    const GsFitBounds& bounds = ActiveFitBounds();
+    const bool ok = bounds.valid;
+    GsFitFrameResult fr;
     if (ok) {
-        g_fitCenter[0] = center[0];
-        g_fitCenter[1] = center[1];
-        g_fitCenter[2] = center[2];
+        g_fitCenter[0] = bounds.center[0];
+        g_fitCenter[1] = bounds.center[1];
+        g_fitCenter[2] = bounds.center[2];
         // Shared width-aware rule (displayxr-common common/auto_fit.h):
         // vHeight = max(H, W / aspect) / fill — the scene caps at `fill` of
         // the viewport in BOTH axes, so a wide scene no longer overflows
@@ -505,7 +556,11 @@ static void ApplyAutoFitForLoadedScene_locked() {
         float viewportW = 0.0f, viewportH = 0.0f;
         const bool fromCanvas = GetAutoFitViewport(viewportW, viewportH);
         const float fill = AutoFitFill();
-        float vh = dxr::AutoFitVHeight(extent[0], extent[1], viewportW, viewportH, fill);
+        // Fit at the pose the viewer will be at. At load that is yaw = 0 and
+        // the depth term reduces to the world axes; passing the pose rather
+        // than assuming it is what makes a refit-on-orbit possible later.
+        fr = RunFit(bounds, viewportW, viewportH, 0.0f, 0.0f);
+        float vh = fr.valid ? fr.vHeight : 0.0f;
         // Degenerate scene (all splats in a thin slice) — fall back to a
         // sensible vHeight rather than failing the fit. Mirrors macOS:1399.
         if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
@@ -524,8 +579,8 @@ static void ApplyAutoFitForLoadedScene_locked() {
         // Cache the CONTENT half of the fit (extents are scene properties) and
         // the viewport this base was derived for, so RefitForViewport can
         // re-derive on an aspect change without re-measuring the splats.
-        g_fitExtentW.store(extent[0], std::memory_order_relaxed);
-        g_fitExtentH.store(extent[1], std::memory_order_relaxed);
+        g_fitExtentW.store(fr.screenW, std::memory_order_relaxed);
+        g_fitExtentH.store(fr.screenH, std::memory_order_relaxed);
         g_fitAspect.store((viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f,
                           std::memory_order_relaxed);
         // A load lands the base immediately — the framing IS the load's result,
@@ -548,16 +603,21 @@ static void ApplyAutoFitForLoadedScene_locked() {
         g_fitPitch = 0.0f;
         g_fitZoom = 1.0f;
         ApplyLaunchPoseToFit();
-        const float aspect = (viewportH > 0.0f) ? (viewportW / viewportH) : 0.0f;
-        const bool widthBound = (aspect > 0.0f) && (extent[0] / aspect > extent[1]);
-        LOG_INFO("Auto-fit: center=(%.3f, %.3f, %.3f) extent=(%.3f, %.3f, %.3f) "
-                 "viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s fill=%.2f%s vHeight=%.3f yaw=%.0fdeg",
-                 center[0], center[1], center[2],
-                 extent[0], extent[1], extent[2],
+        LOG_INFO("Fit: mode=%s bounds=%s center=(%.3f, %.3f, %.3f) "
+                 "screen=(%.3f, %.3f) depth=%.3f viewport=%.3fx%.3f (%s) "
+                 "bound=%s fill=%.2f%s vHeight=%.3f (flat %.3f, depth asks %.3f) "
+                 "shift=%.3f budgetOK=%s yaw=%.0fdeg",
+                 FitModeName(), FitSourceName(bounds.source),
+                 bounds.center[0], bounds.center[1], bounds.center[2],
+                 fr.screenW, fr.screenH, fr.screenD,
                  viewportW, viewportH, fromCanvas ? "runtime canvas, m" : "client rect, px",
-                 aspect, widthBound ? "width" : "height",
-                 fill, g_marginPinned.load(std::memory_order_relaxed) ? " (--margin)" : "",
-                 vh, g_fitYaw * 57.2957795f);
+                 fr.boundBy, fill,
+                 g_marginPinned.load(std::memory_order_relaxed) ? " (--margin)" : "",
+                 vh, fr.vHeightFlat, fr.vHeightDepth, fr.pivotDepthShift,
+                 fr.depthBudgetSatisfied ? "yes" : "NO", g_fitYaw * 57.2957795f);
+    } else {
+        LOG_WARN("Fit: mode=%s found no bounds to frame — falling back to vHeight %.3f",
+                 FitModeName(), kFallbackVirtualDisplayHeightM);
     }
     g_fitValid.store(ok);
 
@@ -607,8 +667,13 @@ static void ApplyRigForLoadedScene_locked() {
         // Coarse fallback pivot for a --rig=camera override on a scene that
         // carries no camera: the forward depth of the main object's centre.
         float boundsDepth = 0.0f;
-        float c[3], e[3];
-        if (g_gsRenderer.getMainObjectBounds(64u, c, e) && -c[2] > 0.0f) boundsDepth = -c[2];
+        // Only the main object's forward depth is wanted here, as a coarse
+        // focus fallback; the fit bounds were measured at load by the shared
+        // module (gs_scene_fit.h).
+        {
+            const GsFitBounds& fb = g_gsRenderer.fitBounds();
+            if (fb.valid && -fb.center[2] > 0.0f) boundsDepth = -fb.center[2];
+        }
 
         // The v2 waterfall takes everything the cloud says in one struct,
         // measured at load: the vertices are long gone by now.
@@ -690,9 +755,12 @@ static void RefitForViewport(float dtSeconds) {
     if (g_vhPinned.load(std::memory_order_relaxed)) {
         return;
     }
+    // These are now the POSE-PROJECTED on-screen extents the last fit
+    // produced, kept only as a "has a fit ever run" guard — the refit
+    // re-derives from the cached bounds, not from them.
     const float extW = g_fitExtentW.load(std::memory_order_relaxed);
     const float extH = g_fitExtentH.load(std::memory_order_relaxed);
-    if (!(extH > 0.0f)) {
+    if (!(extH > 0.0f) || !(extW > 0.0f)) {
         return;
     }
 
@@ -700,7 +768,17 @@ static void RefitForViewport(float dtSeconds) {
     const bool fromCanvas = GetAutoFitViewport(vpW, vpH);
     const float aspect = (vpH > 0.0f) ? (vpW / vpH) : 0.0f;
     if (dxr::AutoFitAspectChanged(g_fitAspect.load(std::memory_order_relaxed), aspect)) {
-        const float vh = dxr::AutoFitVHeight(extW, extH, vpW, vpH, AutoFitFill());
+        // Re-run the WHOLE fit against the cached bounds, not a flat rule
+        // against cached extents: the depth term reads all three axes and the
+        // pose, so re-deriving flat here would drop it on every resize.
+        float refitYaw = 0.0f, refitPitch = 0.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_inputMutex);
+            refitYaw = g_inputState.yaw;
+            refitPitch = g_inputState.pitch;
+        }
+        const GsFitFrameResult fr = RunFit(ActiveFitBounds(), vpW, vpH, refitYaw, refitPitch);
+        const float vh = fr.valid ? fr.vHeight : 0.0f;
         if (vh > 1e-3f) {
             // Retarget rather than restart: a resize that settles in two steps
             // must not snap back to where it started.
@@ -708,11 +786,15 @@ static void RefitForViewport(float dtSeconds) {
             const float prev = g_fitVHeight;
             g_fitAspect.store(aspect, std::memory_order_relaxed);
             g_fitVHeight = vh;  // Space-reset target follows the live viewport
-            LOG_INFO("Auto-fit refit: viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s "
-                     "base %.3f -> %.3f (zoom preserved)",
-                     vpW, vpH, fromCanvas ? "runtime canvas, m" : "client rect, px", aspect,
-                     (aspect > 0.0f && extW / aspect > extH) ? "width" : "height",
-                     prev, vh);
+            g_fitExtentW.store(fr.screenW, std::memory_order_relaxed);
+            g_fitExtentH.store(fr.screenH, std::memory_order_relaxed);
+            LOG_INFO("Fit refit: mode=%s viewport=%.3fx%.3f (%s) aspect=%.3f bound=%s "
+                     "base %.3f -> %.3f (flat %.3f, depth asks %.3f, budgetOK=%s; "
+                     "zoom preserved)",
+                     FitModeName(), vpW, vpH,
+                     fromCanvas ? "runtime canvas, m" : "client rect, px", aspect,
+                     fr.boundBy, prev, vh, fr.vHeightFlat, fr.vHeightDepth,
+                     fr.depthBudgetSatisfied ? "yes" : "NO");
         }
     }
 
