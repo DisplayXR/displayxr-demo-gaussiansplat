@@ -119,6 +119,26 @@ first (`KAWS FAMILY.spz` throws ~3 % of its splats out to ±240 while the model
 spans ±15). If the fill finds nothing, a [p5, p95] box is the documented
 fallback.
 
+The fill runs at a ladder of thresholds and has to decide which rung is the
+subject. It stops on **mass**: the tightest blob that already holds a third of
+the scene's opacity-weighted total, plus a knee guard that refuses a step
+growing the blob's largest extent by more than 1.6×, which is the fill leaking
+out of the object into whatever it is standing in.
+
+That question is *scale-free*, and it has to be. The rule this replaced asked
+what fraction of the **grid** a blob covered — so on a small statue in a big
+museum room, where the grid spans 14.6 × 6.2 × 13.2 m, every rung that isolated
+the statue covered under 0.2 % of the grid, all of them were rejected, and the
+fallback returned the room. `DXR_FIT_LADDER=1` prints every rung with its mass
+fraction and extent:
+
+```
+t=0.20   58 vox  21.2% mass  1.37 x 1.07 x 1.24
+t=0.10  110 vox  29.9%       1.59 x 1.46 x 1.44
+t=0.07  178 vox  35.9%       1.82 x 1.95 x 1.44   <- the statue, accepted
+t=0.005                      9.78 x 3.90 x 7.63   <- the room
+```
+
 **This used to be implemented twice, differently**, and the two renderer legs
 are chosen at compile time — so the same asset framed one way on Windows and
 another on a Mac, a tablet or a Windows-on-ARM box. On `butterfly.spz` they
@@ -127,26 +147,28 @@ one implementation, `3dgs_common/gs_scene_fit.{h,cpp}`, and every platform gets
 the flood-fill answer. **Windows does not move; macOS and Android move to the
 Windows framing.**
 
-**How big** is the old width-aware rule — the subject caps at `fill` of the
-viewport on both axes — plus a **depth budget**. The fit centre is the ZDP, so
-content `d` off that plane is disparity on the panel; capping that disparity
-bounds how deep a scene may be before it has to be pushed back. The model is
-scale-free (everything is a ratio of the display height), so doubling a scene
-does not change how it is framed. Over budget **grows `vHeight`; it never moves
-the pivot**, because the pivot is the orbit centre and the convergence and those
-three stay one point.
+**How big** is the width-aware rule — the subject caps at `fill` of the
+viewport on both axes. `butterfly.spz` lands at 1.979 vH in landscape,
+`KAWS FAMILY.spz` at 2.354 (its statue is 1.95 m, so it fills 83 % of the
+display height).
 
-On `KAWS FAMILY.spz` the cluster is nearly as deep (3.725) as it is wide
-(3.880): the flat rule framed it at 2.796 with its far end well behind the
-screen, and the budget pulls it back to **7.449**. On `butterfly.spz` — a
-shallow object — the depth term asks for 0.891 and never binds.
+There is also a **depth budget**, which is **off by default**. The fit centre is
+the ZDP, so content `d` off that plane is disparity on the panel; capping that
+disparity bounds how deep a scene may be before it has to be pushed back. The
+model is scale-free, and over budget it **grows `vHeight`; it never moves the
+pivot**, because the pivot is the orbit centre and the convergence and those
+three stay one point. It is opt-in (`--fit=depth`) until the comfort cap has
+been judged on real 3D hardware — shipping it on would make every deep scene
+frame smaller for a reason nobody has verified yet. The `Fit:` line prints what
+it *would* ask for regardless, so the number stays visible while it is not
+acting.
 
 | flag | |
 |---|---|
-| `--fit=depth` | default: shared bounds + the disparity budget |
-| `--fit=flood` | shared bounds, old flat x/y rule (KAWS 2.796) |
+| `--fit=flood` | **default**: shared bounds, width-aware rule (KAWS 2.354) |
+| `--fit=depth` | additionally let the disparity budget bound it (KAWS 3.173) |
 | `--fit=legacy` | **this platform's old framing**, for regression checks — the graphics leg's raw [p5, p95], the compute leg's flood-fill |
-| `--fit-disparity=<vH>` | the budget ceiling as a fraction of the display height, default `0.03`. The one knob that moves a depth-bound fit: `0.06` takes KAWS from 7.449 to 4.190. |
+| `--fit-disparity=<vH>` | the budget ceiling as a fraction of the display height, default `0.03`. The one knob that moves a depth-bound fit: `0.06` halves what it asks for. Only bites under `--fit=depth`. |
 
 The fit does not run at all on the camera rig — a photograph is framed by its
 own camera, and a flood-fill over an open scene finds no subject to frame
@@ -302,7 +324,7 @@ not carry a `camera` block — and they override it when it does.
 | `--focus-weight=centre` | Take the median-disparity focus from the middle of the frame only. Right for a portrait, wrong for a landscape, so it is off by default. |
 | `--mode=<index>` | Initial rendering mode — `0` is the runtime's 2D passthrough, `1` the first 3D mode. Makes a rest view reproducible from a script. |
 | `--window=WxH` | Open the window at this size in points. The camera rig derives its horizontal FOV from the canvas aspect, so this is a real input to the framing — it is how a portrait asset gets checked. |
-| `--fit=legacy\|flood\|depth` | Display-rig fit mode, default `depth`. See [the fit](#the-display-rig-fit). |
+| `--fit=legacy\|flood\|depth` | Display-rig fit mode, default `flood`. See [the fit](#the-display-rig-fit). |
 | `--fit-disparity=<vH>` | Depth-budget ceiling as a fraction of the display height, default `0.03`. |
 
 Framing the DisplayXR Gallery's `ports` scene through its own camera:
