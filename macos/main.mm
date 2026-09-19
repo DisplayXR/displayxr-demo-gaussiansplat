@@ -2576,11 +2576,17 @@ int main(int argc, char** argv) {
         }
     }
 
-    // `--mode=` wins over the env var: it is the explicit, per-launch request,
-    // and it is what makes a rest view reproducible from a script (mode 0 is
-    // the 2D passthrough, so a capture of it is one view rather than a
-    // composite the display processor has already mixed).
+    // `--mode=` wins over the env var, and — like it — over ADOPTION: it is the
+    // most explicit statement of intent there is, and it is what makes a rest
+    // view reproducible from a script (mode 0 is the 2D passthrough, so a
+    // capture of it is one view rather than a composite the DP has mixed).
+    //
+    // It therefore has to set `envPinnedMode`, not just currentRenderingMode:
+    // that variable is what gates the adoption after session create, so writing
+    // only the mode would let the runtime's active mode quietly overwrite the
+    // flag a few hundred lines later.
     if (g_rigFlags.hasMode) {
+        envPinnedMode = g_rigFlags.mode;
         g_input.currentRenderingMode = (uint32_t)g_rigFlags.mode;
         LOG_INFO("Initial rendering mode from --mode=%d", g_rigFlags.mode);
     }
@@ -2697,8 +2703,9 @@ int main(int argc, char** argv) {
     // changes still arrive via XrEventDataRenderingModeChangedDXR.
     if (envPinnedMode >= 0) {
         if (xr.renderingModeCount > 0 && (uint32_t)envPinnedMode >= xr.renderingModeCount) {
-            LOG_WARN("SIM_DISPLAY_OUTPUT selects mode %d but the display has only %u mode(s) "
+            LOG_WARN("%s selects mode %d but the display has only %u mode(s) "
                      "— falling back to mode 0",
+                     g_rigFlags.hasMode ? "--mode" : "SIM_DISPLAY_OUTPUT",
                      envPinnedMode, xr.renderingModeCount);
             g_input.currentRenderingMode = 0;
         } else {
@@ -2712,7 +2719,8 @@ int main(int argc, char** argv) {
     // mode-switch IPD ramp on frame one.
     g_msLastMode = g_input.currentRenderingMode;
     LOG_INFO("Startup rendering mode: %u (%s)", g_input.currentRenderingMode,
-             envPinnedMode >= 0 ? "SIM_DISPLAY_OUTPUT"
+             g_rigFlags.hasMode ? "--mode"
+                                : envPinnedMode >= 0 ? "SIM_DISPLAY_OUTPUT"
                                 : (xr.activeRenderingMode >= 0 ? "adopted from runtime"
                                                                : "app default"));
     g_input.renderingModeChangeRequested = true;
