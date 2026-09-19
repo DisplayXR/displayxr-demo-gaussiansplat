@@ -1064,9 +1064,13 @@ load_butterfly(struct android_app *app)
 			if (g_gs.getMainObjectBounds(64u, bc, be) && -bc[2] > 0.0f) {
 				bounds_depth = -bc[2];
 			}
+			// The v2 waterfall takes everything the cloud says in one
+			// struct, measured at load: the vertices are long gone by now.
+			GsRigResolveInput rig_in;
+			rig_in.measurements = &g_gs.sceneMeasurements();
+			rig_in.boundsForwardDepthM = bounds_depth;
 			std::string why;
-			if (GsResolveCameraRig(cam, g_rig_flags, g_gs.sceneMedianForwardDepthM(),
-			                       bounds_depth, g_cam_rig, &why)) {
+			if (GsResolveCameraRig(cam, g_rig_flags, rig_in, g_cam_rig, &why)) {
 				g_camera_rig_active = true;
 				g_cam_rig_rest_sampled = false;  // a new scene, a new camera
 				g_spin_angle = 0.0f;             // no turntable on a photo lift
@@ -1074,7 +1078,7 @@ load_butterfly(struct android_app *app)
 				     "baseline=%.4fm pivot=%.3fm (%s)",
 				     g_cam_rig.fx, g_cam_rig.fy, g_cam_rig.cx, g_cam_rig.cy,
 				     g_cam_rig.width, g_cam_rig.height, g_cam_rig.baselineM,
-				     g_cam_rig.pivotM, g_cam_rig.pivotSource.c_str());
+				     g_cam_rig.pivotM, g_cam_rig.focusSource.c_str());
 			} else {
 				LOGW("Camera rig requested but %s — framing with the display rig",
 				     why.c_str());

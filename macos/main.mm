@@ -2667,6 +2667,49 @@ int main(int argc, char** argv) {
                 g_input.captureAtlasRequested = true;
             }
         }
+
+        // DXR_GS_FOCUS_PROBE=<x>,<y>: at frame 240 aim the focus at whatever
+        // splat sits under window point (x, y) — the same pick a double-click
+        // runs — and at frame 420 press Space. A dev aid for the same reason
+        // the capture trigger is one: synthesising a real double-click needs
+        // the accessibility grant the harness does not have, and without it
+        // the focus path cannot be exercised at all. It also gives the arms
+        // that have no mouse a way to run the same check.
+        {
+            static float s_probeXY[2] = {-1.0f, -1.0f};
+            static bool  s_probeRead = false;
+            if (!s_probeRead) {
+                s_probeRead = true;
+                if (const char* e = getenv("DXR_GS_FOCUS_PROBE")) {
+                    float x = 0.0f, y = 0.0f;
+                    if (sscanf(e, "%f,%f", &x, &y) == 2) {
+                        s_probeXY[0] = x; s_probeXY[1] = y;
+                        LOG_INFO("DXR_GS_FOCUS_PROBE=(%.0f, %.0f) — focus at frame 240, "
+                                 "Space at frame 420", x, y);
+                    } else {
+                        LOG_WARN("DXR_GS_FOCUS_PROBE must be <x>,<y>; ignored");
+                    }
+                }
+            }
+            if (s_probeXY[0] >= 0.0f) {
+                if (g_frameCount == 240) {
+                    g_input.teleportMouseX = s_probeXY[0];
+                    g_input.teleportMouseY = s_probeXY[1];
+                    g_input.teleportRequested = true;
+                } else if (g_frameCount == 420) {
+                    g_input.resetViewRequested = true;
+                }
+            }
+        }
+
+        // While the focus is gliding, say where it is — the whole point of the
+        // easing is that it is gradual, and a single before/after pair cannot
+        // show that it did not simply jump.
+        if (g_cameraRigActive && g_camRig.valid && g_focusEasing &&
+            (g_frameCount % 6) == 0) {
+            LOG_INFO("focus easing: pivot %.4f m -> %.4f m", g_camRig.pivotM,
+                     -g_focusTarget[2]);
+        }
         g_avgFrameTime = g_avgFrameTime * 0.95 + deltaTime * 0.05;
 
         // Handle load request (from L key or Open button)

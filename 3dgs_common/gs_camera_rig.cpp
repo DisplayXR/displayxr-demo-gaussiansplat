@@ -409,33 +409,48 @@ bool GsResolveCameraRig(const GsSceneCamera& cam,
         w = cam.width; h = cam.height;
         out.intrinsicsSource = "block";
     }
-    // Flags override the block field by field: --cx alone on a block-bearing
-    // scene is a legitimate correction, not a request to discard the rest.
-    if (flags.hasFx || flags.hasFy || flags.hasSize || flags.hasCx || flags.hasCy) {
-        if (flags.hasSize) { w = flags.width; h = flags.height; }
-        if (flags.hasFx) fx = flags.fx;
-        if (flags.hasFy) fy = flags.fy;
-        if (fx > 0.0f && !(fy > 0.0f)) fy = fx;   // square pixels are the norm
-        if (fy > 0.0f && !(fx > 0.0f)) fx = fy;
-        if (w > 0 && h > 0) {
-            if (!flags.hasCx && !cam.present) cx = 0.5f * (float)w;
-            if (!flags.hasCy && !cam.present) cy = 0.5f * (float)h;
-        }
-        if (flags.hasCx) cx = flags.cx;
-        if (flags.hasCy) cy = flags.cy;
-        if (out.intrinsicsSource.empty()) out.intrinsicsSource = "flags";
-        else if (flags.hasFx || flags.hasFy || flags.hasSize || flags.hasCx || flags.hasCy)
-            out.intrinsicsSource = "block + flags";
-    }
     if ((!(fx > 0.0f) || !(fy > 0.0f) || w <= 0 || h <= 0) && out.estimate.valid) {
         // Nothing declared them, so recover them from the cloud. This is what
-        // lets a bare `.sog` with no block at all be framed as the photograph
-        // it was, instead of auto-fitted like an object.
+        // lets a `.sog` whose block omits intrinsics — or carries none at all —
+        // still be framed as the photograph it is, instead of auto-fitted like
+        // an object.
         fx = out.estimate.fx; fy = out.estimate.fy;
-        cx = out.estimate.cx; cy = out.estimate.cy;
         w = out.estimate.width; h = out.estimate.height;
+        // The SCALE is measured; the PRINCIPAL POINT is centred, and that is a
+        // measurement result, not a shortcut. The estimator's window asymmetry
+        // is real but it is not the lens: a lifted cloud spans the union of
+        // what both cameras saw plus whatever the model extrapolated, so its
+        // angular centre drifts off the optical axis by more than the true
+        // principal-point offset and in an unrelated direction.
+        //
+        // Measured on the harbour asset, grey MAE against the two photographs:
+        //   estimate, asymmetry applied   32.5 / 29.3
+        //   estimate, point centred       23.6 / 23.6
+        //   the block's own intrinsics    23.6 / 23.5
+        // So the asymmetry costs about seven points and centring reproduces
+        // the declared camera to within a tenth of one. The half-tangents, by
+        // contrast, land within 0.2% and are worth trusting. Trust the extent,
+        // centre the point.
+        cx = 0.5f * (float)w;
+        cy = 0.5f * (float)h;
         out.intrinsicsSource = out.estimate.usedFallback
                                    ? "estimated (28mm fallback)" : "estimated";
+    }
+    // Flags outrank both the block and the estimate, and do it field by field:
+    // --cx alone is a legitimate correction to an otherwise good camera, not a
+    // request to discard the rest of it. Applied LAST for that reason.
+    if (flags.hasSize) { w = flags.width; h = flags.height; }
+    if (flags.hasFx) fx = flags.fx;
+    if (flags.hasFy) fy = flags.fy;
+    if (fx > 0.0f && !(fy > 0.0f)) fy = fx;   // square pixels are the norm
+    if (fy > 0.0f && !(fx > 0.0f)) fx = fy;
+    if (flags.hasSize && !flags.hasCx && out.intrinsicsSource.empty()) cx = 0.5f * (float)w;
+    if (flags.hasSize && !flags.hasCy && out.intrinsicsSource.empty()) cy = 0.5f * (float)h;
+    if (flags.hasCx) cx = flags.cx;
+    if (flags.hasCy) cy = flags.cy;
+    if (flags.hasFx || flags.hasFy || flags.hasSize || flags.hasCx || flags.hasCy) {
+        out.intrinsicsSource = out.intrinsicsSource.empty()
+                                   ? "flags" : (out.intrinsicsSource + " + flags");
     }
     if (!(fx > 0.0f) || !(fy > 0.0f) || w <= 0 || h <= 0) {
         if (why)
