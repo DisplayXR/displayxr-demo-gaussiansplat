@@ -167,13 +167,18 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                 if (key == "cx") { out.hasCx = true; out.cx = v; }
                 if (key == "cy") { out.hasCy = true; out.cy = v; }
             }
-        } else if (key == "size") {
+        } else if (key == "size" || key == "window") {
             const size_t x = val.find_first_of("xX");
             int w = 0, h = 0;
+            const bool isWindow = (key == "window");
             if (x == std::string::npos ||
                 !ParseIntStrict(val.substr(0, x), w) ||
                 !ParseIntStrict(val.substr(x + 1), h) || w <= 0 || h <= 0) {
-                Warn(warnings, "--size must be WxH in pixels; ignored");
+                Warn(warnings, "--" + key + " must be WxH; ignored");
+            } else if (isWindow && (w < 64 || h < 64 || w > 16384 || h > 16384)) {
+                Warn(warnings, "--window must be between 64 and 16384 on each side; ignored");
+            } else if (isWindow) {
+                out.hasWindow = true; out.windowW = w; out.windowH = h;
             } else {
                 out.hasSize = true; out.width = w; out.height = h;
             }

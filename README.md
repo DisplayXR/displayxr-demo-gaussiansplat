@@ -255,6 +255,7 @@ not carry a `camera` block — and they override it when it does.
 | `--pivot=<m>` | Focus depth in metres — the plane that stays put under head motion, the orbit centre and the convergence, which are one thing. Default: `camera.focus.point`, else the cloud's median disparity. |
 | `--focus-weight=centre` | Take the median-disparity focus from the middle of the frame only. Right for a portrait, wrong for a landscape, so it is off by default. |
 | `--mode=<index>` | Initial rendering mode — `0` is the runtime's 2D passthrough, `1` the first 3D mode. Makes a rest view reproducible from a script. |
+| `--window=WxH` | Open the window at this size in points. The camera rig derives its horizontal FOV from the canvas aspect, so this is a real input to the framing — it is how a portrait asset gets checked. |
 
 Framing the DisplayXR Gallery's `ports` scene through its own camera:
 

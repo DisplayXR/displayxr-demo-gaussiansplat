@@ -2510,8 +2510,18 @@ int main(int argc, char** argv) {
     AppXrSession xr = {};
     if (!InitializeOpenXR(xr)) { LOG_ERROR("OpenXR init failed"); return 1; }
 
-    // Step 2: Create the macOS window (app-owned) on the 3D panel
+    // Step 2: Create the macOS window (app-owned) on the 3D panel.
+    // --window=WxH picks the size in POINTS, which is how a portrait window
+    // gets tested: the runtime derives the camera rig's horizontal FOV from
+    // the canvas aspect, so the aspect is a real input to the framing and not
+    // just a cosmetic. The auto-fit and its refit path read the resulting
+    // viewport as they always did.
     g_windowW = 1280; g_windowH = 720;
+    if (g_rigFlags.hasWindow) {
+        g_windowW = (uint32_t)g_rigFlags.windowW;
+        g_windowH = (uint32_t)g_rigFlags.windowH;
+        LOG_INFO("Window size from --window=%ux%u points", g_windowW, g_windowH);
+    }
     if (!CreateMacOSWindow(g_windowW, g_windowH, xr.displayScreenLeft, xr.displayScreenTop)) {
         LOG_ERROR("Failed to create macOS window");
         CleanupOpenXR(xr);

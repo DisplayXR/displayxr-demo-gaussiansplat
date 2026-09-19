@@ -153,6 +153,14 @@ struct GsRigFlags {
     //! it is the right answer for a portrait and the wrong one for a
     //! landscape, and only the user knows which they have.
     bool  centreWeightedFocus = false;
+
+    //! `--window=WxH` — the window size to open at, in points. Not a rig
+    //! property either, but the rig's whole job is to conserve a frustum and
+    //! the window's ASPECT is what the runtime derives the horizontal half of
+    //! that frustum from. Being able to ask for a portrait window is what
+    //! makes "does a portrait asset frame correctly" a thing you can check
+    //! rather than assert.
+    bool  hasWindow = false;   int windowW = 0, windowH = 0;
 };
 
 //! Intrinsics recovered from the cloud itself, for a scene that declares none.
@@ -219,6 +227,7 @@ bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
 //!   --mode=<index>    initial rendering mode (0 = 2D passthrough, 1 = first 3D)
 //!   --focus-weight=centre|frame   restrict the median-disparity focus to the
 //!                                 middle of the frame (default: frame)
+//!   --window=WxH      open the window at this size in points
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);
 
