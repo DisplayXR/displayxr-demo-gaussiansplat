@@ -184,6 +184,13 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
             } else {
                 out.hasBaseline = true; out.baselineM = v;
             }
+        } else if (key == "mode") {
+            int v = 0;
+            if (!ParseIntStrict(val, v) || v > 15) {
+                Warn(warnings, "--mode must be a small rendering-mode index; ignored");
+            } else {
+                out.hasMode = true; out.mode = v;
+            }
         } else if (key == "pivot") {
             float v = 0.0f;
             if (!ParseFloatStrict(val, v) || !(v > 0.0f)) {
@@ -310,8 +317,23 @@ float GsCameraRig::ConvergenceDiopters() const {
     return (pivotM > 1.0e-4f) ? (1.0f / pivotM) : 0.0f;
 }
 
-float GsCameraRig::IpdScale() const {
-    return baselineM / kGsNominalHumanIpdM;
+float GsCameraRig::IpdScale(float measuredEyeSeparationM) const {
+    const float base = (measuredEyeSeparationM > 1.0e-4f) ? measuredEyeSeparationM
+                                                          : kGsNominalHumanIpdM;
+    return baselineM / base;
+}
+
+void GsCameraRig::RigPose(bool monoView, float outPosition[3], float outRotation[4]) const {
+    for (int i = 0; i < 4; i++) outRotation[i] = restRotation[i];
+    // Half a baseline along the camera's own +x (its right), so the pair of
+    // views the runtime straddles this pose with lands on the captured pair.
+    // A mono mode has no pair, so it stays on the left camera = the photo.
+    const float half = monoView ? 0.0f : (0.5f * baselineM);
+    float R[16];
+    Mat4FromQuatXyzw(R, restRotation);
+    outPosition[0] = restPosition[0] + R[0] * half;
+    outPosition[1] = restPosition[1] + R[1] * half;
+    outPosition[2] = restPosition[2] + R[2] * half;
 }
 
 void GsCameraRig::PrincipalShiftTan(float& du, float& dv) const {
@@ -337,18 +359,22 @@ void GsCameraRig::SceneOrbitMatrix(float yawRad, float pitchRad, float out[16]) 
     Mat4Multiply(local, rot, fromPivot);
     Mat4Multiply(local, toPivot, local);
 
-    const bool identityRest =
-        restPosition[0] == 0.0f && restPosition[1] == 0.0f && restPosition[2] == 0.0f &&
-        restRotation[0] == 0.0f && restRotation[1] == 0.0f && restRotation[2] == 0.0f &&
-        std::fabs(restRotation[3]) == 1.0f;
-    if (identityRest) {
+    // Conjugate through the RIG pose (the head centre), not `rest`: the pivot
+    // is the point straight ahead of the camera the frustum is built around.
+    float rigPos[3], rigRot[4];
+    RigPose(/*monoView=*/false, rigPos, rigRot);
+    const bool identityRig =
+        rigPos[0] == 0.0f && rigPos[1] == 0.0f && rigPos[2] == 0.0f &&
+        rigRot[0] == 0.0f && rigRot[1] == 0.0f && rigRot[2] == 0.0f &&
+        std::fabs(rigRot[3]) == 1.0f;
+    if (identityRig) {
         std::memcpy(out, local, 16 * sizeof(float));
         return;
     }
     float P[16], Pinv[16], tmp[16];
-    Mat4FromQuatXyzw(P, restRotation);
-    P[12] = restPosition[0]; P[13] = restPosition[1]; P[14] = restPosition[2];
-    Mat4RigidInverse(Pinv, restRotation, restPosition);
+    Mat4FromQuatXyzw(P, rigRot);
+    P[12] = rigPos[0]; P[13] = rigPos[1]; P[14] = rigPos[2];
+    Mat4RigidInverse(Pinv, rigRot, rigPos);
     Mat4Multiply(tmp, local, Pinv);
     Mat4Multiply(out, P, tmp);
 }
