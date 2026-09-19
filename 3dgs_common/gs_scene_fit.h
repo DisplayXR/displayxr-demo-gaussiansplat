@@ -148,6 +148,31 @@ void GsBuildFitPoints(const GsVertex* verts, size_t count,
 //! Margin on the [p2, p98] core, in multiples of half that range.
 constexpr float kGsFitOutlierMargin = 3.0f;
 
+//! Fraction of the scene's opacity-weighted mass a blob must hold before the
+//! threshold ladder stops descending. A third: enough to mean "this is what
+//! the scene is OF", while still excluding the room, which on a museum-sized
+//! capture only arrives with the last few percent of threshold.
+//!
+//! Scale-free on purpose. The rule this replaced asked what fraction of the
+//! GRID a blob covered, which made the answer depend on how big the room
+//! around the subject happened to be — on `KAWS FAMILY.spz` every level that
+//! isolated the statue covered under 0.2 % of the grid and was rejected, and
+//! the fallback returned the museum.
+constexpr float kFitMinMassFrac = 0.34f;
+
+//! How much a blob's largest extent may grow in ONE step down the ladder
+//! before the descent is refused. Past this the fill has leaked out of the
+//! object and into whatever it is standing in — visible as a knee without
+//! knowing any absolute size (3.18 m -> 9.78 m on KAWS, a 3.1x jump).
+constexpr float kFitExtentJump = 1.6f;
+
+//! How much mass the PREVIOUS rung must already hold before the knee guard is
+//! allowed to fire. At the top of the ladder a blob is a handful of voxels and
+//! one extra row more than doubles its extent, so an ungated knee fires on the
+//! very first step — it did, and it framed butterfly.spz at 0.118 vH off five
+//! voxels. A leak is only a leak once there is something to leak OUT of.
+constexpr float kFitKneeMinMassFrac = 0.20f;
+
 //! Minimum splat count for the percentile machinery to mean anything.
 constexpr size_t kGsFitMinPercentileCount = 1024;
 
@@ -180,6 +205,10 @@ struct GsFitBounds {
     size_t totalVoxels  = 0;
     float  fillRatio    = 0.0f;
     float  threshold    = 0.0f;  //!< accepted threshold, x peak density
+    //! Fraction of the scene's opacity-weighted mass the accepted blob holds.
+    //! This is what the ladder now stops on, so it is the number that explains
+    //! a framing — see kFitMinMassFrac.
+    float  massFraction = 0.0f;
 };
 
 //! Locate the main object: opacity-weighted voxel density, flood-fill from the

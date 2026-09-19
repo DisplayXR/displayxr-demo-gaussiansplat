@@ -166,14 +166,19 @@ struct GsRigFlags {
     bool  hasWindow = false;   int windowW = 0, windowH = 0;
 
     //! `--fit=legacy|flood|depth` — which display-rig fit to use. Default
-    //! `depth`. A kill switch, not a preference: `legacy` reproduces the
+    //! `flood`. A kill switch, not a preference: `legacy` reproduces the
     //! framing THIS PLATFORM shipped (which differed between the two renderer
     //! legs by 47% on butterfly.spz — that divergence is the reason the shared
     //! module exists), `flood` is the shared flood-fill with the old flat
     //! x/y rule, and `depth` adds the on-panel disparity budget. Having all
     //! three live means a framing regression can be bisected on a running
     //! viewer instead of argued about.
-    GsFitMode fitMode = GsFitMode::Depth;
+    //! Default `flood`, NOT `depth`: the depth budget's comfort cap has not
+    //! been judged on real 3D hardware yet, and until it has, shipping it as
+    //! the default would make every deep scene frame smaller for a reason
+    //! nobody has verified. The `Fit:` line still prints what the budget WOULD
+    //! ask for, so the number stays visible while it is not acting.
+    GsFitMode fitMode = GsFitMode::Flood;
     bool      hasFitMode = false;
 
     //! `--fit-disparity=<vH>` — the depth budget's ceiling as a fraction of
@@ -248,7 +253,7 @@ bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
 //!   --focus-weight=centre|frame   restrict the median-disparity focus to the
 //!                                 middle of the frame (default: frame)
 //!   --window=WxH      open the window at this size in points
-//!   --fit=legacy|flood|depth      display-rig fit mode (default depth)
+//!   --fit=legacy|flood|depth      display-rig fit mode (default flood)
 //!   --fit-disparity=<vH>          depth budget ceiling (default 0.03)
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);

@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -209,35 +211,124 @@ GsFitBounds GsMainObjectBoundsEx(const GsVertex* verts, size_t count,
         return cnt;
     };
 
-    // 5. Adaptive threshold search. Try thresholds from loose to tight; pick
-    //    the first one whose fill is in the [1 %, 30 %] range. If none fits
-    //    (e.g. tight object scene where everything connects), fall back to
-    //    the loosest-but-still-valid result.
-    const size_t minFill = std::max((size_t)16, totalVoxels / 100);
-    const size_t maxFill = totalVoxels / 3;
-    const float thresholds[] = {0.01f, 0.02f, 0.05f, 0.10f, 0.20f, 0.30f, 0.50f, 0.70f};
+    // 5. Adaptive threshold search — MASS-FRACTION STOP.
+    //
+    //    The old rule accepted the first level whose blob covered [1 %, 30 %]
+    //    of the GRID. That is scale-dependent, and it fails exactly where it
+    //    matters: a small object in a big room. On `KAWS FAMILY.spz` the grid
+    //    spans the whole museum (14.6 x 6.2 x 13.2 m, ~0.2 m cells), so every
+    //    level that isolates the statue covers under 0.2 % of the grid and was
+    //    rejected on sight; the largest-under-maxFill fallback then walked down
+    //    to 0.5 % of peak and returned the ROOM. Measured on the cloud:
+    //
+    //      10 %  ->  111 vox (0.04 % grid), 30 % mass, 1.59 x 1.46 x 1.44
+    //       5 %  ->  223 vox (0.09 %),      38 % mass, 1.82 x 1.95 x 1.65  <- statue
+    //       1 %  ->  449 vox (0.17 %),      44 % mass, 3.18 x 2.05 x 3.30
+    //     0.5 %  -> 1354 vox (0.52 %),      54 % mass, 9.78 x 3.90 x 7.63  <- room
+    //
+    //    So ask the scale-free question instead: how much of the scene's
+    //    opacity-weighted MASS is in the blob? Descend the ladder and take the
+    //    HIGHEST threshold (tightest blob) that already holds a third of it.
+    //    A third is enough to mean "this is what the scene is of" while still
+    //    excluding the room, which only arrives with the last few percent.
+    //
+    //    Plus a knee guard: refuse to descend past a level whose largest
+    //    extent grew more than kFitExtentJump in ONE step. That is the moment
+    //    the fill leaks out of the object and into the room (3.18 -> 9.78
+    //    above, a 3.1x jump) and it is visible without knowing any absolute
+    //    size. If the knee comes before the mass target is met, the level
+    //    BEFORE the knee wins — better a tight object than a room.
+    const float thresholds[] = {0.50f, 0.30f, 0.20f, 0.10f, 0.07f,
+                                0.05f, 0.03f, 0.02f, 0.01f, 0.005f};
+
+    // Total opacity-weighted mass of the SCENE — every trimmed splat, not just
+    // the ones that landed inside the grid. The grid only spans the [p5, p95]
+    // box, so summing it instead would quietly shrink the denominator by
+    // whatever lies outside that box and inflate every fraction. On
+    // `KAWS FAMILY.spz` that alone moved the answer a whole rung (the 10 %
+    // level reads 30 % of the scene but 35 % of the grid), which is the
+    // difference between framing the statue and framing its plinth.
+    double totalMass = 0.0;
+    for (const GsFitPoint& g : pts) totalMass += (double)g.opacity;
+    if (!(totalMass > 0.0)) return result;
 
     std::vector<bool> filled(totalVoxels, false);
     std::vector<bool> bestFilled(totalVoxels, false);
     size_t bestCount = 0;
-    float bestThresh = 0.30f;
+    float bestThresh = 0.0f;
+    float bestMassFrac = 0.0f;
+    float prevMaxExtent = 0.0f;
+    float prevMassFrac = 0.0f;
+    bool  haveCandidate = false;
+    // DXR_FIT_LADDER=1 prints every rung. The stop rule is a judgement about
+    // the shape of a curve, so seeing the curve is how it gets argued about.
+    const bool ladderLog = (getenv("DXR_FIT_LADDER") != nullptr);
+
     for (float t : thresholds) {
         const size_t cnt = floodFill(t * peakDensity, filled);
-        if (cnt >= minFill && cnt <= maxFill) {
-            bestFilled = filled;
-            bestCount = cnt;
-            bestThresh = t;
+        if (cnt == 0) continue;
+
+        // Mass and voxel bbox of THIS blob.
+        double blobMass = 0.0;
+        int lo[3] = {(int)G, (int)G, (int)G}, hi[3] = {-1, -1, -1};
+        for (size_t idx = 0; idx < totalVoxels; idx++) {
+            if (!filled[idx]) continue;
+            blobMass += (double)density[idx];
+            const int z = (int)(idx % G);
+            const int y = (int)((idx / G) % G);
+            const int x = (int)(idx / ((size_t)G * G));
+            if (x < lo[0]) lo[0] = x; if (x > hi[0]) hi[0] = x;
+            if (y < lo[1]) lo[1] = y; if (y > hi[1]) hi[1] = y;
+            if (z < lo[2]) lo[2] = z; if (z > hi[2]) hi[2] = z;
+        }
+        const float massFrac = (float)(blobMass / totalMass);
+        float maxExtent = 0.0f;
+        for (int a = 0; a < 3; a++) {
+            const float voxSize = (vmax[a] - vmin[a]) / (float)G;
+            const float e = (float)(hi[a] - lo[a] + 1) * voxSize;
+            if (e > maxExtent) maxExtent = e;
+        }
+
+        if (ladderLog) {
+            fprintf(stderr, "  [fit ladder] t=%.3f x peak: %zu vox (%.3f%% grid), "
+                            "mass %.1f%%, extent %.3f x %.3f x %.3f (max %.3f)\n",
+                    (double)t, cnt, 100.0 * (double)cnt / (double)totalVoxels,
+                    100.0 * (double)massFrac,
+                    (double)((float)(hi[0]-lo[0]+1) * (vmax[0]-vmin[0]) / (float)G),
+                    (double)((float)(hi[1]-lo[1]+1) * (vmax[1]-vmin[1]) / (float)G),
+                    (double)((float)(hi[2]-lo[2]+1) * (vmax[2]-vmin[2]) / (float)G),
+                    (double)maxExtent);
+        }
+
+        // The knee: this level leaked out of the object and into whatever it
+        // is standing in. Keep what we had and stop.
+        //
+        // Gated on the PREVIOUS blob already being substantial. At the top of
+        // the ladder a blob is a handful of voxels and one extra row more than
+        // 1.6x-es its extent, so an ungated knee fires on the first step every
+        // time — it did, and it framed butterfly.spz at 0.118 vH (five voxels).
+        // A leak is only a leak once there is something to leak OUT of.
+        if (haveCandidate && prevMassFrac >= kFitKneeMinMassFrac &&
+            prevMaxExtent > 1.0e-6f &&
+            maxExtent > kFitExtentJump * prevMaxExtent) {
+            if (ladderLog) fprintf(stderr, "  [fit ladder] knee -> keeping t=%.3f\n",
+                                   (double)bestThresh);
             break;
         }
-        // Also remember the largest fill that's at most maxFill, in case
-        // nothing falls into the sweet spot.
-        if (cnt > bestCount && cnt <= maxFill) {
-            bestFilled = filled;
-            bestCount = cnt;
-            bestThresh = t;
-        }
+
+        bestFilled = filled;
+        bestCount = cnt;
+        bestThresh = t;
+        bestMassFrac = massFrac;
+        prevMaxExtent = maxExtent;
+        prevMassFrac = massFrac;
+        haveCandidate = true;
+
+        // Tightest blob that already holds a third of the scene's mass.
+        if (massFrac >= kFitMinMassFrac) break;
     }
     if (bestCount == 0) return result;
+    result.massFraction = bestMassFrac;
 
     // 6. Bbox of filled voxels in voxel coords, then convert to world.
     int minVox[3] = {(int)G, (int)G, (int)G};
@@ -328,14 +419,25 @@ GsFitBounds GsMainObjectBoundsEx(const GsVertex* verts, size_t count,
                 result.extent[a] = denseExt[a] * kComfort;
             }
         } else {
+            // Centre on the opacity centroid — it pulls toward the dense part
+            // of the subject and away from sparse appendages — but take the
+            // extent from the precise bbox ITSELF rather than symmetrising it
+            // about that centroid.
+            //
+            // The symmetrisation was compensating for a blob that might be the
+            // whole room: doubling the larger half guaranteed the subject
+            // stayed inside whatever had been found. The mass-fraction stop
+            // now identifies the subject directly, so the compensation has
+            // become pure inflation — on `KAWS FAMILY.spz` it turned a 1.95 m
+            // statue into a 2.38 m box and framed it a quarter too far out.
+            // What survives is the centring, which is the half that was always
+            // about the picture rather than about not trusting the blob.
             const float centroid[3] = {(float)(centroidSum[0] / sumW),
                                        (float)(centroidSum[1] / sumW),
                                        (float)(centroidSum[2] / sumW)};
             for (int a = 0; a < 3; a++) {
                 result.center[a] = centroid[a];
-                const float halfMax = std::max(preciseMax[a] - centroid[a],
-                                               centroid[a] - preciseMin[a]);
-                result.extent[a] = 2.0f * halfMax * kComfort;
+                result.extent[a] = (preciseMax[a] - preciseMin[a]) * kComfort;
             }
         }
         result.source = GsBoundsSource::FloodFillScene;
