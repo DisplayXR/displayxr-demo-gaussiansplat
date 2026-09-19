@@ -133,6 +133,25 @@ if given, else from the cloud's own **median forward depth** (measured before
 any decimation, so it does not move with a performance knob), else 2 m. The HUD
 names which.
 
+That omission has a visible consequence, and it is the single biggest
+difference between this viewer's output and the source photographs. The
+rendered pair is converged at the **pivot**; a raw capture is converged
+wherever the camera was. On the gallery's `ports` asset the two photographs
+carry +36.8 eye-px of mutual offset while the rendered pair carries +1.6, so
+each rendered eye sits about 18 px from its photograph — which is most of the
+23.6/255 grey MAE between them. Re-converging the render onto the pair (a 16 px
+`--cx` nudge) halves that to 11.8. Neither number is a defect: they are two
+different, both-correct convergences. But a viewer cannot reproduce the
+capture's convergence from the block as specified, because the block does not
+carry it — the gallery's own model uses `min(dConv, dSubject)` and only
+`dSubject` survives the round trip. **Adding a convergence (or a
+`stereo.convergence_m`) to the block is the fix**, and until then `--pivot=` is
+the manual override.
+
+A smaller, separate residual: this asset also wants its principal point about
+9 px **below** the image centre — a shift that helps both eyes equally, unlike
+the convergence one, which helps one and hurts the other. Worth about 2/255.
+
 ## Command line and the `displayxr-view:` protocol
 
 A web page — or a native app such as a CAD tool "undocking" a part — can spawn
