@@ -54,10 +54,19 @@
  *    Here the runtime owns the eye, so eye motion is head tracking and the
  *    comfort cone applies only to the DRAG, which orbits the scene.
  *  - `camera.ts` derives the pivot from the pair's stored `convergence` /
- *    `disp_median` columns. The `camera` block carries no such field, so the
- *    pivot comes from `--pivot=`, else the median forward depth of the cloud
- *    (the `dSubject` half of the same `min`), else a fallback. See
- *    GsResolveCameraRig.
+ *    `disp_median` columns, i.e. `min(dConv, dSubject)`. A v2 `camera` block
+ *    carries that decision directly as `focus.point`; without one the viewer
+ *    falls back to the cloud's median disparity, which is the `dSubject` half
+ *    of the same `min`. Full waterfall: GsResolveCameraRig.
+ *
+ * ## Focus is one point, and it is the same point on both rigs
+ *
+ * The orbit centre, the pivot plane that stays put under head motion, and the
+ * convergence depth are THE SAME THING and are stored once
+ * (`GsCameraRig::focusLocal`). A viewer that orbits about one place and
+ * converges at another shows the user two different scenes depending on
+ * whether they are moving. A double-click moves that one point; everything
+ * follows.
  *
  * ## Units and frame
  *
@@ -74,8 +83,9 @@
 
 #include "gs_scene_loader.h"  // GsVertex, GsSceneCamera
 
-//! Which rig frames the scene.
-enum class GsRigKind { Display, Camera };
+// GsRigKind is declared in gs_scene_loader.h, because the FILE can carry a rig
+// hint and the loader must be able to express it without depending on this
+// module.
 
 //! Near/far of the camera rig, metres. Deliberately far past any content: a
 //! deconverged lift puts the sky at the depth worker's cap and the refinement
@@ -135,7 +145,59 @@ struct GsRigFlags {
     //! this is the viewer's own flag namespace, and launching straight into a
     //! known mode is what makes a rest view reproducible from a script.
     bool  hasMode = false;     int mode = 0;
+
+    //! `--focus-weight=centre` — restrict the median-disparity focus estimate
+    //! to the middle of the frame. Off by default: on a scene whose subject
+    //! IS central it barely moves the answer, and on one whose subject is not
+    //! it silently prefers whatever happens to be in the middle. Kept because
+    //! it is the right answer for a portrait and the wrong one for a
+    //! landscape, and only the user knows which they have.
+    bool  centreWeightedFocus = false;
 };
+
+//! Intrinsics recovered from the cloud itself, for a scene that declares none.
+//!
+//! A photo-lifted cloud remembers its camera whether or not anyone wrote it
+//! down: every gaussian was unprojected along a ray through the lens, so the
+//! ANGULAR EXTENT of the cloud about the rest camera IS the frustum it was
+//! fitted in. Measuring the 1st and 99th percentile of x/z and y/z recovers the
+//! half-tangents (the percentiles rather than the extremes because a lift
+//! always leaves a few stray gaussians far outside the frame, and one of those
+//! would set the focal on its own).
+//!
+//! Validated on the gallery's harbour asset, whose true intrinsics are known:
+//! P1/P99 of x/z came out -0.854/+0.863 against a true +/-0.857, and of y/z
+//! -0.480/+0.505 against +/-0.482 — i.e. within a percent, and the asymmetry
+//! it reports IS the principal-point offset rather than noise.
+struct GsIntrinsicsEstimate {
+    bool  valid = false;
+    float fx = 0.0f, fy = 0.0f, cx = 0.0f, cy = 0.0f;
+    int   width = 0, height = 0;
+    //! The measured tangent window, for the log and for comparison against a
+    //! block that also declares intrinsics.
+    float tanLeft = 0.0f, tanRight = 0.0f, tanDown = 0.0f, tanUp = 0.0f;
+    //! Implied 35 mm-equivalent focal, the number a photographer would
+    //! recognise, and the one the sanity gate is expressed in.
+    float focal35mm = 0.0f;
+    //! True when the gate rejected the measurement and a nominal 28 mm-eq
+    //! frustum was substituted (the aspect is still the measured one).
+    bool  usedFallback = false;
+    std::string note;
+};
+
+//! Widest and narrowest 35 mm-equivalent focal the estimator will believe.
+//! Outside this the measurement is not a lens, it is a cloud with a long tail
+//! or a scene that was never a photograph.
+constexpr float kGsEstMinFocal35 = 14.0f;
+constexpr float kGsEstMaxFocal35 = 85.0f;
+//! What to assume when the gate rejects the measurement: a 28 mm-eq frustum,
+//! the most ordinary phone-camera field of view there is.
+constexpr float kGsFallbackFocal35 = 28.0f;
+
+//! Recover intrinsics from a righted (RUB) cloud. Returns false only when the
+//! cloud has too little in front of the camera to measure at all.
+bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
+                          GsIntrinsicsEstimate& out);
 
 //! Parse the rig flags out of argv.
 //!
@@ -155,6 +217,8 @@ struct GsRigFlags {
 //!   --baseline=<m>    capture baseline, metres
 //!   --pivot=<m>       pivot / convergence depth, metres
 //!   --mode=<index>    initial rendering mode (0 = 2D passthrough, 1 = first 3D)
+//!   --focus-weight=centre|frame   restrict the median-disparity focus to the
+//!                                 middle of the frame (default: frame)
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);
 
@@ -170,13 +234,39 @@ struct GsCameraRig {
     //! Capture baseline, metres.
     float baselineM = kGsDefaultBaselineM;
 
-    //! Pivot / convergence depth, metres: the plane that stays put under head
-    //! motion and the vertex of the comfort cone.
+    //! THE FOCUS, in rest-camera space, app convention (+x right, +y up,
+    //! +z back — so a point in front has a NEGATIVE z).
+    //!
+    //! One point, three jobs that must never disagree: the orbit centre, the
+    //! pivot plane that stays put under head motion, and the convergence
+    //! depth. Keeping them as one field is the point — a viewer that orbits
+    //! about one place and converges at another shows the user two different
+    //! scenes depending on whether they are moving.
+    float focusLocal[3] = {0.0f, 0.0f, -kGsFallbackPivotM};
+
+    //! Pivot / convergence depth, metres: the focus point's distance along the
+    //! camera axis, i.e. -focusLocal[2]. Derived, never set independently.
     float pivotM = kGsFallbackPivotM;
 
-    //! Where the pivot came from, for the log and the HUD ("--pivot",
-    //! "scene median depth", "scene bounds", "fallback").
-    std::string pivotSource;
+    //! Where each resolved field came from, for the log and the HUD. The
+    //! waterfall has four levels and a wrong answer looks identical to a right
+    //! one until you know which level produced it.
+    std::string rigSource;         //!< "--rig", "camera.rig", "block present", "no block"
+    std::string focusSource;       //!< "--pivot", "block", "median-disparity", "scene bounds", "fallback"
+    std::string intrinsicsSource;  //!< "block", "flags", "estimated", "estimated (28mm fallback)"
+
+    //! Populated when the intrinsics were measured from the cloud, OR when the
+    //! block declared them and a measurement was taken anyway to compare.
+    GsIntrinsicsEstimate estimate;
+
+    //! Absolute scalars from the block's `dxr` object, applied on top of the
+    //! measured-IPD scaling. 1.0 unless the file asked otherwise.
+    float dxrIpdFactor = 1.0f;
+    float dxrParallaxFactor = 1.0f;
+
+    //! Move the focus. Recomputes pivotM, so these two can never drift apart.
+    //! Takes rest-camera space, app convention.
+    void SetFocusLocal(float x, float y, float z);
 
     //! Rest pose of the camera in APP space (RUB), converted from the block's
     //! OpenCV pose. Position metres, quaternion xyzw.
@@ -262,32 +352,82 @@ struct GsCameraRig {
     void ClampOrbit(float& yawRad, float& pitchRad) const;
 };
 
-//! Resolve the rig from what the file declared plus what the CLI overrode.
+//! What the cloud itself says, measured ONCE at load.
 //!
-//! `medianForwardDepthM` is the cloud's own median forward depth (<= 0 when
-//! unknown); it stands in for `camera.ts`'s `dSubject`. `boundsForwardDepthM`
-//! is a coarser fallback — the scene AABB's centre depth, which is all a
-//! `--rig=camera` override on a non-photo scene can offer — and is likewise
-//! <= 0 when unknown. Pivot priority: `--pivot=` > median > bounds > 2 m.
+//! The rig is resolved long after the vertices are freed (they go to the GPU
+//! and the CPU copy is dropped — it is 270 MB on a million-gaussian scene), so
+//! everything the waterfall might need from the cloud is measured while it is
+//! still in hand and carried in this. Both medians are taken because which one
+//! the user wants is a flag, and re-reading the cloud to answer it is not an
+//! option.
+struct GsSceneMeasurements {
+    bool  valid = false;
+    GsIntrinsicsEstimate estimate;
+    float medianDepthM       = 0.0f;  //!< median disparity, whole frame
+    float medianDepthCentreM = 0.0f;  //!< median disparity, middle of the frame
+};
+
+//! Measure a righted (RUB) cloud. O(n), a few passes, once per load.
+GsSceneMeasurements GsMeasureScene(const std::vector<GsVertex>& vertices);
+
+//! Everything the resolver needs that is not the file or the flags.
+struct GsRigResolveInput {
+    //! What GsMeasureScene found at load. Null means the cloud levels of the
+    //! waterfall are skipped.
+    const GsSceneMeasurements* measurements = nullptr;
+    //! Coarse fallback focus depth — the main object's centre depth — which is
+    //! all a `--rig=camera` override on a non-photo scene can offer. <= 0 when
+    //! unknown.
+    float boundsForwardDepthM = 0.0f;
+};
+
+//! Resolve the rig from the file, the flags and the cloud, in that order of
+//! preference, recording where every field came from.
 //!
-//! Returns false (with `why` set, when non-null) when there are not enough
-//! intrinsics to frame anything — the caller must then stay on the display rig
-//! rather than invent a camera.
+//! THE WATERFALL — each level is tried in turn and the first that yields an
+//! answer wins. `out.rigSource` / `intrinsicsSource` / `focusSource` name the
+//! level that did, because a wrong answer and a right one look identical until
+//! you know which level produced it.
+//!
+//!   intrinsics: block -> --fx/--fy/--cx/--cy/--size -> estimated from the
+//!               cloud's angular extent -> 28 mm-eq with the measured aspect
+//!   focus:      --pivot= -> camera.focus.point -> median disparity
+//!               -> scene bounds -> 2 m
+//!
+//! Returns false (with `why` set) only when there is nothing to frame with at
+//! all — no block, no flags and no cloud. The caller must then stay on the
+//! display rig rather than invent a camera.
 bool GsResolveCameraRig(const GsSceneCamera& cam,
                         const GsRigFlags& flags,
-                        float medianForwardDepthM,
-                        float boundsForwardDepthM,
+                        const GsRigResolveInput& in,
                         GsCameraRig& out,
                         std::string* why = nullptr);
 
-//! Which rig a scene should be framed with: the file's `camera` block decides,
-//! `--rig=` overrides.
-GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags);
+//! Which rig a scene should be framed with, and why.
+//!   --rig= -> camera.rig -> (block present ? camera : display)
+GsRigKind GsSelectRigKind(const GsSceneCamera& cam, const GsRigFlags& flags,
+                          std::string* source = nullptr);
 
-//! Median forward depth (-z, i.e. into the screen) of a righted RUB cloud, in
-//! metres; 0 when the cloud is empty or entirely behind the camera. O(n) via
-//! nth_element over a copy of one float per gaussian.
-float GsMedianForwardDepth(const std::vector<GsVertex>& vertices);
+//! The block's rest pose, righted from its OpenCV convention into app space
+//! (RUB), as `GsResolveCameraRig` does internally. Exposed because the DISPLAY
+//! rig needs the same conversion for a block that carries a rest pose and asks
+//! for that rig — and doing it twice, differently, is how conventions drift.
+//! Identity in, identity out.
+void GsCameraRestPoseRub(const GsSceneCamera& cam, float outPosition[3],
+                         float outRotation[4]);
+
+//! Focus depth from the cloud's MEDIAN DISPARITY: the median of 1/z over the
+//! gaussians in front of the camera, inverted. Returns 0 when there are none.
+//!
+//! Disparity rather than depth because disparity is what a stereo pair
+//! measures and what the eye fuses — but note the two agree exactly here:
+//! 1/x is monotonic on z > 0, so median(1/z) == 1/median(z). The name is the
+//! honest one for what the quantity IS.
+//!
+//! `centreWeighted` restricts the sample to the middle of the frame (see
+//! GsRigFlags::centreWeightedFocus).
+float GsMedianDisparityDepth(const std::vector<GsVertex>& vertices,
+                             bool centreWeighted = false);
 
 //! Drag -> scene orbit, radians. `dx`/`dy` are drag deltas as a FRACTION of the
 //! canvas box, so a full-width drag is 2x the comfort cone and the gesture
