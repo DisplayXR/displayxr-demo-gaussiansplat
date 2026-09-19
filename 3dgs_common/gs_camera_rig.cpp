@@ -230,6 +230,33 @@ void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
     }
 }
 
+bool GsIsAppOwnedFlagName(const std::string& name) {
+    // Every flag GsParseRigFlags reads, plus the ones other parts of this
+    // viewer read straight from argv. Kept as one list so a new flag has one
+    // place to be declared rather than two.
+    static const char* kOwned[] = {
+        "rig", "fx", "fy", "cx", "cy", "size", "baseline", "pivot",
+        "mode", "focus-weight", "window", "fit", "fit-disparity",
+        "opaque",   // read by the macOS arm at startup; harmless elsewhere
+    };
+    for (const char* k : kOwned) if (name == k) return true;
+    return false;
+}
+
+bool GsIsOwnFlagWarning(const std::string& warning) {
+    // Both shapes quote the token; pull out whatever is between the quotes and
+    // strip a leading "--" so the two forms compare against the same list.
+    const size_t a = warning.find('\'');
+    if (a == std::string::npos) return false;
+    const size_t b = warning.find('\'', a + 1);
+    if (b == std::string::npos) return false;
+    std::string name = warning.substr(a + 1, b - a - 1);
+    if (name.rfind("--", 0) == 0) name = name.substr(2);
+    const size_t eq = name.find('=');
+    if (eq != std::string::npos) name = name.substr(0, eq);
+    return GsIsAppOwnedFlagName(name);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Resolution
 // ─────────────────────────────────────────────────────────────────────────────

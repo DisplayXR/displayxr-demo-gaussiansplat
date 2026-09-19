@@ -259,6 +259,34 @@ bool GsEstimateIntrinsics(const std::vector<GsVertex>& vertices,
 void GsParseRigFlags(int argc, const char* const* argv, GsRigFlags& out,
                      std::vector<std::string>* warnings = nullptr);
 
+//! Is `name` a flag this VIEWER owns, as opposed to one the shared launch
+//! contract knows about?
+//!
+//! argv is read by two parsers — displayxr-common's launch-args parser for the
+//! flags every DisplayXR viewer shares (`--src`, `--vh`, `--pose`, ...) and
+//! GsParseRigFlags for this viewer's own — and each necessarily meets tokens
+//! belonging to the other. The shared one says so out loud, which turned a
+//! perfectly ordinary launch into a wall of
+//!
+//!   [WARN] launch: cli: unknown key 'rig' ignored
+//!   [WARN] launch: cli: unknown key 'fx' ignored        (and nine more)
+//!   [WARN] launch: cli: unknown flag '--opaque' ignored
+//!
+//! none of which is a problem: those flags ARE handled, just not there. This
+//! is how the caller tells the difference before it logs. The other direction
+//! needs no equivalent — GsParseRigFlags ignores what it does not own in
+//! silence, because it is the second reader and knows it.
+//!
+//! Teaching the SHARED parser these names instead would put a splat viewer's
+//! vocabulary into a contract that a model viewer and a browser also implement,
+//! and would need a release of that repo and a pin bump to land a log fix.
+bool GsIsAppOwnedFlagName(const std::string& name);
+
+//! True when `warning` is the shared parser complaining about a flag this
+//! viewer owns. Understands both shapes it produces: `unknown key 'rig'`
+//! (--key=value) and `unknown flag '--opaque'` (no value).
+bool GsIsOwnFlagWarning(const std::string& warning);
+
 //! The resolved camera rig: everything the platform glue needs to declare an
 //! XrCameraRigDXR and to orbit the scene, and nothing else.
 struct GsCameraRig {
