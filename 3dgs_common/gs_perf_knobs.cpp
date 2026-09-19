@@ -60,13 +60,14 @@ bool lookup(const char *envName, const char *androidProp, char *out, size_t outS
             copyInto(out, outSize, buf);
             return true;
         }
-#else
+        // Fall through to the CRT copy as well: the Win32 block is the
+        // authoritative one, but a miss there must not silently mean "unset".
+#endif
         const char *v = getenv(envName);
         if (v != nullptr && v[0] != '\0') {
             copyInto(out, outSize, v);
             return true;
         }
-#endif
     }
 #if defined(__ANDROID__)
     if (androidProp != nullptr && outSize > 0) {
