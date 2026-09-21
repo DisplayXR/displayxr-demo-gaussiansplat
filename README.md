@@ -471,10 +471,21 @@ file path, the Open dialog, drag-and-drop) loads normally.
 
 Every renderer-side performance lever is an **environment variable**, read once
 when the renderer initialises, on all four platforms and on both splat
-renderers (`GsRenderer`, the compute compositor used on x86 Windows/Linux, and
-`GsAdrenoRenderer`, the graphics/TBDR path used on Android, Apple Silicon and
-Windows-on-ARM). They are environment variables and not command-line flags so
-they can never collide with the viewer's scene/URL argument parsing.
+renderers (`GsRenderer`, the compute compositor used on x86 Windows, and
+`GsAdrenoRenderer`, the graphics/TBDR path used on Linux, Android, Apple
+Silicon and Windows-on-ARM). They are environment variables and not
+command-line flags so they can never collide with the viewer's scene/URL
+argument parsing.
+
+> **Which renderer on Linux.** The Linux leg defaults to **GRAPHICS**
+> (`GsAdrenoRenderer`), set by `GS_RENDERER` in `linux/CMakeLists.txt` — not
+> COMPUTE. The desktop head-to-head showed the graphics path also wins on
+> immediate-mode GPUs, because its radix sort sorts N gaussians rather than
+> N x 8 fragments. Override at configure time with
+> `-DGS_RENDERER=COMPUTE` (legacy) or `-DGS_RENDERER=AUTO`
+> (`gs_renderer_select.h`'s own default, which on desktop x86_64 is COMPUTE).
+> The `GsAdreno: knobs ...` vs `GsRenderer: knobs ...` startup log line tells
+> you which one a given build actually linked.
 
 On **Android** each one also falls back to its historical `debug.dxr.gs.*`
 system property when the environment variable is unset, so
