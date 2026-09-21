@@ -144,11 +144,10 @@ find_package(OpenXR REQUIRED CONFIG)
 # desktop legs reach through displayxr::rules, so there is one implementation
 # (runtime#1612). Fetch sources only; don't run its CMake, which carries
 # desktop platform deps. Keep the pin identical to common/CMakeLists.txt.
-# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
-    GIT_SHALLOW FALSE)
+    GIT_TAG v2.15.0
+    GIT_SHALLOW TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
     FetchContent_Populate(displayxr_common_rules)

@@ -77,7 +77,7 @@ Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
 
 This file no longer exists here. Since runtime#1612 every leg takes
 `dxr_view_config.h` (`DxrSelectViewConfigType` + `DxrAliasInactiveViews`) from
-displayxr-common's `common/` directory — one implementation shared by every
+displayxr-common's `common/` directory (v2.15.0+) — one implementation shared by every
 demo. The history below is kept for context only.
 
 ### Historical note
@@ -99,6 +99,5 @@ the vendored `XR_DXR_display_info.h` is present but older than spec 19 — the
 runtime original only probes for the header's *existence*, which is sufficient
 in a tree whose headers always move together, and is not sufficient here.
 
-When `common/CMakeLists.txt` re-pins `displayxr-common` to **v2.14.0** (which
-ships the same helper), the Windows leg can drop its include; the three legs
-with their own session code keep using this file.
+(Superseded: `common/CMakeLists.txt` now pins `displayxr-common` **v2.15.0**,
+which ships both helpers, and every leg includes that copy instead.)
