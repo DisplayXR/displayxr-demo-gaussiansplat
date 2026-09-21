@@ -1413,7 +1413,10 @@ static void PumpXEvents(AppXrSession& xr) {
             // (that is deliberate — see CreateAppWindow), so the top
             // kTitleStripH pixels stand in for one. Everything below it is the
             // scene.
-            if (g_clientDrag && ev.xbutton.y < kTitleStripH) {
+            // Not while fullscreen: there is nowhere to move to, and asking
+            // the WM to move a fullscreen window is how you end up with a
+            // window that is neither.
+            if (g_clientDrag && !g_fullscreen && ev.xbutton.y < kTitleStripH) {
                 g_winDragging = true;
                 g_winDragPtrX = ev.xbutton.x_root;
                 g_winDragPtrY = ev.xbutton.y_root;
