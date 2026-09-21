@@ -34,6 +34,7 @@
 #include "clip_policy.h"   // dxr::ResolveClipPlanes / ChainRearDepthBudget / RearDepthBudgetStateName (#100)
 #include "content_bounds.h" // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (#100 v2 ROI)
 #include "content_mask.h"   // dxr::ContentMaskFromCoverage / ChainContentMask (#100 v3 silhouette ROI)
+#include "dxr_view_config.h" // DxrAliasInactiveViews — submit every located view (ADR-041, runtime#1612)
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_depth_budget.h>
 
@@ -2254,6 +2255,11 @@ static void RenderThreadFunc(
                 uint32_t locatedViewCount = 0;
                 uint32_t filledViewCount = 0;
                 uint32_t atlasSliceCount = 0;
+                // ADR-041 (runtime#1612): a copy of what xrLocateViews wrote, kept
+                // at this scope so the "Submit frame" block can alias the views the
+                // active mode does not render (DxrAliasInactiveViews keeps each
+                // aliased view's OWN located pose/fov).
+                XrView locatedViews[8] = {};
 
                 // Aspect-preserving HUD layer footprint (fixes demo-gs#8).
                 // The HUD swapchain has a fixed pixel aspect (hudWidth × hudHeight,
@@ -2412,6 +2418,7 @@ static void RenderThreadFunc(
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
                         locatedViewCount = viewCount;  // runtime#1486 clamp input
+                        for (uint32_t i = 0; i < viewCount && i < 8; i++) locatedViews[i] = rawViews[i];
 
                         const XrRearDepthBudgetDXR* depthBudgetPtr =
                             (hasDepthBudgetExt && depthBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR)
@@ -3526,6 +3533,11 @@ static void RenderThreadFunc(
                 }
 
                 // Submit frame
+                //
+                // submitViewCount below is the number of views RENDERED this frame
+                // (the active mode's count, reconciled with what was located /
+                // written / fits). The projection layer itself carries EVERY
+                // located view — layerViewCount — see the ADR-041 block after it.
                 uint32_t submitViewCount = (xr->renderingModeCount > 0 && xr->currentModeIndex < xr->renderingModeCount) ? xr->renderingModeViewCounts[xr->currentModeIndex] : 2;
                 if (submitViewCount == 0) submitViewCount = 1;
                 if (submitViewCount > 8) submitViewCount = 8;  // matches projectionViews[8] sizing
@@ -3560,6 +3572,20 @@ static void RenderThreadFunc(
                         submitViewCount = clamped;
                     }
                 }
+
+                // ADR-041 (runtime#1612): under PRIMARY_MULTIVIEW_DXR xrEndFrame
+                // must carry EVERY located view. A 1-view (2D) frame submitted as a
+                // 1-view layer is REJECTED outright, so the panel drops to 2D while
+                // still showing the last woven 3D frame — a frozen double image.
+                // Render only the active views ([0, submitViewCount) is filled
+                // above) and point the unrendered tail at view 0's image; the
+                // runtime ignores those pixels. locatedViewCount <= 8 (the locate
+                // capacity), so the tail stays inside projectionViews[8].
+                uint32_t layerViewCount = submitViewCount;
+                if (rendered && locatedViewCount > submitViewCount) {
+                    DxrAliasInactiveViews(projectionViews, locatedViews, locatedViewCount, submitViewCount);
+                    layerViewCount = locatedViewCount;
+                }
                 if (rendered && (hudSubmitted || toastLayerReady)) {
                     // Layer footprint sized per-frame to match the HUD
                     // swapchain's aspect (computed above as layerFracW ×
@@ -3584,7 +3610,7 @@ static void RenderThreadFunc(
                     // XrFrameEndInfo::next — frameEndNext is nullptr whenever the extension is
                     // off or no scene is loaded, which reproduces the pre-#100 behavior.
                     EndFrameWithWindowSpaceLayers(*xr, frameState.predictedDisplayTime, projectionViews,
-                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, submitViewCount,
+                        0.0f, 0.0f, layerFracW, layerFracH, 0.0f, layerViewCount,
                         toastLayerReady ? &toastLayer : nullptr, toastLayerReady ? 1u : 0u,
                         0, 0, -1, -1,
                         /*submitHud=*/hudSubmitted,
@@ -3592,7 +3618,7 @@ static void RenderThreadFunc(
                         /*projectionNext=*/nullptr, /*extraLayers=*/nullptr, /*extraLayerCount=*/0u,
                         frameEndNext);
                 } else if (rendered) {
-                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, submitViewCount,
+                    EndFrame(*xr, frameState.predictedDisplayTime, projectionViews, layerViewCount,
                         XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT,
                         /*projectionNext=*/nullptr, frameEndNext);
                 } else {

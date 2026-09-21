@@ -44,8 +44,9 @@
 // XR_DXR_display_info: the panel pixel size, so the load-time auto-fit
 // can use the real viewport instead of reconstructing one.
 #include <openxr/XR_DXR_display_info.h>
-// DxrSelectViewConfigType (runtime#1486 opt-in) — same vendored helper all four
-// legs use; openxr_includes/ is on every leg's include path.
+// DxrSelectViewConfigType (runtime#1486 opt-in) — displayxr-common's
+// common/dxr_view_config.h, the same header all four legs use (fetched by
+// android/src/main/cpp/CMakeLists.txt; runtime#1612).
 #include <dxr_view_config.h>
 #include <android/native_window.h>
 

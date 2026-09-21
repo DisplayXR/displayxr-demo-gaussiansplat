@@ -9,10 +9,9 @@
 #include "logging.h"
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_depth_budget.h>
-// Explicit relative path on purpose: displayxr-common v2.14.0 ships an
-// identical dxr_view_config.h via displayxr::rules, so a bare include is
-// ambiguous once displayxr::common is on the include path.
-#include "../openxr_includes/dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
+// displayxr-common's copy (displayxr::rules) is the ONE implementation; the
+// demo-local vendored copy in openxr_includes/ was deleted (runtime#1612).
+#include "dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
 #include <cstring>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima math and
