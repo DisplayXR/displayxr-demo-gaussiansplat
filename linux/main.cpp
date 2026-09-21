@@ -43,6 +43,7 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
+#include <openxr/XR_DXR_weave.h>                  // xrWeaveSnapWindowRectDXR — drag-time phase snap
 #include "dxr_view_config.h"   // DxrSelectViewConfigType + DxrAliasInactiveViews (displayxr::rules; runtime#1486, ADR-041)
 
 #include <cmath>
@@ -84,6 +85,7 @@
 #include "gs_camera_rig.h"        // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "gs_scene_fit.h"         // the shared, depth-aware display-rig fit
 #include "launch_args.h"          // dxr::ParseLaunchArgs — the shared --key=value grammar
+#include "mode_switch.h"          // dxr::ModeSwitch — the shared 2D<->3D ramp (V / 0-8 keys)
 #pragma pop_macro("None")
 
 // ============================================================================
@@ -163,6 +165,68 @@ static float g_camRigRestTan[2]   = {0.0f, 0.0f};  //!< tangent centre of the un
 static float g_camOrbitYaw = 0.0f, g_camOrbitPitch = 0.0f;
 static bool  g_camDragging = false;
 static int   g_camDragLastX = 0, g_camDragLastY = 0;
+
+// ── Display-rig interaction (the parity gap this leg had) ───────────────────
+//
+// The Windows leg drives the display rig from InputState.{yaw,pitch} and
+// viewParams.{scaleFactor,ipdFactor}; the render path there computes
+// `rigVH = virtualDisplayHeight / scaleFactor` (windows/main.cpp:2339), so a
+// bigger scaleFactor is a bigger subject. input_handler.h is <windows.h>-only,
+// so the STATE is mirrored here and fed from X11 events with the same
+// semantics, signs and clamps rather than a Linux-only invention.
+//
+// The turntable used to be unconditional on this leg. Windows gates it on the
+// 'M' toggle and stops it the moment the user touches the scene, which is the
+// behaviour a drag needs — an auto-advancing yaw fights the drag otherwise.
+static float g_dispOrbitYaw = 0.0f;     //!< display-rig yaw, radians (drag + turntable)
+static float g_dispOrbitPitch = 0.0f;   //!< display-rig pitch, radians (drag only)
+static bool  g_dispDragging = false;
+static int   g_dispDragLastX = 0, g_dispDragLastY = 0;
+static bool  g_animateEnabled = true;   //!< 'M': turntable on/off (on = the old behaviour)
+static float g_scaleFactor = 1.0f;      //!< wheel zoom, [0.1, 10] (Windows: viewParams.scaleFactor)
+static float g_steadyIpd = 1.0f;        //!< '+/-' and shift+wheel 3D strength, [0.1, 1]
+static float g_ipdFactor = 1.0f;        //!< live ipdFactor, driven by the ModeSwitch ramp
+
+// ── 2D/3D mode switching ('V', '0'-'8') ─────────────────────────────────────
+// The shared, platform-neutral sequencer displayxr-common already ships and
+// the Windows leg uses (XrSessionUpdateModeSwitch wraps it there). It owns the
+// asymmetry: 3D->2D ramps the disparity to zero BEFORE switching, 2D->3D
+// switches first and eases up after.
+static dxr::ModeSwitch g_modeSwitch;
+static bool    g_cycleModeRequested = false;
+static int32_t g_absoluteModeRequested = -1;
+
+// ── Client-owned window drag + weave phase snap (INV-1.3, runtime #1588) ────
+//
+// The interlace phase is a function of the window's absolute position in
+// physical panel pixels, so a window-manager-owned drag re-lands the phase on
+// an arbitrary pixel every frame and the 3D shimmers. A mutter
+// _NET_WM_MOVERESIZE grab cannot be intercepted by the client, so the only
+// cure on X11 is to take the drag away from the WM: go undecorated, own the
+// move, and ask the display processor where the window may land.
+//
+// The window is therefore born undecorated with a synthetic title strip:
+// button 1 in the top kTitleStripH pixels MOVES the window (snapped), button 1
+// anywhere else ORBITS the scene. That is exactly the Windows split (title-bar
+// drag moves, client drag orbits) — Windows just gets the strip from the OS.
+// DXR_X11_WM_DECORATIONS=1 restores the decorated, WM-dragged window (and
+// forfeits the snap), matching the runtime test apps' opt-out knob.
+static const int kTitleStripH = 28;
+static bool g_clientDrag = true;        //!< false under DXR_X11_WM_DECORATIONS=1
+static bool g_winDragging = false;
+static int  g_winDragPtrX = 0, g_winDragPtrY = 0;      //!< pointer root pos at grab
+static int  g_winDragOriginX = 0, g_winDragOriginY = 0; //!< window root origin at grab
+static int  g_winDragAtX = 0, g_winDragAtY = 0;         //!< where we last put it
+static unsigned long long g_winDragMoves = 0, g_winDragSnapped = 0;
+static bool g_fullscreen = false;
+
+//! xrWeaveSnapWindowRectDXR, or null. Resolved after xrCreateSession; absent on
+//! any runtime without XR_DXR_weave, in which case the drag is simply
+//! unsnapped. NEVER hard-required (the extension is young, and a display
+//! processor with no lattice snap returns the target unchanged anyway).
+static PFN_xrWeaveSnapWindowRectDXR g_pfnWeaveSnap = nullptr;
+static bool g_weaveSnapFailed = false;
+static bool g_weaveSnapReported = false;
 
 static void SignalHandler(int sig) {
     (void)sig;
@@ -377,6 +441,7 @@ struct AppXrSession {
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
     bool hasXlibBindingExt = false;
+    bool hasWeaveExt = false;   //!< XR_DXR_weave — drag-time phase snap only
     float displayWidthM = 0, displayHeightM = 0;
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
@@ -423,6 +488,7 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
     }
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
@@ -431,6 +497,15 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     if (xr.hasXlibBindingExt) enabled.push_back(XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME);
+    // XR_DXR_weave: this leg wants ONE entry point out of it —
+    // xrWeaveSnapWindowRectDXR, the GPU-free query that says where a dragged
+    // window may land on the lens lattice. Detect-then-push; never required.
+    if (xr.hasWeaveExt) {
+        enabled.push_back(XR_DXR_WEAVE_EXTENSION_NAME);
+        LOG_INFO("XR_DXR_weave: AVAILABLE (enabled for the drag-time phase snap)");
+    } else {
+        LOG_INFO("XR_DXR_weave: NOT FOUND — window drags will not be phase-snapped");
+    }
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtLinux",
@@ -842,6 +917,141 @@ static bool GetPanelRect(Display* dpy, ::Window root, int& x, int& y, int& w, in
     return found;
 }
 
+// ── X11 window-geometry helpers (mirrors test_apps/common/dxr_linux_window.cpp)
+//
+// Strip the WM frame BEFORE the map: a frame that is never created cannot eat
+// rows out of the weave, and it is also what takes the drag away from the WM.
+static void X11SetUndecorated(Display* dpy, ::Window win) {
+    Atom motif = XInternAtom(dpy, "_MOTIF_WM_HINTS", False);
+    if (motif == None) return;
+    // flags, functions, decorations, input_mode, status.
+    // flags=2 is MWM_HINTS_DECORATIONS; decorations=0 is "none".
+    unsigned long hints[5] = {2, 0, 0, 0, 0};
+    XChangeProperty(dpy, win, motif, motif, 32, PropModeReplace,
+                    (const unsigned char*)hints, 5);
+}
+
+// The window's TRUE root-relative origin. XGetWindowAttributes' x/y are
+// parent-relative once the WM reparents (and some WMs reparent even an
+// undecorated window), so they are not the phase anchor — this is.
+static void X11RootOrigin(Display* dpy, ::Window win, int* out_x, int* out_y) {
+    ::Window child = 0;
+    int rx = 0, ry = 0;
+    if (XTranslateCoordinates(dpy, win, DefaultRootWindow(dpy), 0, 0, &rx, &ry, &child) == 0) {
+        rx = 0; ry = 0;
+    }
+    *out_x = rx; *out_y = ry;
+}
+
+static void X11SendRootMessage(Display* dpy, ::Window win, Atom type,
+                               long d0, long d1, long d2, long d3, long d4) {
+    XEvent ev = {};
+    ev.xclient.type = ClientMessage;
+    ev.xclient.send_event = True;
+    ev.xclient.display = dpy;
+    ev.xclient.window = win;
+    ev.xclient.message_type = type;
+    ev.xclient.format = 32;
+    ev.xclient.data.l[0] = d0; ev.xclient.data.l[1] = d1; ev.xclient.data.l[2] = d2;
+    ev.xclient.data.l[3] = d3; ev.xclient.data.l[4] = d4;
+    XSendEvent(dpy, DefaultRootWindow(dpy), False,
+               SubstructureRedirectMask | SubstructureNotifyMask, &ev);
+}
+
+//! Ask the display processor where a dragged window may land.
+//!
+//! Returns true and writes the lattice-aligned top-left when the runtime
+//! answered; false (outputs untouched) when the extension is absent, the
+//! session predates it, or the call failed. A failure is reported ONCE and
+//! then disables the pointer for the rest of the run — a per-motion log line
+//! would be per-event spam, and a call that failed once will fail again.
+//!
+//! Note both rects are in ABSOLUTE DESKTOP DEVICE PIXELS. The display
+//! processor uses only (target - origin), so translation cancels — but a scale
+//! factor does not, which is why the honest root origin above matters.
+static bool SnapWindowOrigin(XrSession session, unsigned int w, unsigned int h,
+                             int origin_x, int origin_y, int target_x, int target_y,
+                             int* out_x, int* out_y) {
+    if (g_pfnWeaveSnap == nullptr || session == XR_NULL_HANDLE) return false;
+
+    XrRect2Di origin = {};
+    origin.offset.x = origin_x;
+    origin.offset.y = origin_y;
+    origin.extent.width = (int32_t)w;
+    origin.extent.height = (int32_t)h;
+
+    XrRect2Di target = origin;
+    target.offset.x = target_x;
+    target.offset.y = target_y;
+
+    XrRect2Di snapped = {};
+    const XrResult res = g_pfnWeaveSnap(session, &origin, &target, &snapped);
+    if (res != XR_SUCCESS) {
+        if (!g_weaveSnapFailed) {
+            g_weaveSnapFailed = true;
+            LOG_WARN("xrWeaveSnapWindowRectDXR failed (%d) — the drag falls back to an "
+                     "unsnapped window position for the rest of this run", (int)res);
+        }
+        g_pfnWeaveSnap = nullptr;   // one strike and it never calls again
+        return false;
+    }
+    *out_x = snapped.offset.x;
+    *out_y = snapped.offset.y;
+    return true;
+}
+
+//! Move the window to `target`, snapped to the lens lattice if the DP offers
+//! one. Snapping, not correcting, is the cure: the window only ever LANDS on a
+//! phase-aligned position, so the woven pattern is identical everywhere the
+//! drag visits.
+static void MoveWindowSnapped(AppXrSession& xr, int target_x, int target_y) {
+    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+
+    int sx = target_x, sy = target_y;
+    const bool snapped = SnapWindowOrigin(xr.session, xr.xWinW, xr.xWinH,
+                                          g_winDragOriginX, g_winDragOriginY,
+                                          target_x, target_y, &sx, &sy);
+    if (!snapped) { sx = target_x; sy = target_y; }
+
+    if (!g_weaveSnapReported) {
+        g_weaveSnapReported = true;
+        LOG_INFO("drag: snap provider %s — the window %s",
+                 snapped ? "ACTIVE" : "unavailable",
+                 snapped ? "lands only on lattice-aligned positions"
+                         : "lands on the raw pointer position (identity snap)");
+    }
+    if (sx != target_x || sy != target_y) {
+        g_winDragSnapped++;
+        // On-change only: with an identity snap this never fires, which is
+        // the point.
+        LOG_INFO("drag: raw (%d, %d) -> snapped (%d, %d)", target_x, target_y, sx, sy);
+    }
+    if (sx == g_winDragAtX && sy == g_winDragAtY) {
+        return;   // the lattice swallowed this step; do not churn the WM
+    }
+    XMoveWindow(xr.xDisplay, xr.xWindow, sx, sy);
+    XFlush(xr.xDisplay);
+    g_winDragAtX = sx;
+    g_winDragAtY = sy;
+    g_winDragMoves++;
+}
+
+//! F11 — EWMH fullscreen toggle. Parity with the Windows leg's ToggleFullscreen.
+static void ToggleFullscreen(AppXrSession& xr) {
+    if (xr.xDisplay == nullptr || xr.xWindow == 0) return;
+    Atom state = XInternAtom(xr.xDisplay, "_NET_WM_STATE", False);
+    Atom fs = XInternAtom(xr.xDisplay, "_NET_WM_STATE_FULLSCREEN", False);
+    if (state == None || fs == None) {
+        LOG_WARN("F11: _NET_WM_STATE unavailable — cannot toggle fullscreen");
+        return;
+    }
+    g_fullscreen = !g_fullscreen;
+    // 1 = _NET_WM_STATE_ADD, 0 = _NET_WM_STATE_REMOVE; source 1 = application.
+    X11SendRootMessage(xr.xDisplay, xr.xWindow, state, g_fullscreen ? 1 : 0, (long)fs, 0, 1, 0);
+    XFlush(xr.xDisplay);
+    LOG_INFO("F11: fullscreen %s", g_fullscreen ? "ON" : "OFF");
+}
+
 // Create a normal decorated X11 window (opaque, default visual), landscape
 // 1920x1080 centered on the 3D panel — the app passes it via
 // XR_DXR_xlib_window_binding so the runtime weaves window-relative. Override
@@ -859,12 +1069,15 @@ static bool CreateAppWindow(AppXrSession& xr) {
 
     XSetWindowAttributes attrs = {};
     attrs.background_pixel = BlackPixel(dpy, screen);
-    // Button1Motion (not PointerMotion): motion is only reported while button 1
-    // is held, which is exactly the camera rig's scene-orbit drag and costs
-    // nothing the rest of the time. Nothing consumes these under the display
-    // rig — that leg is still keyboard-only.
+    // PointerMotionMask as well as Button1MotionMask: the client-owned window
+    // drag grabs the pointer, and a window being dragged fast routinely leaves
+    // its own frame — the motion that arrives through the grab is plain
+    // PointerMotion. Button1Motion alone was enough while the only consumer
+    // was the in-window orbit drag; it is not enough now. (Both are selected
+    // unconditionally so one mask serves the decorated and undecorated paths.)
     attrs.event_mask = StructureNotifyMask | KeyPressMask |
-                       ButtonPressMask | ButtonReleaseMask | Button1MotionMask;
+                       ButtonPressMask | ButtonReleaseMask |
+                       PointerMotionMask | Button1MotionMask;
 
     unsigned int w = kDefaultWindowW, h = kDefaultWindowH;
     int px = 0, py = 0;
@@ -933,6 +1146,19 @@ static bool CreateAppWindow(AppXrSession& xr) {
         XSetWMNormalHints(dpy, win, &hints);
     }
 
+    // Undecorated BEFORE the map (INV-1.3): a frame that is never created can
+    // neither eat rows out of the weave nor take the drag away from us. This
+    // is what makes the phase snap possible at all — a mutter
+    // _NET_WM_MOVERESIZE grab cannot be intercepted by the client, so the only
+    // way to route every move through the lattice snap is to own the move.
+    // DXR_X11_WM_DECORATIONS=1 restores the decorated, WM-dragged window and
+    // forfeits the snap (same opt-out knob as the runtime test apps).
+    {
+        const char* wm_dec = getenv("DXR_X11_WM_DECORATIONS");
+        g_clientDrag = !(wm_dec != nullptr && wm_dec[0] != '\0' && strcmp(wm_dec, "0") != 0);
+    }
+    if (g_clientDrag) X11SetUndecorated(dpy, win);
+
     XMapWindow(dpy, win);
     XFlush(dpy);
     // Re-assert the position after mapping — Mutter ignores the create-time
@@ -944,7 +1170,16 @@ static bool CreateAppWindow(AppXrSession& xr) {
     xr.xWindow = win;
     xr.xWinW = w;
     xr.xWinH = h;
-    LOG_INFO("Created %ux%u app window at (%d,%d) — XR_DXR_xlib_window_binding", w, h, px, py);
+    // Seed "where the window is now" from the honest root origin, not from the
+    // requested px/py — the WM may not have honoured them.
+    X11RootOrigin(dpy, win, &g_winDragAtX, &g_winDragAtY);
+    LOG_INFO("Created %ux%u app window at (%d,%d) [root origin (%d,%d)] — XR_DXR_xlib_window_binding",
+             w, h, px, py, g_winDragAtX, g_winDragAtY);
+    if (g_clientDrag) {
+        LOG_INFO("Window is undecorated: drag the top %d px to MOVE it (phase-snapped), "
+                 "drag anywhere else to ORBIT the scene, ESC or Q to quit "
+                 "(DXR_X11_WM_DECORATIONS=1 for a normal titlebar, unsnapped).", kTitleStripH);
+    }
     return true;
 }
 
@@ -1017,35 +1252,191 @@ static void PollFilePicker() {
     }
 }
 
-// Pump the app window's X11 events: Ctrl+O = open-scene dialog, close button =
-// clean exit, ConfigureNotify = track live window size.
+// Pump the app window's X11 events.
+//
+// PARITY NOTE. windows/main.cpp routes every message through displayxr-common's
+// UpdateInputState (input_handler.cpp), which is <windows.h>-only and cannot be
+// linked here. The bindings below are therefore transcribed from it rather than
+// invented, so a key or a drag means the same thing on both legs:
+//
+//   LMB drag (client area) orbit the scene          input_handler.cpp:98/72
+//   LMB drag (title strip)  move the window          WM_NCHITTEST -> HTCAPTION
+//   wheel                   zoom, x1.1 per notch     input_handler.cpp:130
+//   shift+wheel, +/-        3D strength (ipd)        input_handler.cpp:136, :210
+//   V                       cycle rendering mode     input_handler.cpp:252
+//   0-8                     jump to that mode        input_handler.cpp:268
+//   SPACE                   reset the view           input_handler.cpp:230
+//   M                       turntable on/off         input_handler.cpp:201
+//   F11                     fullscreen               input_handler.cpp:237
+//   ESC / Q                 quit                     windows/main.cpp:1732
+//   Ctrl+O                  open a scene             windows/main.cpp:1743
+//
+// Motion is COALESCED: the X server can queue dozens of MotionNotify per frame
+// and acting on each would issue dozens of XMoveWindow for one visible step.
+// The window drag's target is derived from the absolute pointer position, not
+// from a delta chain, so only the last one matters. The orbit drag is
+// incremental and accumulates every event, which is why the two are tracked
+// separately.
 static void PumpXEvents(AppXrSession& xr) {
     if (xr.xDisplay == nullptr) return;
+
+    bool haveWinMotion = false;
+    int winMotionRootX = 0, winMotionRootY = 0;
+
     while (XPending(xr.xDisplay) > 0) {
         XEvent ev;
         XNextEvent(xr.xDisplay, &ev);
         switch (ev.type) {
         case KeyPress: {
             KeySym sym = XLookupKeysym(&ev.xkey, 0);
-            // Ctrl+O = open a scene (uniform across demos + platforms, #74).
-            // Strict: Ctrl must be held (bare O does nothing).
-            if ((sym == XK_o || sym == XK_O) && (ev.xkey.state & ControlMask)) StartFilePicker();
-            break;
-        }
-        case ButtonPress:
-            // Camera rig only: a drag turns the SCENE about the pivot. Under
-            // the display rig these three cases are inert, so the harness's
-            // keyboard-only behaviour is unchanged.
-            if (ev.xbutton.button == Button1 && g_cameraRigActive && g_camRig.valid) {
-                g_camDragging = true;
-                g_camDragLastX = ev.xbutton.x;
-                g_camDragLastY = ev.xbutton.y;
+            const bool ctrl = (ev.xkey.state & ControlMask) != 0;
+            const bool shift = (ev.xkey.state & ShiftMask) != 0;
+            (void)shift;
+            switch (sym) {
+            case XK_o: case XK_O:
+                // Ctrl+O = open a scene (uniform across demos + platforms, #74).
+                // Strict: Ctrl must be held (bare O does nothing).
+                if (ctrl) StartFilePicker();
+                break;
+            case XK_Escape:
+            case XK_q: case XK_Q:
+                LOG_INFO("ESC/Q — exiting");
+                g_running = false;
+                break;
+            case XK_F11:
+                ToggleFullscreen(xr);
+                break;
+            case XK_v: case XK_V:
+                // Cycle to the next rendering mode. The main loop turns this
+                // into a ModeSwitch request and the sequencer fires
+                // xrRequestDisplayRenderingModeDXR on the right frame.
+                g_cycleModeRequested = true;
+                break;
+            case XK_m: case XK_M:
+                g_animateEnabled = !g_animateEnabled;
+                LOG_INFO("M: turntable %s", g_animateEnabled ? "ON" : "OFF");
+                break;
+            case XK_space:
+                // Reset the view: orbit back to rest, zoom and 3D strength back
+                // to their defaults. Windows' resetViewRequested does the same.
+                g_dispOrbitYaw = 0.0f; g_dispOrbitPitch = 0.0f;
+                g_camOrbitYaw = 0.0f;  g_camOrbitPitch = 0.0f;
+                g_scaleFactor = 1.0f;
+                g_steadyIpd = 1.0f;
+                LOG_INFO("SPACE: view reset");
+                break;
+            case XK_minus: case XK_KP_Subtract: {
+                float v = g_steadyIpd - 0.1f;
+                if (v < 0.1f) v = 0.1f;
+                g_steadyIpd = v;
+                LOG_INFO("-: 3D strength %.2f", g_steadyIpd);
+                break;
+            }
+            case XK_equal: case XK_plus: case XK_KP_Add: {
+                float v = g_steadyIpd + 0.1f;
+                if (v > 1.0f) v = 1.0f;
+                g_steadyIpd = v;
+                LOG_INFO("+: 3D strength %.2f", g_steadyIpd);
+                break;
+            }
+            case XK_0: case XK_1: case XK_2: case XK_3: case XK_4:
+            case XK_5: case XK_6: case XK_7: case XK_8: {
+                const int32_t want = (int32_t)(sym - XK_0);
+                // Mode 0 is always legal (2D); the rest only if enumerated.
+                if (want == 0 || (uint32_t)want < xr.renderingModeCount) {
+                    g_absoluteModeRequested = want;
+                } else {
+                    LOG_WARN("mode %d not advertised by this display (%u modes)",
+                             want, xr.renderingModeCount);
+                }
+                break;
+            }
+            default: break;
             }
             break;
-        case ButtonRelease:
-            if (ev.xbutton.button == Button1) g_camDragging = false;
+        }
+
+        case ButtonPress:
+            // Wheel arrives as button 4 (up) / 5 (down) on X11. x1.1 per notch,
+            // multiplicative, matching WM_MOUSEWHEEL's `factor`.
+            if (ev.xbutton.button == Button4 || ev.xbutton.button == Button5) {
+                const float factor = (ev.xbutton.button == Button4) ? 1.1f : (1.0f / 1.1f);
+                if ((ev.xbutton.state & ShiftMask) != 0) {
+                    // Shift+wheel drives the 3D-effect strength, in lockstep
+                    // with the +/- keys (input_handler.cpp:136).
+                    float v = g_steadyIpd * factor;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    g_steadyIpd = v;
+                } else {
+                    float z = g_scaleFactor * factor;
+                    if (z < 0.1f) z = 0.1f;
+                    if (z > 10.0f) z = 10.0f;
+                    g_scaleFactor = z;
+                }
+                break;
+            }
+            if (ev.xbutton.button != Button1) break;
+
+            // Title strip = move the window. There is no WM frame to aim at
+            // (that is deliberate — see CreateAppWindow), so the top
+            // kTitleStripH pixels stand in for one. Everything below it is the
+            // scene.
+            if (g_clientDrag && ev.xbutton.y < kTitleStripH) {
+                g_winDragging = true;
+                g_winDragPtrX = ev.xbutton.x_root;
+                g_winDragPtrY = ev.xbutton.y_root;
+                X11RootOrigin(xr.xDisplay, xr.xWindow, &g_winDragOriginX, &g_winDragOriginY);
+                g_winDragAtX = g_winDragOriginX;
+                g_winDragAtY = g_winDragOriginY;
+                g_winDragMoves = 0;
+                g_winDragSnapped = 0;
+                // Grab so motion OUTSIDE the window keeps arriving: the pointer
+                // routinely leaves a window being dragged fast.
+                XGrabPointer(xr.xDisplay, xr.xWindow, False,
+                             ButtonReleaseMask | PointerMotionMask | Button1MotionMask,
+                             GrabModeAsync, GrabModeAsync, None, None, CurrentTime);
+                LOG_INFO("drag: start — origin (%d, %d), pointer (%d, %d)",
+                         g_winDragOriginX, g_winDragOriginY, g_winDragPtrX, g_winDragPtrY);
+                break;
+            }
+
+            // Scene orbit. Both rigs, unlike before: the camera rig turns the
+            // SCENE about the pivot, the display rig turns the display about
+            // the subject, but a left-drag rotates the thing you are looking at
+            // on either. (This leg used to gate the whole drag on
+            // g_cameraRigActive, which meant the bundled butterfly.spz — a
+            // display-rig scene — could not be turned at all.)
+            g_camDragging = true;
+            g_dispDragging = true;
+            g_camDragLastX = ev.xbutton.x;
+            g_camDragLastY = ev.xbutton.y;
+            g_dispDragLastX = ev.xbutton.x;
+            g_dispDragLastY = ev.xbutton.y;
             break;
+
+        case ButtonRelease:
+            if (ev.xbutton.button != Button1) break;
+            if (g_winDragging) {
+                g_winDragging = false;
+                XUngrabPointer(xr.xDisplay, CurrentTime);
+                XFlush(xr.xDisplay);
+                LOG_INFO("drag: end — %llu move(s), %llu snapped away from the raw target, "
+                         "origin (%d, %d) -> (%d, %d)",
+                         g_winDragMoves, g_winDragSnapped,
+                         g_winDragOriginX, g_winDragOriginY, g_winDragAtX, g_winDragAtY);
+            }
+            g_camDragging = false;
+            g_dispDragging = false;
+            break;
+
         case MotionNotify:
+            if (g_winDragging) {
+                haveWinMotion = true;
+                winMotionRootX = ev.xmotion.x_root;
+                winMotionRootY = ev.xmotion.y_root;
+                break;
+            }
             if (g_camDragging && g_cameraRigActive && g_camRig.valid) {
                 // Gain is per canvas FRACTION (GsOrbitFromDrag's contract), so a
                 // full-width drag reaches the comfort cone and no further,
@@ -1063,8 +1454,29 @@ static void PumpXEvents(AppXrSession& xr) {
                 g_camOrbitYaw += d.yaw;
                 g_camOrbitPitch += d.pitch;
                 g_camRig.ClampOrbit(g_camOrbitYaw, g_camOrbitPitch);
+            } else if (g_dispDragging && !g_cameraRigActive) {
+                // Display rig. The camera rig's +-15 deg comfort cone is a
+                // property of photo-lifted data (no support off the capture
+                // axis) and does NOT apply to an object-centric scene, which
+                // can be turned all the way round — so yaw accumulates
+                // unclamped and only pitch is bounded, at +-85 deg, to stop the
+                // view going over the pole. Sensitivity matches Windows: a
+                // full-window drag is a half turn.
+                const float vw = (xr.xWinW > 1u) ? (float)xr.xWinW : 1.0f;
+                const float vh = (xr.xWinH > 1u) ? (float)xr.xWinH : 1.0f;
+                const float kPi = 3.14159265358979323846f;
+                const float dx = (float)(ev.xmotion.x - g_dispDragLastX) / vw;
+                const float dy = -(float)(ev.xmotion.y - g_dispDragLastY) / vh;
+                g_dispDragLastX = ev.xmotion.x;
+                g_dispDragLastY = ev.xmotion.y;
+                g_dispOrbitYaw += dx * kPi;
+                g_dispOrbitPitch += dy * kPi;
+                const float pitchCap = 85.0f * kPi / 180.0f;
+                if (g_dispOrbitPitch > pitchCap) g_dispOrbitPitch = pitchCap;
+                if (g_dispOrbitPitch < -pitchCap) g_dispOrbitPitch = -pitchCap;
             }
             break;
+
         case ConfigureNotify:
             if (ev.xconfigure.width > 0 && ev.xconfigure.height > 0) {
                 xr.xWinW = (unsigned int)ev.xconfigure.width;
@@ -1081,6 +1493,15 @@ static void PumpXEvents(AppXrSession& xr) {
             break;
         default: break;
         }
+    }
+
+    if (haveWinMotion && g_winDragging) {
+        // Absolute, not incremental: origin + (pointer now - pointer at grab).
+        // A snap that holds the window back for a few pixels therefore never
+        // makes the window lag the pointer permanently.
+        MoveWindowSnapped(xr,
+                          g_winDragOriginX + (winMotionRootX - g_winDragPtrX),
+                          g_winDragOriginY + (winMotionRootY - g_winDragPtrY));
     }
 }
 
@@ -1206,13 +1627,36 @@ int main(int argc, char** argv) {
         vkDestroyDevice(vkDevice, nullptr); vkDestroyInstance(vkInstance, nullptr);
         CleanupOpenXR(xr); return 1; }
 
-    // Settle the rendering mode ONCE, here — this leg has no mode-switch UI and
-    // issues no xrRequestDisplayRenderingModeDXR at all. Same precedence as the
-    // macOS leg: an explicit SIM_DISPLAY_OUTPUT pin wins, else the runtime's
+    // Resolve the drag-time phase snap. Optional by construction: the entry
+    // point is young (runtime #1588) and a display processor with no lattice
+    // snap answers with the target unchanged anyway, so an absent pointer is
+    // logged once and the drag is merely unsnapped. It is resolved AFTER
+    // xrCreateSession because it is a per-session query.
+    if (xr.hasWeaveExt) {
+        PFN_xrVoidFunction fn = nullptr;
+        if (xrGetInstanceProcAddr(xr.instance, "xrWeaveSnapWindowRectDXR", &fn) == XR_SUCCESS &&
+            fn != nullptr) {
+            g_pfnWeaveSnap = reinterpret_cast<PFN_xrWeaveSnapWindowRectDXR>(fn);
+        }
+    }
+    LOG_INFO("xrWeaveSnapWindowRectDXR: %s — a window drag %s",
+             g_pfnWeaveSnap != nullptr ? "RESOLVED" : "unavailable on this runtime",
+             g_pfnWeaveSnap != nullptr
+                 ? "will be phase-snapped by the display processor"
+                 : "lands on the raw pointer position (identity snap)");
+
+    // Settle the STARTUP rendering mode here. Same precedence as the macOS leg:
+    // an explicit SIM_DISPLAY_OUTPUT / --mode pin wins, else the runtime's
     // active 3D mode, else the app default (mode 1). Everything downstream —
     // tile grid, view count, view scale — keys off xr.currentRenderingMode, and
     // CreateSwapchains below sizes the atlas worst-case across all modes, so a
     // 4-view Quad fits.
+    //
+    // Unlike before, this is the STARTUP mode rather than the only one: 'V' and
+    // '0'-'8' now drive xrRequestDisplayRenderingModeDXR through the shared
+    // ModeSwitch sequencer (see the render loop). The old per-frame re-assert
+    // that made an external mode change impossible is still gone — the app
+    // issues a request only when the user asks for one.
     if (envPinnedMode >= 0) {
         if (xr.renderingModeCount > 0 && (uint32_t)envPinnedMode >= xr.renderingModeCount) {
             LOG_WARN("%s selects mode %d but the display has only %u mode(s) "
@@ -1275,9 +1719,11 @@ int main(int argc, char** argv) {
 #endif
       } }
 
-    LOG_INFO("=== Entering main loop (auto-orbit; Ctrl+C to quit) ===");
+    LOG_INFO("=== Entering main loop ===");
+    LOG_INFO("  mouse: drag = orbit | wheel = zoom | shift+wheel = 3D strength");
+    LOG_INFO("  keys:  V = cycle 2D/3D | 0-8 = pick mode | M = turntable | SPACE = reset");
+    LOG_INFO("         +/- = 3D strength | F11 = fullscreen | Ctrl+O = open | ESC/Q = quit");
 
-    float yaw = 0.0f;
     const float virtualDisplayHeight = 1.5f;
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -1304,8 +1750,61 @@ int main(int argc, char** argv) {
         // Never on the camera rig: a photo-lifted cloud has no support more than
         // ~15 deg off the capture axis, so a turntable shows floaters rather
         // than parallax — and the rest view has to stay the photograph.
-        if (!g_cameraRigActive)
-            yaw += (6.2831853f / 20.0f) * dt;   // one revolution / 20 s
+        //
+        // Also never WHILE THE USER IS DRAGGING, and only while the 'M' toggle
+        // is on. An auto-advancing yaw fights a drag: the scene would keep
+        // creeping out from under the pointer. Windows solves the same problem
+        // with an idle timer on InputState.lastInputTimeSec; the toggle is the
+        // same contract in a form this leg can honour without a HUD.
+        if (!g_cameraRigActive && g_animateEnabled && !g_dispDragging)
+            g_dispOrbitYaw += (6.2831853f / 20.0f) * dt;   // one revolution / 20 s
+
+        // ── 2D/3D mode switching ('V' / '0'-'8') ────────────────────────────
+        // Turn a key press into a ModeSwitch request, then advance the ramp.
+        // The sequencer owns the asymmetry (3D->2D flattens BEFORE switching,
+        // 2D->3D switches first and eases up) and hands back the ipdFactor to
+        // submit this frame plus the frame on which to fire the runtime call.
+        if (xr.renderingModeCount > 0 && xr.pfnRequestDisplayRenderingModeEXT != nullptr) {
+            const uint32_t cur = xr.currentRenderingMode < xr.renderingModeCount
+                                     ? xr.currentRenderingMode : 0u;
+            int32_t want = -1;
+            if (g_cycleModeRequested) {
+                want = (int32_t)((cur + 1u) % xr.renderingModeCount);
+            } else if (g_absoluteModeRequested >= 0) {
+                want = g_absoluteModeRequested;
+            }
+            g_cycleModeRequested = false;
+            g_absoluteModeRequested = -1;
+
+            if (want >= 0 && (uint32_t)want < xr.renderingModeCount) {
+                const uint32_t targetVC = xr.renderingModeViewCounts[want];
+                const uint32_t currentVC = xr.renderingModeViewCounts[cur];
+                LOG_INFO("mode switch requested: %u (%u view%s) -> %d (%u view%s)",
+                         cur, currentVC, currentVC == 1 ? "" : "s",
+                         want, targetVC, targetVC == 1 ? "" : "s");
+                g_modeSwitch.request((uint32_t)want, targetVC, cur, currentVC,
+                                     g_ipdFactor, g_steadyIpd);
+            }
+
+            float rampIpd = g_steadyIpd;
+            bool fire = false;
+            uint32_t fireMode = cur;
+            g_modeSwitch.update(dt, &rampIpd, &fire, &fireMode);
+            g_ipdFactor = rampIpd;
+            if (fire && fireMode != xr.currentRenderingMode) {
+                const XrResult mr = xr.pfnRequestDisplayRenderingModeEXT(xr.session, fireMode);
+                if (XR_SUCCEEDED(mr)) {
+                    xr.currentRenderingMode = fireMode;
+                    LOG_INFO("rendering mode -> %u", fireMode);
+                } else {
+                    LOG_WARN("xrRequestDisplayRenderingModeDXR(%u) failed: %d", fireMode, (int)mr);
+                }
+            }
+        } else {
+            // No mode-switch entry point (or no enumerated modes): the ramp has
+            // nothing to sequence, so the strength knob applies directly.
+            g_ipdFactor = g_steadyIpd;
+        }
 
         XrFrameState fs;
         if (!BeginFrame(xr, fs)) continue;
@@ -1347,7 +1846,10 @@ int main(int argc, char** argv) {
                 }
                 cameraPose.position = {rigPos[0], rigPos[1], rigPos[2]};
             } else {
-                quat_from_yaw_pitch(yaw, 0.0f, &cameraPose.orientation);
+                // Display rig: the turntable and the left-drag orbit are the
+                // same two angles, so a drag simply moves where the turntable
+                // resumes from rather than fighting it.
+                quat_from_yaw_pitch(g_dispOrbitYaw, g_dispOrbitPitch, &cameraPose.orientation);
                 cameraPose.position = {0, 0, 0};
             }
 
@@ -1386,7 +1888,10 @@ int main(int argc, char** argv) {
                 // scales the tracked eyes; metersToVirtual is 1 because a lifted
                 // scene is already metric.
                 camRigDesc.pose = cameraPose;
-                camRigDesc.ipdFactor = g_camRig.IpdScale(g_camRigMeasuredIpdM);
+                // The ramp is a [0,1] STRENGTH multiplier here, not the
+                // absolute scale: IpdScale() already carries the capture
+                // baseline, and 'V' must still be able to flatten it to zero.
+                camRigDesc.ipdFactor = g_camRig.IpdScale(g_camRigMeasuredIpdM) * g_ipdFactor;
                 camRigDesc.parallaxFactor = 1.0f;
                 camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters();
                 camRigDesc.verticalFov = g_camRig.VerticalFovRad(canvasAspect);
@@ -1395,8 +1900,13 @@ int main(int argc, char** argv) {
                 viewState.next = &viewRigRaw;
             } else if (useRig) {
                 displayRig.pose = cameraPose;
-                displayRig.virtualDisplayHeight = virtualDisplayHeight;
-                displayRig.ipdFactor = 1.0f;
+                // rigVH = virtualDisplayHeight / scaleFactor — the same
+                // arithmetic the Windows leg uses (windows/main.cpp:2339), so
+                // a wheel notch means the same thing on both: a bigger
+                // scaleFactor is a SMALLER virtual display, i.e. a bigger
+                // subject.
+                displayRig.virtualDisplayHeight = virtualDisplayHeight / g_scaleFactor;
+                displayRig.ipdFactor = g_ipdFactor;
                 displayRig.parallaxFactor = 1.0f;
                 displayRig.perspectiveFactor = 1.0f;
                 locateInfo.next = &displayRig;
