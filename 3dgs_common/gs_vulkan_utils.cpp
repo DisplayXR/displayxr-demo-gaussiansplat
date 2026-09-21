@@ -200,3 +200,52 @@ bool gsUploadBuffer(VkDevice device,
     gsDestroyBuffer(device, staging);
     return true;
 }
+
+// ── Radix-sort subgroup-size precondition ──────────────────────────────────
+// Contract and rationale: gs_vulkan_utils.h.
+
+//! WORKGROUP_SIZE / RADIX_SORT_BINS in shaders/sort.comp. Both are 256 there
+//! and the arithmetic below assumes it, so keep them equal to the shader.
+static const uint32_t kGsSortWorkgroupSize = 256;
+
+bool gsSortSubgroupSizeSupported(uint32_t subgroupSize, const char** whyNot) {
+    const char* why = nullptr;
+    bool ok = true;
+    if (subgroupSize == 0 || (subgroupSize & (subgroupSize - 1)) != 0) {
+        why = "not a power of two"; ok = false;
+    } else if (subgroupSize > kGsSortWorkgroupSize) {
+        why = "larger than the 256-thread workgroup (sums[] would be zero-length)"; ok = false;
+    } else if (subgroupSize < 16) {
+        // 256 / s subgroups must fit in one subgroup for the cross-subgroup
+        // scan's subgroupBroadcast(.., gl_SubgroupID) to be in range.
+        why = "below 16, so the 256/s subgroup sums cannot be scanned inside one subgroup";
+        ok = false;
+    }
+    if (whyNot != nullptr) *whyNot = why;
+    return ok;
+}
+
+uint32_t gsPickSortSubgroupSize(uint32_t minSubgroupSize, uint32_t maxSubgroupSize) {
+    if (minSubgroupSize == 0 || maxSubgroupSize < minSubgroupSize) return 0;
+    // Prefer the LARGEST legal size in range: fewer subgroups means a shorter
+    // cross-subgroup scan, and it is what every device that reports a sane
+    // default already uses.
+    for (uint32_t s = kGsSortWorkgroupSize; s >= 1; s >>= 1) {
+        if (s < minSubgroupSize || s > maxSubgroupSize) continue;
+        if (gsSortSubgroupSizeSupported(s, nullptr)) return s;
+    }
+    return 0;
+}
+
+bool gsSpirvAllowsVaryingSubgroupSize(const void* spirv, size_t byteSize) {
+    // SPIR-V header: word 0 magic (0x07230203), word 1 version as
+    // 0x00MMmm00. Anything malformed is reported as "varying allowed" — the
+    // conservative answer, because it makes the caller complain rather than
+    // assume a guarantee it cannot verify.
+    if (spirv == nullptr || byteSize < 8) return true;
+    const uint32_t* w = static_cast<const uint32_t*>(spirv);
+    if (w[0] != 0x07230203u) return true;
+    const uint32_t major = (w[1] >> 16) & 0xffu;
+    const uint32_t minor = (w[1] >> 8) & 0xffu;
+    return (major > 1u) || (major == 1u && minor >= 6u);
+}

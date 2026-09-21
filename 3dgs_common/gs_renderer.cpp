@@ -23,8 +23,10 @@
 #if defined(__ANDROID__)
 #  include <android/log.h>
 #  define GS_LOGI(...) __android_log_print(ANDROID_LOG_INFO, "gausssplat_vk_android", __VA_ARGS__)
+#  define GS_LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "gausssplat_vk_android", __VA_ARGS__)
 #else
 #  define GS_LOGI(...) do { printf(__VA_ARGS__); printf("\n"); } while (0)
+#  define GS_LOGE(...) do { fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); } while (0)
 #endif
 #include <cstring>
 #include <cmath>
@@ -215,6 +217,43 @@ bool GsRenderer::init(VkInstance instance,
     vkGetPhysicalDeviceProperties2(instance_ ? physDevice_ : VK_NULL_HANDLE, &props2);
     subgroupSize_ = subgroupProps.subgroupSize;
     if (subgroupSize_ == 0) subgroupSize_ = 32;
+
+    // Validate the radix sort's subgroup-size precondition BEFORE anything
+    // else is built. sort.comp sizes shared memory from this number and scans
+    // the per-subgroup sums inside one subgroup, so a value outside
+    // {16,32,64,128,256} mis-sorts the splat list silently — wrong
+    // back-to-front order, garbled compositing, and no validation-layer
+    // message, because every individual Vulkan call stays legal. See
+    // gs_vulkan_utils.h for the derivation.
+    //
+    // Two separate failure modes, both silent, both checked here.
+    {
+        const char* why = nullptr;
+        if (!gsSortSubgroupSizeSupported(subgroupSize_, &why)) {
+            GS_LOGE("GsRenderer: subgroup size %u is unusable by the radix sort (%s). "
+                     "shaders/sort.comp needs a power of two in [16, 256]. "
+                     "Refusing to init rather than rendering a mis-sorted scene.",
+                     subgroupSize_, why ? why : "unsupported");
+            return false;
+        }
+        // The spec constant must also MATCH the size the driver actually
+        // dispatches, and that is only guaranteed while the SPIR-V is older
+        // than 1.6 — see gsSpirvAllowsVaryingSubgroupSize for the spec rule
+        // and the measurement. 3dgs_common/CMakeLists.txt pins
+        // --target-env vulkan1.2 (SPIR-V 1.5) for exactly this reason; the
+        // check is here because a build-system pin is not evidence, and the
+        // symptom of losing it is a garbled scene with no error anywhere.
+        if (gsSpirvAllowsVaryingSubgroupSize(sort_comp_data, sizeof(sort_comp_data))) {
+            GS_LOGE("GsRenderer: shaders/sort.comp was compiled to SPIR-V 1.6 or newer, which "
+                     "implicitly allows a VARYING subgroup size — the size specialized "
+                     "into the shader (%u) may then not be the size dispatched, and the "
+                     "radix sort's shared memory is indexed past its end. Pin "
+                     "--target-env vulkan1.2 in 3dgs_common/CMakeLists.txt, or supply "
+                     "VkPipelineShaderStageRequiredSubgroupSizeCreateInfo.",
+                     subgroupSize_);
+            return false;
+        }
+    }
 
     // GPU timestamp support: timestampPeriod (ns/tick) is a device limit, but
     // timestamps only work on a queue whose family reports timestampValidBits>0.
