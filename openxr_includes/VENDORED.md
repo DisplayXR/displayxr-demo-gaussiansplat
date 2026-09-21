@@ -73,7 +73,14 @@ informational — only a pin *mismatch* fails CI).
 
 Refreshed in the #61 pass: `XR_DXR_xlib_window_binding.h`.
 
-## `dxr_view_config.h` — NOT part of the pinned vendor dir
+## `dxr_view_config.h` — REMOVED (now from displayxr-common)
+
+This file no longer exists here. Since runtime#1612 every leg takes
+`dxr_view_config.h` (`DxrSelectViewConfigType` + `DxrAliasInactiveViews`) from
+displayxr-common's `common/` directory — one implementation shared by every
+demo. The history below is kept for context only.
+
+### Historical note
 
 `openxr_includes/dxr_view_config.h` sits one level **above** `openxr/`, and
 `VENDORED.json` does not cover it. It is a DisplayXR *app* helper

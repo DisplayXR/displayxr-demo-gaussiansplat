@@ -139,6 +139,21 @@ target_include_directories(native_app_glue PUBLIC
 
 find_package(OpenXR REQUIRED CONFIG)
 
+# displayxr-common's header-only view-configuration helper
+# (common/dxr_view_config.h: DxrSelectViewConfigType) — the SAME header the
+# desktop legs reach through displayxr::rules, so there is one implementation
+# (runtime#1612). Fetch sources only; don't run its CMake, which carries
+# desktop platform deps. Keep the pin identical to common/CMakeLists.txt.
+# TODO(runtime #1612): TEMPORARY pin to displayxr-common PR #50's commit. Repin to the release tag that contains DxrAliasInactiveViews (and restore GIT_SHALLOW TRUE) BEFORE this PR merges.
+FetchContent_Declare(displayxr_common_rules
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG 7a5acac5b15b6826cd88aa9ef616a8b480270bed
+    GIT_SHALLOW FALSE)
+FetchContent_GetProperties(displayxr_common_rules)
+if(NOT displayxr_common_rules_POPULATED)
+    FetchContent_Populate(displayxr_common_rules)
+endif()
+
 add_library(gausssplat_vk_android SHARED
     main.cpp
     # ── Adreno/TBDR-native renderer (3dgs_common/) — NOT the desktop
@@ -165,7 +180,8 @@ target_include_directories(gausssplat_vk_android PRIVATE
     ${CMAKE_CURRENT_BINARY_DIR}                 # generated *.comp.h
     ${GS_COMMON}                                # gs_renderer.h, ...
     ${libwebp_SOURCE_DIR}/src                   # webp/decode.h for gs_sog_loader
-    ${REPO_ROOT}/openxr_includes)               # DisplayXR XR_EXT_* headers
+    ${REPO_ROOT}/openxr_includes                # DisplayXR XR_EXT_* headers
+    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h (displayxr-common, runtime#1612)
 
 set_target_properties(gausssplat_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")

@@ -43,7 +43,7 @@
 #include <openxr/XR_DXR_display_info.h>
 #include <openxr/XR_DXR_view_rig.h>
 #include <openxr/XR_DXR_xlib_window_binding.h>
-#include "../openxr_includes/dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
+#include "dxr_view_config.h"   // DxrSelectViewConfigType + DxrAliasInactiveViews (displayxr::rules; runtime#1486, ADR-041)
 
 #include <cmath>
 #include <csignal>
@@ -1519,8 +1519,8 @@ int main(int argc, char** argv) {
                     ? xr.renderingModeTileRows[mode] : 1u;
                 int eyeCount = monoMode ? 1 : (int)modeViewCount;
 
-                // runtime#1486 INV-3.1: eyeCount is what gets rendered AND what
-                // reaches xrEndFrame (projectionViews is sized from it), so it is the
+                // runtime#1486 INV-3.1: eyeCount is what gets RENDERED (the layer
+                // itself carries every located view — ADR-041, below), so it is the
                 // single place to reconcile the counts that can disagree: the active
                 // mode's view count, the count xrLocateViews returned (modeViewCount is
                 // already clamped to it above), and the number of tiles the swapchain
@@ -1561,7 +1561,16 @@ int main(int argc, char** argv) {
 
                 uint32_t imageIndex;
                 if (AcquireSwapchainImage(xr, imageIndex)) {
-                    projectionViews.assign((size_t)eyeCount, {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
+                    // ADR-041 (runtime#1612): the layer carries EVERY located view;
+                    // only [0, eyeCount) are rendered and the tail is aliased onto
+                    // view 0 after the loop. Under PRIMARY_MULTIVIEW_DXR xrEndFrame
+                    // refuses anything shorter, so a 1-view (2D) frame submitted as
+                    // one view was dropped outright — the panel went 2D while still
+                    // showing the last woven 3D frame. The max() only matters if the
+                    // locate returned 0 views (eyeCount is floored at 1).
+                    projectionViews.assign(
+                        (size_t)(runtimeViewCount > (uint32_t)eyeCount ? runtimeViewCount : (uint32_t)eyeCount),
+                        {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                     VkImage targetImage = swapchainImages[imageIndex].image;
                     VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
@@ -1639,6 +1648,7 @@ int main(int argc, char** argv) {
                                 clipNear, clipFar, /*clipFadeFrac=*/0.15f);
                         }
                     }
+                    DxrAliasInactiveViews(projectionViews.data(), views, runtimeViewCount, (uint32_t)eyeCount);
                     ReleaseSwapchainImage(xr);
                 }
             }

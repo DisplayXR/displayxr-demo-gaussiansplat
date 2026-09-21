@@ -124,20 +124,27 @@ that does not advertise the new type, so it is safe to call unconditionally —
 but it needs `XR_DXR_display_info` **enabled on the instance**, which is what
 makes the runtime enumerate the type at all.
 
-The helper is vendored at `openxr_includes/dxr_view_config.h` — deliberately one
-level above `openxr/`, because `openxr_includes/` is the single include
-directory all four legs share and it is *not* part of the byte-pinned
-`VENDORED.json` vendor dir (see `openxr_includes/VENDORED.md`). On Windows the
+The helper comes from **displayxr-common** (`common/dxr_view_config.h`) — the one
+implementation, not a local copy (runtime#1612). The desktop legs reach it through
+`displayxr::rules` (via `sr_common_base`); the Android leg, which does not build
+displayxr-common, fetches the same pinned commit sources-only in
+`android/src/main/cpp/CMakeLists.txt` and appends its `common/` dir. Keep the two
+pins identical. On Windows the
 variable is `XrSessionManager::viewConfigType` from `displayxr-common` (which
 already routes it into all four calls since v2.13.0); macOS/Linux/Android carry
 their own session code and their own variable.
 
-**Never submit more views than were located.** `submitViewCount` is clamped to
+**Render the active views, submit every located view (ADR-041, runtime#1612).**
+The number of views *rendered* is clamped to
 `min(active mode's view count, xrLocateViews' returned count, views actually
 written into `projectionViews[]`, swapchain slice/tile capacity)`, floored at 1
 (dropping to `layerCount = 0` blanks the display) and logged **once** per
-distinct disagreement — never per-frame. INV-3.1; `scripts/check_displayxr_app.py`
-enforces the opt-in.
+distinct disagreement — never per-frame (INV-3.1). The projection **layer**
+nevertheless carries *every* located view: `DxrAliasInactiveViews` points the
+unrendered tail at view 0's subimage. Under `PRIMARY_MULTIVIEW_DXR` the runtime
+rejects a shorter layer, so a 2D (1-view) frame submitted as one view is dropped
+and the panel keeps its last woven 3D frame — a frozen double image.
+`scripts/check_displayxr_app.py` enforces the opt-in and the aliasing.
 
 The **Android leg is stereo-fixed** (`kViewCount = 2` sizes `g_views[]`,
 `projection_views[]` and the whole render path). It opts in for uniformity, and
