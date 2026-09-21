@@ -183,6 +183,10 @@ static float g_dispOrbitPitch = 0.0f;   //!< display-rig pitch, radians (drag on
 static bool  g_dispDragging = false;
 static int   g_dispDragLastX = 0, g_dispDragLastY = 0;
 static bool  g_animateEnabled = true;   //!< 'M': turntable on/off (on = the old behaviour)
+static bool  g_animationActive = false; //!< derived: animateEnabled && idle > 10 s
+//! Wall-clock of the last user input, seconds. The turntable's 10 s idle gate
+//! reads it; MarkUserInput() resets it. Mirrors InputState::lastInputTimeSec.
+static double g_lastInputTimeSec = 0.0;
 static float g_scaleFactor = 1.0f;      //!< wheel zoom, [0.1, 10] (Windows: viewParams.scaleFactor)
 static float g_steadyIpd = 1.0f;        //!< '+/-' and shift+wheel 3D strength, [0.1, 1]
 static float g_ipdFactor = 1.0f;        //!< live ipdFactor, driven by the ModeSwitch ramp
@@ -1252,6 +1256,22 @@ static void PollFilePicker() {
     }
 }
 
+//! Monotonic seconds. The turntable's idle gate is a duration, so a steady
+//! clock is what it needs — not wall time, which can step.
+static double NowSec() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+//! Every input resets the turntable's idle countdown (input_handler.cpp's
+//! MarkUserInput). Note WHICH events count on Windows: a key press, a wheel
+//! notch, a button press, and a mouse MOVE ONLY WHILE DRAGGING — a bare
+//! hover does not. Transcribed rather than broadened, because a hover-resets
+//! version would mean the turntable never starts on a machine whose pointer
+//! sits over the window.
+static void MarkUserInput() { g_lastInputTimeSec = NowSec(); }
+
 // Pump the app window's X11 events.
 //
 // PARITY NOTE. windows/main.cpp routes every message through displayxr-common's
@@ -1288,6 +1308,7 @@ static void PumpXEvents(AppXrSession& xr) {
         XNextEvent(xr.xDisplay, &ev);
         switch (ev.type) {
         case KeyPress: {
+            MarkUserInput();
             KeySym sym = XLookupKeysym(&ev.xkey, 0);
             const bool ctrl = (ev.xkey.state & ControlMask) != 0;
             const bool shift = (ev.xkey.state & ShiftMask) != 0;
@@ -1300,8 +1321,16 @@ static void PumpXEvents(AppXrSession& xr) {
                 break;
             case XK_Escape:
             case XK_q: case XK_Q:
+                // Graceful, like the Windows WM_CLOSE path: ask the runtime to
+                // end the session and let the state machine drain, rather than
+                // dropping the loop from under an in-flight frame. The hard
+                // stop is the fallback when there is no running session.
                 LOG_INFO("ESC/Q — exiting");
-                g_running = false;
+                if (xr.session != XR_NULL_HANDLE && xr.sessionRunning) {
+                    xrRequestExitSession(xr.session);
+                } else {
+                    g_running = false;
+                }
                 break;
             case XK_F11:
                 ToggleFullscreen(xr);
@@ -1323,6 +1352,7 @@ static void PumpXEvents(AppXrSession& xr) {
                 g_camOrbitYaw = 0.0f;  g_camOrbitPitch = 0.0f;
                 g_scaleFactor = 1.0f;
                 g_steadyIpd = 1.0f;
+                MarkUserInput();
                 LOG_INFO("SPACE: view reset");
                 break;
             case XK_minus: case XK_KP_Subtract: {
@@ -1357,6 +1387,7 @@ static void PumpXEvents(AppXrSession& xr) {
         }
 
         case ButtonPress:
+            MarkUserInput();
             // Wheel arrives as button 4 (up) / 5 (down) on X11. x1.1 per notch,
             // multiplicative, matching WM_MOUSEWHEEL's `factor`.
             if (ev.xbutton.button == Button4 || ev.xbutton.button == Button5) {
@@ -1438,6 +1469,7 @@ static void PumpXEvents(AppXrSession& xr) {
                 break;
             }
             if (g_camDragging && g_cameraRigActive && g_camRig.valid) {
+                MarkUserInput();
                 // Gain is per canvas FRACTION (GsOrbitFromDrag's contract), so a
                 // full-width drag reaches the comfort cone and no further,
                 // whatever the window size. Turntable sign and the cone are the
@@ -1454,26 +1486,28 @@ static void PumpXEvents(AppXrSession& xr) {
                 g_camOrbitYaw += d.yaw;
                 g_camOrbitPitch += d.pitch;
                 g_camRig.ClampOrbit(g_camOrbitYaw, g_camOrbitPitch);
-            } else if (g_dispDragging && !g_cameraRigActive) {
-                // Display rig. The camera rig's +-15 deg comfort cone is a
-                // property of photo-lifted data (no support off the capture
-                // axis) and does NOT apply to an object-centric scene, which
-                // can be turned all the way round — so yaw accumulates
-                // unclamped and only pitch is bounded, at +-85 deg, to stop the
-                // view going over the pole. Sensitivity matches Windows: a
-                // full-window drag is a half turn.
-                const float vw = (xr.xWinW > 1u) ? (float)xr.xWinW : 1.0f;
-                const float vh = (xr.xWinH > 1u) ? (float)xr.xWinH : 1.0f;
-                const float kPi = 3.14159265358979323846f;
-                const float dx = (float)(ev.xmotion.x - g_dispDragLastX) / vw;
-                const float dy = -(float)(ev.xmotion.y - g_dispDragLastY) / vh;
+            } else if (g_dispDragging) {
+                MarkUserInput();
+                // Display rig — transcribed verbatim from input_handler.cpp:72-89,
+                // including the things that look arbitrary:
+                //   * 0.005 rad PER CLIENT PIXEL on both axes, with no window-size
+                //     or DPI normalisation (unlike the camera rig, whose gain is
+                //     per canvas fraction because its cone is absolute).
+                //   * BOTH signs negative — camera-orbit convention, the scene
+                //     appears to move opposite the finger. Note this is the
+                //     opposite sense from the camera rig's turntable above, which
+                //     is deliberate on Windows too.
+                //   * pitch clamped to +-1.4 rad (80.21 deg), yaw unclamped and
+                //     never wrapped.
+                // Incremental, with the anchor rewritten every motion event.
+                const int dx = ev.xmotion.x - g_dispDragLastX;
+                const int dy = ev.xmotion.y - g_dispDragLastY;
                 g_dispDragLastX = ev.xmotion.x;
                 g_dispDragLastY = ev.xmotion.y;
-                g_dispOrbitYaw += dx * kPi;
-                g_dispOrbitPitch += dy * kPi;
-                const float pitchCap = 85.0f * kPi / 180.0f;
-                if (g_dispOrbitPitch > pitchCap) g_dispOrbitPitch = pitchCap;
-                if (g_dispOrbitPitch < -pitchCap) g_dispOrbitPitch = -pitchCap;
+                g_dispOrbitYaw -= (float)dx * 0.005f;
+                g_dispOrbitPitch -= (float)dy * 0.005f;
+                if (g_dispOrbitPitch > 1.4f) g_dispOrbitPitch = 1.4f;
+                if (g_dispOrbitPitch < -1.4f) g_dispOrbitPitch = -1.4f;
             }
             break;
 
@@ -1726,6 +1760,10 @@ int main(int argc, char** argv) {
 
     const float virtualDisplayHeight = 1.5f;
     auto lastTime = std::chrono::high_resolution_clock::now();
+    // Seed the idle clock so the turntable starts 10 s after launch rather
+    // than on frame 1 — the same shape as Windows, where lastInputTimeSec is
+    // stamped by the startup pose application.
+    MarkUserInput();
 
     while (g_running && !xr.exitRequested) {
         PollEvents(xr);
@@ -1756,8 +1794,19 @@ int main(int argc, char** argv) {
         // creeping out from under the pointer. Windows solves the same problem
         // with an idle timer on InputState.lastInputTimeSec; the toggle is the
         // same contract in a form this leg can honour without a HUD.
-        if (!g_cameraRigActive && g_animateEnabled && !g_dispDragging)
-            g_dispOrbitYaw += (6.2831853f / 20.0f) * dt;   // one revolution / 20 s
+        // input_handler.cpp:460-470: the turntable only runs after the user has
+        // been idle for more than 10 s, and every input resets the clock. That
+        // is what lets an auto-orbit coexist with a drag instead of fighting
+        // it. Rate and sign are the shared handler's: +18 deg/s, which is the
+        // OPPOSITE sense from a rightward display-rig drag (also true on
+        // Windows).
+        g_animationActive = false;
+        if (!g_cameraRigActive && g_animateEnabled && g_lastInputTimeSec > 0.0) {
+            const double idleFor = NowSec() - g_lastInputTimeSec;
+            g_animationActive = (idleFor > 10.0);
+            if (g_animationActive)
+                g_dispOrbitYaw += (6.2831853f / 20.0f) * dt;   // one revolution / 20 s
+        }
 
         // ── 2D/3D mode switching ('V' / '0'-'8') ────────────────────────────
         // Turn a key press into a ModeSwitch request, then advance the ramp.
@@ -1767,12 +1816,12 @@ int main(int argc, char** argv) {
         if (xr.renderingModeCount > 0 && xr.pfnRequestDisplayRenderingModeEXT != nullptr) {
             const uint32_t cur = xr.currentRenderingMode < xr.renderingModeCount
                                      ? xr.currentRenderingMode : 0u;
+            // Cycle first, then let an absolute request OVERRIDE it — the
+            // order in xr_session_common.cpp:394-451. It matters when both
+            // land in one frame.
             int32_t want = -1;
-            if (g_cycleModeRequested) {
-                want = (int32_t)((cur + 1u) % xr.renderingModeCount);
-            } else if (g_absoluteModeRequested >= 0) {
-                want = g_absoluteModeRequested;
-            }
+            if (g_cycleModeRequested) want = (int32_t)((cur + 1u) % xr.renderingModeCount);
+            if (g_absoluteModeRequested >= 0) want = g_absoluteModeRequested;
             g_cycleModeRequested = false;
             g_absoluteModeRequested = -1;
 
