@@ -182,6 +182,33 @@ set(SHADER_SOURCES
 )
 
 set(SHADER_HEADERS "")
+# SPIR-V target env — a CORRECTNESS pin, not a compatibility one.
+#
+# shaders/sort.comp specializes a shared-memory array size from the reported
+# subgroup size, so it needs the size it was specialized with to be the size
+# the driver actually dispatches. The Vulkan spec grants that only while
+# varying subgroup size is NOT allowed, and it lists SPIR-V >= 1.6 as one of
+# the three things that allow it — no flag, no pNext, just the module version.
+# glslangValidator emits SPIR-V 1.6 for --target-env vulkan1.3.
+#
+# Measured on the Linux target hardware (Intel PTL, Mesa 26.0.8): at SPIR-V
+# 1.5 the driver honours the reported 32; at SPIR-V 1.6 with identical
+# pipeline state it reports 32 and dispatches 16. The symptom is a
+# mis-sorted, garbled splat list with no validation error at all.
+#
+# So bumping this needs the requiredSubgroupSize pin to land first. The
+# renderers re-check the emitted module at init (gsSpirvAllowsVaryingSubgroupSize)
+# because a build-system pin is not evidence.
+set(GS_SPIRV_TARGET_ENV "vulkan1.2" CACHE STRING
+    "glslangValidator --target-env. Must stay <= vulkan1.2 (SPIR-V <= 1.5) — see above.")
+if(NOT GS_SPIRV_TARGET_ENV MATCHES "^vulkan1\\.[012]$")
+    message(FATAL_ERROR
+        "GS_SPIRV_TARGET_ENV='${GS_SPIRV_TARGET_ENV}' emits SPIR-V 1.6+, which implicitly "
+        "allows a varying subgroup size and breaks shaders/sort.comp's shared-memory "
+        "sizing. Keep vulkan1.0/1.1/1.2, or add "
+        "VkPipelineShaderStageRequiredSubgroupSizeCreateInfo to both renderers first.")
+endif()
+
 foreach(GLSL_REL ${SHADER_SOURCES})
     get_filename_component(GLSL_NAME ${GLSL_REL} NAME)
     string(MAKE_C_IDENTIFIER ${GLSL_NAME} IDENTIFIER)
@@ -191,7 +218,7 @@ foreach(GLSL_REL ${SHADER_SOURCES})
     add_custom_command(
         OUTPUT ${HEADER}
         COMMAND ${GLSLANGVALIDATOR_COMMAND}
-            -V --target-env vulkan1.2
+            -V --target-env ${GS_SPIRV_TARGET_ENV}
             -I${SHADER_INCLUDE_DIR}
             ${GLSL_SRC}
             --vn ${VARNAME}

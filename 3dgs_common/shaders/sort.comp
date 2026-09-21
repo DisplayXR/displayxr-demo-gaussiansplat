@@ -17,6 +17,33 @@
 #define BITS 32
 #define key_t uint
 
+// SUBGROUP_SIZE is specialized by the host from
+// VkPhysicalDeviceSubgroupProperties::subgroupSize. It has TWO hard
+// preconditions, both of which this shader assumes silently and neither of
+// which the GLSL can assert:
+//
+//   1. It must EQUAL the real subgroup size at dispatch, and must divide
+//      WORKGROUP_SIZE. `sums` below is indexed by gl_SubgroupID, so a
+//      disagreement writes past the end of shared memory. Holding that is
+//      subtler than it looks: the host creates the pipeline without
+//      ALLOW_VARYING_SUBGROUP_SIZE and without a requiredSubgroupSize, but
+//      the spec ALSO allows a varying size whenever the module is SPIR-V 1.6
+//      or newer — no flag needed. CMakeLists.txt therefore pins
+//      --target-env vulkan1.2 (SPIR-V 1.5) and the host re-checks the emitted
+//      module version at init. Measured: on Intel PTL / Mesa 26.0.8 a SPIR-V
+//      1.6 build of this shader reports 32 and dispatches 16.
+//
+//   2. It must be >= 16. The cross-subgroup scan below reduces the
+//      RADIX_SORT_BINS / SUBGROUP_SIZE per-subgroup sums INSIDE ONE SUBGROUP
+//      and broadcasts lane gl_SubgroupID, which requires
+//      256 / SUBGROUP_SIZE <= SUBGROUP_SIZE. Nothing guarantees this one:
+//      llvmpipe reports 8. Below 16 the broadcast index runs past
+//      gl_SubgroupSize (undefined) and most of the bin sums are dropped, and
+//      the result is a silently mis-sorted key array — no validation error.
+//
+// Legal set: {16, 32, 64, 128, 256}. The host checks it in
+// gsSortSubgroupSizeSupported() (gs_vulkan_utils.h) and refuses to init
+// otherwise, so this shader is never dispatched with a size it cannot honour.
 layout (constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 layout (local_size_x = WORKGROUP_SIZE) in;
