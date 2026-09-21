@@ -70,27 +70,23 @@ cmake --build build
 BIN="$REPO_ROOT/build/linux/gaussian_splatting_handle_vk_linux"
 [ -x "$BIN" ] || { echo "Error: expected binary not found at $BIN" >&2; exit 1; }
 
-# --- 2. emit a run script pinned to a dev runtime -------------------------
-# On-screen validation is a later pass (needs the Linux runtime + a GPU + an X
-# server). This wires the dev runtime manifest + sim-display plug-in dir the
-# same way the macOS run_*.sh scripts do.
-RUN="$REPO_ROOT/build/run_gaussiansplat_linux.sh"
-cat > "$RUN" <<'EOF'
-#!/usr/bin/env bash
-# Run the Linux Gaussian Splat demo against a dev DisplayXR runtime.
-# Point XR_RUNTIME_JSON at the dev runtime manifest and XRT_PLUGIN_SEARCH_PATH
-# at the sim-display plug-in dir before running. Overridable via the env.
-set -euo pipefail
-DIR="$(cd "$(dirname "$0")" && pwd)"
-: "${XR_RUNTIME_JSON:=$HOME/.config/openxr/1/active_runtime.json}"
-: "${XRT_PLUGIN_SEARCH_PATH:=/usr/local/lib/displayxr/plugins}"
-: "${SIM_DISPLAY_OUTPUT:=anaglyph}"
-export XR_RUNTIME_JSON XRT_PLUGIN_SEARCH_PATH SIM_DISPLAY_OUTPUT
-export OXR_ENABLE_VK_NATIVE_COMPOSITOR=1
-exec "$DIR/linux/gaussian_splatting_handle_vk_linux" "$@"
-EOF
-chmod +x "$RUN"
+# --- 2. point at the canonical run script ---------------------------------
+# The run script is a TRACKED file at scripts/run_gaussiansplat_linux.sh, not
+# a heredoc emitted into build/. Two reasons: the runtime's
+# scripts/run_linux_demo.sh harness only looks in the demo's scripts/ dir
+# (maxdepth 1) and hard-errors when it finds nothing there, and a generated
+# copy is invisible to review — which is how the previous one came to default
+# XR_RUNTIME_JSON to $HOME/.config/openxr/1/active_runtime.json and
+# XRT_PLUGIN_SEARCH_PATH to /usr/local/lib/displayxr/plugins. Neither path
+# exists on a from-source dev box: the first silently loads whatever runtime
+# is installed instead of the one just built, and the second presents as "no
+# display processor found" at xrCreateInstance.
+RUN="$REPO_ROOT/scripts/run_gaussiansplat_linux.sh"
 
 echo ""
 echo "Built: $BIN"
-echo "Run against a dev runtime: $RUN"
+if [ -x "$RUN" ]; then
+    echo "Run against a dev runtime: $RUN"
+else
+    echo "warning: $RUN is missing — the runtime's run_linux_demo.sh harness needs it" >&2
+fi
