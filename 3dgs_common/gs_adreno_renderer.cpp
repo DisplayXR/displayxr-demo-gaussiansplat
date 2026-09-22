@@ -202,6 +202,12 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
             return false;
         }
     }
+    // Can this device back an _SRGB internal colour target aliased as UNORM?
+    // Decides what syncRenderTargetEncoding() may do when the swapchain turns
+    // out to be _SRGB (macOS/Apple-Silicon picks one; Android picks UNORM).
+    mutableSrgbOk_ = gsMutableSrgbTargetSupported(
+        physDevice_, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
     timestampPeriod_ = p2.properties.limits.timestampPeriod;
     {
         uint32_t n = 0;
@@ -487,12 +493,11 @@ bool GsAdrenoRenderer::createSceneResources() {
     if (numSortWorkgroups_ == 0) numSortWorkgroups_ = 1;
     // Internal scaled render target (full size; only the scaled sub-rect used)
     // + radix histogram — both per slot (draw/blit and sort run per frame).
+    // renderImage_[] itself is created with the framebuffers below, once the
+    // render pass exists (createRenderTargets()).
     for (uint32_t s = 0; s < kFrameRing; s++) {
         histBuffer_[s] = gsCreateBuffer(device_, physDevice_,
             (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssbo, devLocal);
-        renderImage_[s] = gsCreateImage2D(device_, physDevice_, width_, height_,
-            VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     }
 
     // Pre-cull silhouette coverage (#112) — ~1 texel per 16x16 render pixels,
@@ -583,6 +588,9 @@ bool GsAdrenoRenderer::createSceneResources() {
 
     // ── Render pass: single colour attachment = renderImage_ ──
     {
+        // The attachment format is the VIEW's, which is always UNORM so the
+        // fragment output is stored raw (see syncRenderTargetEncoding). It is
+        // deliberately NOT renderImageFormat_.
         VkAttachmentDescription color = {};
         color.format = VK_FORMAT_R8G8B8A8_UNORM;
         color.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -608,13 +616,7 @@ bool GsAdrenoRenderer::createSceneResources() {
         ci.subpassCount = 1; ci.pSubpasses = &sub;
         ci.dependencyCount = 2; ci.pDependencies = deps;
         if (vkCreateRenderPass(device_, &ci, nullptr, &renderPass_) != VK_SUCCESS) return false;
-
-        for (uint32_t s = 0; s < kFrameRing; s++) {
-            VkFramebufferCreateInfo fb = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-            fb.renderPass = renderPass_; fb.attachmentCount = 1; fb.pAttachments = &renderImage_[s].view;
-            fb.width = width_; fb.height = height_; fb.layers = 1;
-            if (vkCreateFramebuffer(device_, &fb, nullptr, &framebuffer_[s]) != VK_SUCCESS) return false;
-        }
+        if (!createRenderTargets()) return false;
     }
 
     // ── Graphics splat pipeline (instanced quads; attr + sorted vals, vertex) ──
@@ -719,6 +721,76 @@ bool GsAdrenoRenderer::createSceneResources() {
     }
 
     return true;
+}
+
+bool GsAdrenoRenderer::createRenderTargets() {
+    for (uint32_t s = 0; s < kFrameRing; s++) {
+        renderImage_[s] = gsCreateImage2DAliased(device_, physDevice_, width_, height_,
+            renderImageFormat_, VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (renderImage_[s].view == VK_NULL_HANDLE) return false;
+        VkFramebufferCreateInfo fb = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        fb.renderPass = renderPass_; fb.attachmentCount = 1; fb.pAttachments = &renderImage_[s].view;
+        fb.width = width_; fb.height = height_; fb.layers = 1;
+        if (vkCreateFramebuffer(device_, &fb, nullptr, &framebuffer_[s]) != VK_SUCCESS) return false;
+    }
+    return true;
+}
+
+// ══════════════════ syncRenderTargetEncoding ════════════════════════════════
+//
+// vkCmdBlitImage CONVERTS through the two images' formats: it decodes the
+// source's transfer function and encodes the destination's. splat.frag's
+// output is already display-referred (the INRIA 3DGS SH convention — the
+// splats were trained on sRGB PNGs), and the runtime is a Model-A passthrough
+// (ADR-021): whatever is left in the swapchain reaches the display processor
+// unchanged. So the blit must apply NO net transfer function, which means both
+// sides of it have to be in the same encoding class. A UNORM internal target
+// blitted into an _SRGB swapchain is half a conversion — encode with no decode
+// — and that is the #49 wash-out.
+//
+// The internal target therefore takes the swapchain's class in its IMAGE
+// format while the colour-attachment VIEW stays UNORM, so the fragment output
+// is still stored raw and the blit becomes _SRGB -> _SRGB, an identity
+// round-trip. Same trick the runtime plays on its side of this very boundary
+// (comp_vk_native_swapchain.c, runtime #1559).
+void GsAdrenoRenderer::syncRenderTargetEncoding(VkFormat swapchainFormat) {
+    const bool wantSrgb = gsFormatIsSrgb(swapchainFormat);
+
+    if (wantSrgb && !mutableSrgbOk_) {
+        if (!srgbFallbackWarned_) {
+            srgbFallbackWarned_ = true;
+            GS_LOGE("GsAdreno: WARNING - the swapchain is _SRGB (fmt %d) but this device "
+                    "cannot alias an _SRGB image as UNORM (needs Vulkan 1.2 core "
+                    "MUTABLE_FORMAT + EXTENDED_USAGE + VkImageFormatListCreateInfo). "
+                    "Keeping a UNORM internal target, so the blit into the swapchain "
+                    "will ENCODE already-display-referred bytes a second time and the "
+                    "image will look washed out. Run with DXR_SWAPCHAIN_ENCODING=unorm "
+                    "to get a UNORM swapchain and correct colour.",
+                    (int)swapchainFormat);
+        }
+        return;
+    }
+
+    const VkFormat want = wantSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    if (want == renderImageFormat_) return;
+    renderImageFormat_ = want;
+
+    GS_LOGI("GsAdreno: internal render target -> %s (swapchain fmt %d); "
+            "blit into the swapchain is a matched pair, no net transfer function",
+            wantSrgb ? "R8G8B8A8_SRGB image / UNORM view" : "R8G8B8A8_UNORM",
+            (int)swapchainFormat);
+
+    // Nothing built yet (no scene): createRenderTargets() picks the format up.
+    if (renderPass_ == VK_NULL_HANDLE) return;
+
+    vkDeviceWaitIdle(device_);
+    for (uint32_t s = 0; s < kFrameRing; s++) {
+        if (framebuffer_[s]) { vkDestroyFramebuffer(device_, framebuffer_[s], nullptr); framebuffer_[s] = VK_NULL_HANDLE; }
+        gsDestroyImage(device_, renderImage_[s]);
+    }
+    if (!createRenderTargets())
+        GS_LOGE("GsAdreno: failed to recreate the internal render target in fmt %d", (int)want);
 }
 
 // ═══════════════════════════ dispatchCov3d (once) ═══════════════════════════
@@ -907,7 +979,7 @@ void GsAdrenoRenderer::updateUniforms(uint32_t slot,
 
 // ═══════════════════════════════ renderEye ══════════════════════════════════
 
-void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFormat*/,
+void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainFormat,
                                  uint32_t /*imageWidth*/, uint32_t /*imageHeight*/,
                                  uint32_t viewportX, uint32_t viewportY,
                                  uint32_t viewportWidth, uint32_t viewportHeight,
@@ -915,6 +987,10 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
                                  bool /*transparentBg*/, float clipNearViewSpace,
                                  float clipFarViewSpace, float clipFadeFrac) {
     if (!sceneLoaded_) return;
+
+    // Match the internal target's encoding class to the swapchain's before
+    // anything records against it (decided once per session in practice).
+    syncRenderTargetEncoding(swapchainFormat);
     const uint32_t N = numGaussians_;
 
     // Scaled internal render dims.

@@ -308,7 +308,16 @@ private:
     GsBuffer tileBoundaryBuffer_;   // tileX * tileY * 2 * 4 bytes
 
     // ── Internal render image ────────────────────────────────────────────
-    GsImage renderImage_;  // R8G8B8A8_UNORM, width_ x height_
+    //
+    // The compute store always writes RAW display-referred bytes through a
+    // R8G8B8A8_UNORM VIEW. The IMAGE's format follows the swapchain's encoding
+    // class so that the vkCmdBlitImage into the swapchain is a MATCHED pair
+    // (UNORM->UNORM, or _SRGB->_SRGB) and therefore an identity round-trip on
+    // the transfer function. See syncRenderTargetEncoding().
+    GsImage renderImage_;  // view R8G8B8A8_UNORM; image renderImageFormat_
+    VkFormat renderImageFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
+    bool mutableSrgbOk_ = false;       // device can alias an _SRGB image as UNORM
+    bool srgbFallbackWarned_ = false;  // one-shot
 
     // ── Pre-cull silhouette coverage (#112) ──────────────────────────────
     // ~1 texel per 16x16 render pixels, capped at 128 per side, so the stores
@@ -391,6 +400,11 @@ private:
     // must have wait-idled the queue. No-op if requiredCapacity fits.
     void growSortBuffers(uint32_t requiredCapacity);
     void dispatchPrecompCov3d();
+    // Point renderImage_'s IMAGE format at the swapchain's encoding class,
+    // recreating it (and re-writing the render descriptor) when the class
+    // changes. Called at the top of renderEye; in practice the class is
+    // decided once per session.
+    void syncRenderTargetEncoding(VkFormat swapchainFormat);
     // Record UNDEFINED -> clear-to-zero -> GENERAL for coverageImage_ into an
     // already-begun command buffer (the one-time post-load transition).
     void cmdInitCoverageImage(VkCommandBuffer cmd);

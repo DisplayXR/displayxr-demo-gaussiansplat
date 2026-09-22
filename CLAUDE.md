@@ -79,6 +79,29 @@ Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` und
 - Uses `XR_DXR_display_info` (v12+) for display dims + rendering modes.
 - Submits a single `XrCompositionLayerProjection` per frame.
 
+**Colour: the blit into the swapchain must be a MATCHED pair (#49).** The splat
+colours are **already display-referred** — the INRIA 3DGS SH convention, trained
+on sRGB PNGs (`preprocess.comp`), composited in that space (`render.comp` /
+`splat.frag`) — and the runtime is a Model-A **byte passthrough** to the display
+processor (runtime ADR-021): whatever is in the swapchain reaches the panel
+unchanged. Nothing decodes on the way out, so **no shader may encode**
+(`apply_srgb` stays 0). The one place a transfer function can still be applied is
+`vkCmdBlitImage renderImage_ → swapchain`, which *converts through the two
+images' formats*. Hence the rule: the internal target takes the **swapchain's
+encoding class** (`GsRenderer`/`GsAdrenoRenderer::syncRenderTargetEncoding`) —
+`_SRGB` swapchain → `R8G8B8A8_SRGB` image created `MUTABLE_FORMAT |
+EXTENDED_USAGE` with a two-entry `VkImageFormatListCreateInfo`, whose compute
+storage view / colour attachment view is the **UNORM sibling** so the raw bytes
+are still stored unencoded. The blit is then `_SRGB`→`_SRGB`, an identity
+round-trip (same trick the runtime plays on its side of the boundary,
+runtime#1559). A UNORM internal target under an `_SRGB` swapchain is *half* a
+conversion — encode with no decode — and washes the image out; that was the bug
+displayxr-common v2.15.0 exposed when it made the swapchain `_SRGB` by default.
+Gated on Vulkan 1.2 (both create flags and the format list are core there); if
+unavailable the renderer keeps UNORM and logs a one-shot warning pointing at
+`DXR_SWAPCHAIN_ENCODING=unorm`. Runtime rule: INV-4.6 in
+`docs/guides/displayxr-app-rules.md`.
+
 **ADOPT the runtime's active rendering mode; never force one at startup.** All
 three desktop legs read `XrDisplayRenderingModeInfoDXR::isActive`
 (`XR_DXR_display_info` v13) once after `xrCreateSession` and take it, logging

@@ -77,6 +77,50 @@ void gsDestroyBuffer(VkDevice device, GsBuffer& buf)
     buf.size = 0;
 }
 
+bool gsFormatIsSrgb(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool gsMutableSrgbTargetSupported(VkPhysicalDevice physDevice,
+                                  VkImageUsageFlags usage)
+{
+    if (physDevice == VK_NULL_HANDLE) return false;
+
+    // VK_IMAGE_CREATE_EXTENDED_USAGE_BIT arrived with maintenance2 (core in
+    // 1.1) and VkImageFormatListCreateInfo with VK_KHR_image_format_list (core
+    // in 1.2). Asking for 1.2 means both are CORE, so neither depends on a
+    // device extension having been enabled by whichever window leg created the
+    // VkDevice -- something this renderer cannot see from here. Every desktop
+    // leg already asks for VK_API_VERSION_1_2 at instance create, so this is
+    // not a real restriction; it just makes the negative case honest instead
+    // of undefined.
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physDevice, &props);
+    if (props.apiVersion < VK_API_VERSION_1_2) return false;
+
+    // The image itself is only ever a blit SOURCE; the view carries the usage.
+    VkFormatProperties srgbProps;
+    vkGetPhysicalDeviceFormatProperties(physDevice, VK_FORMAT_R8G8B8A8_SRGB, &srgbProps);
+    if ((srgbProps.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0)
+        return false;
+
+    VkFormatProperties unormProps;
+    vkGetPhysicalDeviceFormatProperties(physDevice, VK_FORMAT_R8G8B8A8_UNORM, &unormProps);
+    VkFormatFeatureFlags need = 0;
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT)          need |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    if (usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) need |= VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT)     need |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    return (unormProps.optimalTilingFeatures & need) == need;
+}
+
 GsImage gsCreateImage2D(VkDevice device,
                         VkPhysicalDevice physDevice,
                         uint32_t width,
@@ -84,13 +128,40 @@ GsImage gsCreateImage2D(VkDevice device,
                         VkFormat format,
                         VkImageUsageFlags usage)
 {
+    return gsCreateImage2DAliased(device, physDevice, width, height,
+                                  format, format, usage);
+}
+
+GsImage gsCreateImage2DAliased(VkDevice device,
+                               VkPhysicalDevice physDevice,
+                               uint32_t width,
+                               uint32_t height,
+                               VkFormat imageFormat,
+                               VkFormat viewFormat,
+                               VkImageUsageFlags usage)
+{
     GsImage img;
     img.width = width;
     img.height = height;
 
+    const bool aliased = (viewFormat != imageFormat);
+
+    // Both siblings, so the view below is legal and the driver knows at create
+    // time which formats the usage bits are to be validated against -- the
+    // _SRGB image itself supports neither STORAGE nor, on some drivers, the
+    // colour-attachment path the UNORM view uses.
+    VkFormat viewFormats[2] = {imageFormat, viewFormat};
+    VkImageFormatListCreateInfo formatList = {VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO};
+    formatList.viewFormatCount = 2;
+    formatList.pViewFormats = viewFormats;
+
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ici.pNext = aliased ? &formatList : nullptr;
+    ici.flags = aliased ? (VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                           VK_IMAGE_CREATE_EXTENDED_USAGE_BIT)
+                        : 0;
     ici.imageType = VK_IMAGE_TYPE_2D;
-    ici.format = format;
+    ici.format = imageFormat;
     ici.extent = {width, height, 1};
     ici.mipLevels = 1;
     ici.arrayLayers = 1;
@@ -101,7 +172,8 @@ GsImage gsCreateImage2D(VkDevice device,
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     if (vkCreateImage(device, &ici, nullptr, &img.image) != VK_SUCCESS) {
-        fprintf(stderr, "gs_vulkan_utils: failed to create image (%ux%u)\n", width, height);
+        fprintf(stderr, "gs_vulkan_utils: failed to create image (%ux%u, fmt %d)\n",
+                width, height, (int)imageFormat);
         return img;
     }
 
@@ -124,7 +196,7 @@ GsImage gsCreateImage2D(VkDevice device,
     VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
     vci.image = img.image;
     vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    vci.format = format;
+    vci.format = viewFormat;
     vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
 
     if (vkCreateImageView(device, &vci, nullptr, &img.view) != VK_SUCCESS) {

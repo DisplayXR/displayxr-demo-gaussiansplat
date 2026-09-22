@@ -260,7 +260,17 @@ private:
     uint32_t lastDrawnInstances_ = 0;
 
     // ── Internal scaled render target (per slot: draw target + blit source) ──
-    GsImage renderImage_[kFrameRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
+    //
+    // splat.frag writes RAW display-referred colour, so the colour ATTACHMENT
+    // view is always R8G8B8A8_UNORM — an _SRGB attachment would encode the
+    // fragment output on store. The IMAGE's format follows the swapchain's
+    // encoding class instead, so the vkCmdBlitImage into the swapchain is a
+    // MATCHED pair and applies no net transfer function. See
+    // syncRenderTargetEncoding().
+    GsImage renderImage_[kFrameRing];       // view R8G8B8A8_UNORM; image renderImageFormat_
+    VkFormat renderImageFormat_ = VK_FORMAT_R8G8B8A8_UNORM;
+    bool mutableSrgbOk_ = false;            // device can alias an _SRGB image as UNORM
+    bool srgbFallbackWarned_ = false;       // one-shot
 
     // ── Pre-cull silhouette coverage (#112) ──
     // Single image, NOT per slot: the readback drains the queue before it
@@ -321,6 +331,15 @@ private:
     // ── Private helpers ──
     bool createSceneResources();
     void dispatchCov3d();
+    // Point renderImage_[]'s IMAGE format at the swapchain's encoding class,
+    // recreating the images and their framebuffers when the class changes.
+    // The render pass is untouched: its attachment format is the VIEW's, which
+    // stays UNORM. Called at the top of renderEye; in practice the class is
+    // decided once per session.
+    void syncRenderTargetEncoding(VkFormat swapchainFormat);
+    // Create renderImage_[]/framebuffer_[] in renderImageFormat_. renderPass_
+    // must already exist.
+    bool createRenderTargets();
     // Record UNDEFINED -> clear-to-zero -> GENERAL for coverageImage_ into an
     // already-begun command buffer.
     void cmdInitCoverageImage(VkCommandBuffer cmd);

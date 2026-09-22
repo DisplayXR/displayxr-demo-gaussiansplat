@@ -40,13 +40,43 @@ struct GsImage {
     uint32_t height = 0;
 };
 
-// Create a 2D image with a view.
+// Create a 2D image with a view in the same format.
 GsImage gsCreateImage2D(VkDevice device,
                         VkPhysicalDevice physDevice,
                         uint32_t width,
                         uint32_t height,
                         VkFormat format,
                         VkImageUsageFlags usage);
+
+// Create a 2D image whose VIEW is in a different — but size- and
+// class-compatible — format from the image itself (MUTABLE_FORMAT +
+// EXTENDED_USAGE + a two-entry VkImageFormatListCreateInfo). This is how the
+// internal colour target is made to carry the swapchain's encoding class
+// without the shaders ever seeing it: the image is `..._SRGB` so the blit into
+// an `_SRGB` swapchain is an identity round-trip, while the view handed to the
+// compute store / colour attachment is the UNORM sibling so the raw,
+// already-display-referred bytes are written through unchanged.
+// viewFormat == imageFormat behaves exactly like gsCreateImage2D.
+GsImage gsCreateImage2DAliased(VkDevice device,
+                               VkPhysicalDevice physDevice,
+                               uint32_t width,
+                               uint32_t height,
+                               VkFormat imageFormat,
+                               VkFormat viewFormat,
+                               VkImageUsageFlags usage);
+
+// True for the 8-bit swapchain formats that carry the sRGB transfer function,
+// i.e. the ones a vkCmdBlitImage ENCODES into on write.
+bool gsFormatIsSrgb(VkFormat format);
+
+// Whether this device can back gsCreateImage2DAliased() for the sRGB internal
+// target with `usage`. Gated on Vulkan 1.2 (where both
+// VK_IMAGE_CREATE_EXTENDED_USAGE_BIT and VkImageFormatListCreateInfo are core,
+// so neither needs a device extension to have been enabled by the window leg
+// that created the VkDevice) plus the format features the pair actually needs.
+// False -> the caller keeps a UNORM internal target and says so once.
+bool gsMutableSrgbTargetSupported(VkPhysicalDevice physDevice,
+                                  VkImageUsageFlags usage);
 
 // Destroy an image, its view, and free memory.
 void gsDestroyImage(VkDevice device, GsImage& img);

@@ -255,6 +255,13 @@ bool GsRenderer::init(VkInstance instance,
         }
     }
 
+    // Can this device back an _SRGB internal colour target aliased as UNORM?
+    // Decides what syncRenderTargetEncoding() may do when the swapchain turns
+    // out to be _SRGB; probed here so the answer is one device query, not one
+    // per scene load.
+    mutableSrgbOk_ = gsMutableSrgbTargetSupported(
+        physDevice_, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+
     // GPU timestamp support: timestampPeriod (ns/tick) is a device limit, but
     // timestamps only work on a queue whose family reports timestampValidBits>0.
     timestampPeriod_ = props2.properties.limits.timestampPeriod;
@@ -561,9 +568,12 @@ bool GsRenderer::createBuffers()
     tileBoundaryBuffer_ = gsCreateBuffer(device_, physDevice_,
         (VkDeviceSize)tileX_ * tileY_ * 2 * 4, ssboUsage, devLocal);
 
-    // Internal render image
-    renderImage_ = gsCreateImage2D(device_, physDevice_, width_, height_,
-        VK_FORMAT_R8G8B8A8_UNORM,
+    // Internal render image. The compute store needs a UNORM view (imageStore
+    // cannot target an _SRGB storage image, and the bytes it writes are already
+    // display-referred); renderImageFormat_ is what the BLIT into the swapchain
+    // reads it as. They are the same object, so the two agree by construction.
+    renderImage_ = gsCreateImage2DAliased(device_, physDevice_, width_, height_,
+        renderImageFormat_, VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     // Pre-cull silhouette coverage (#112) — ~1 texel per 16x16 render pixels,
@@ -1350,6 +1360,100 @@ void GsRenderer::updateUniforms(const float viewMatrix[16], const float projMatr
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// syncRenderTargetEncoding — keep the blit into the swapchain a MATCHED pair
+// ═════════════════════════════════════════════════════════════════════════
+//
+// vkCmdBlitImage CONVERTS through the two images' formats: it decodes the
+// source's transfer function and encodes the destination's. The bytes this
+// renderer produces are already display-referred (the INRIA 3DGS SH
+// convention — the splats were trained on sRGB PNGs — composited in that same
+// space by render.comp), and the runtime is a Model-A passthrough (ADR-021):
+// whatever is left in the swapchain reaches the display processor unchanged.
+// So the blit must apply NO net transfer function, which means the two sides
+// of it have to be in the same encoding class. A UNORM internal target
+// blitted into an _SRGB swapchain is half a conversion — encode with no
+// decode — and that is the #49 wash-out.
+//
+// Rather than encode in the shader (which would then be wrong for a UNORM
+// swapchain, and is the "do both" half of INV-4.6), the internal target takes
+// the swapchain's class: _SRGB image, UNORM view. The shader still writes raw
+// bytes through the view; the blit becomes _SRGB -> _SRGB, an identity
+// round-trip. This is the same trick the runtime plays on its side of this
+// very boundary (comp_vk_native_swapchain.c, runtime #1559).
+void GsRenderer::syncRenderTargetEncoding(VkFormat swapchainFormat)
+{
+    const bool wantSrgb = gsFormatIsSrgb(swapchainFormat);
+
+    if (wantSrgb && !mutableSrgbOk_) {
+        if (!srgbFallbackWarned_) {
+            srgbFallbackWarned_ = true;
+            GS_LOGE("GsRenderer: WARNING - the swapchain is _SRGB (fmt %d) but this device "
+                    "cannot alias an _SRGB image as UNORM (needs Vulkan 1.2 core "
+                    "MUTABLE_FORMAT + EXTENDED_USAGE + VkImageFormatListCreateInfo). "
+                    "Keeping a UNORM internal target, so the blit into the swapchain "
+                    "will ENCODE already-display-referred bytes a second time and the "
+                    "image will look washed out. Run with DXR_SWAPCHAIN_ENCODING=unorm "
+                    "to get a UNORM swapchain and correct colour.",
+                    (int)swapchainFormat);
+        }
+        return;
+    }
+
+    const VkFormat want = wantSrgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    if (want == renderImageFormat_) return;
+    renderImageFormat_ = want;
+
+    GS_LOGI("GsRenderer: internal render target -> %s (swapchain fmt %d); "
+            "blit into the swapchain is a matched pair, no net transfer function",
+            wantSrgb ? "R8G8B8A8_SRGB image / UNORM view" : "R8G8B8A8_UNORM",
+            (int)swapchainFormat);
+
+    // No image yet (first call is ahead of any scene load): createBuffers()
+    // will pick the format up.
+    if (renderImage_.image == VK_NULL_HANDLE) return;
+
+    vkDeviceWaitIdle(device_);
+    gsDestroyImage(device_, renderImage_);
+    renderImage_ = gsCreateImage2DAliased(device_, physDevice_, width_, height_,
+        renderImageFormat_, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (renderImage_.image == VK_NULL_HANDLE) return;
+
+    if (dsRenderSet1_ != VK_NULL_HANDLE)
+        writeImageDS(device_, dsRenderSet1_, 0, renderImage_.view);
+
+    // The fresh image is UNDEFINED; every renderEye barrier below assumes
+    // GENERAL, same as the one-time post-load transition does.
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+    VkImageMemoryBarrier imb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    imb.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imb.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    imb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    imb.image = renderImage_.image;
+    imb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    imb.srcAccessMask = 0;
+    imb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue_);
+    vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // renderEye — full per-frame compute dispatch sequence
 // ═════════════════════════════════════════════════════════════════════════
 
@@ -1369,6 +1473,10 @@ void GsRenderer::renderEye(VkImage swapchainImage,
                            float clipFadeFrac)
 {
     if (!hasScene()) return;
+
+    // Match the internal target's encoding class to the swapchain's before
+    // anything records against it (decided once per session in practice).
+    syncRenderTargetEncoding(swapchainFormat);
 
     // Render-scale: drive the entire compute pipeline (projection, tile grid,
     // sort, per-pixel composite) at a reduced internal resolution rw x rh, then
@@ -1713,10 +1821,17 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             layoutRender_, 0, 2, renderSets, 0, nullptr);
 
-        // Never apply manual sRGB encoding — the swapchain is SRGB format,
-        // so the compositor's sampler decodes sRGB→linear on read, and the
-        // display surface re-encodes linear→sRGB on output (single gamma).
-        // Manual linearToSrgb() would cause double encoding (washed out colors).
+        // apply_srgb stays 0: these colours are ALREADY display-referred (the
+        // INRIA 3DGS SH convention — trained on sRGB PNGs — composited in that
+        // space above), and the runtime is a byte passthrough to the display
+        // processor (Model A, ADR-021). Nothing decodes them on the way out, so
+        // encoding here would be a second encode.
+        //
+        // The blit into the swapchain is the ONLY place in this app a transfer
+        // function can be applied, because vkCmdBlitImage converts through the
+        // two images' formats. It must therefore be a MATCHED pair, which is
+        // what syncRenderTargetEncoding() arranges by giving the internal
+        // target the swapchain's encoding class. Do not "fix" colour here.
         uint32_t renderPC[4] = {rw, rh, 0u,
                                 transparentBg ? 1u : 0u};
         vkCmdPushConstants(cmd, layoutRender_, VK_SHADER_STAGE_COMPUTE_BIT,
