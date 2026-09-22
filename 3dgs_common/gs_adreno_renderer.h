@@ -261,6 +261,7 @@ private:
 
     // ── Internal scaled render target (per slot: draw target + blit source) ──
     GsImage renderImage_[kFrameRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
+    GsImage swapScratch_[kFrameRing];       // UNORM sibling of an sRGB swapchain (gsCmdBlitToSwapchain); empty otherwise
 
     // ── Pre-cull silhouette coverage (#112) ──
     // Single image, NOT per slot: the readback drains the queue before it

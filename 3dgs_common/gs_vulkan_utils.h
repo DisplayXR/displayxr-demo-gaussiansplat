@@ -38,6 +38,7 @@ struct GsImage {
     VkImageView view = VK_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
 };
 
 // Create a 2D image with a view.
@@ -47,6 +48,57 @@ GsImage gsCreateImage2D(VkDevice device,
                         uint32_t height,
                         VkFormat format,
                         VkImageUsageFlags usage);
+
+// ── Render target → swapchain transfer (display-referred bytes) ──────────
+//
+// The splat renderers composite display-referred (sRGB-encoded) colours — the
+// space 3DGS is trained and blended in — into an R8G8B8A8_UNORM target, and
+// those bytes must reach the swapchain unchanged. vkCmdBlitImage is NOT a byte
+// copy: it converts through each image's FORMAT, so blitting into an *_SRGB
+// swapchain image sRGB-ENCODES the already-encoded values a second time
+// (washed out). A runtime that returns the VkImage in the format the app asked
+// for (XR_KHR_vulkan_enable; DisplayXR runtime >= v2.18.0) exposes exactly
+// that.
+//
+// So on an *_SRGB swapchain the transfer is two steps: blit (scale + channel
+// swizzle, no colour conversion) into a scratch image of the swapchain's UNORM
+// sibling, then vkCmdCopyImage — which never converts — into the swapchain.
+// That is byte-exact whatever format the runtime's VkImage really has, so the
+// demo stays correct on older runtimes that substituted an UNORM image too.
+// On a non-sRGB swapchain it is the single blit it always was.
+
+// Is `format` an 8-bit *_SRGB colour format?
+bool gsIsSrgbFormat(VkFormat format);
+
+// Make `scratch` a (width x height) image in the UNORM sibling of
+// `swapchainFormat`, (re)creating it only when missing or of the wrong
+// size/format. No-op (returns true, leaves `scratch` empty) for a non-sRGB
+// swapchain. Returns false only when an sRGB swapchain needs one and creation
+// failed. The caller must own `scratch` exclusively (no GPU use in flight).
+bool gsEnsureSwapchainScratch(VkDevice device,
+                              VkPhysicalDevice physDevice,
+                              GsImage& scratch,
+                              uint32_t width,
+                              uint32_t height,
+                              VkFormat swapchainFormat);
+
+// Record the transfer of `src` region (0,0)-(srcW,srcH) onto `dst` region
+// (dstX,dstY)+(dstW,dstH). `src` must be in TRANSFER_SRC_OPTIMAL and `dst` in
+// TRANSFER_DST_OPTIMAL; both are left there. `scratch` (from
+// gsEnsureSwapchainScratch) is used when `dstFormat` is *_SRGB and it covers
+// dstW x dstH; otherwise this is a direct blit.
+void gsCmdBlitToSwapchain(VkCommandBuffer cmd,
+                          VkImage src,
+                          uint32_t srcW,
+                          uint32_t srcH,
+                          VkImage dst,
+                          VkFormat dstFormat,
+                          int32_t dstX,
+                          int32_t dstY,
+                          uint32_t dstW,
+                          uint32_t dstH,
+                          VkFilter filter,
+                          const GsImage& scratch);
 
 // Destroy an image, its view, and free memory.
 void gsDestroyImage(VkDevice device, GsImage& img);
