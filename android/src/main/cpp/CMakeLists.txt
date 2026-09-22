@@ -146,7 +146,7 @@ find_package(OpenXR REQUIRED CONFIG)
 # desktop platform deps. Keep the pin identical to common/CMakeLists.txt.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.15.0
+    GIT_TAG v2.16.0
     GIT_SHALLOW TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
