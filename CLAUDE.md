@@ -68,6 +68,28 @@ splat renderer (`GsRenderer`) is used on Linux desktop; the Adreno/TBDR
 graphics path (`gs_adreno_renderer`) is Android/Apple-Silicon only. Recipe:
 the runtime repo's `docs/guides/linux-demo-port.md`.
 
+### Linux packaging (`.deb`) — one package for 22.04, 24.04 and 26.04
+```bash
+./scripts/package_deb_linux.sh                       # dist/displayxr-gaussiansplat_<ver>_amd64.deb
+DXR_DEB_MAX_GLIBC=2.35 ./scripts/package_deb_linux.sh  # what CI enforces
+```
+A binary's glibc floor is its **build host's**, so the released `.deb` is built
+in an `ubuntu:22.04` container (CI's `Deb` job) — the oldest supported release.
+Three guards keep the one package installable and runnable on all three
+(runtime issue #1656):
+
+* `dpkg-shlibdeps` derives **versioned** `Depends`, so apt refuses a too-new
+  package instead of installing one that then dies at exec;
+* `STABLE_SONAMES` in `scripts/package_deb_linux.sh` fails the build on a newly
+  linked system library whose package name is not identical on 22.04, 24.04 and
+  26.04 (the t64 renames, `libcurl4` → `libcurl4t64`, are the trap);
+* `DXR_DEB_MAX_GLIBC` fails a glibc floor above the oldest release.
+
+`scripts/verify_deb_install_linux.sh` is the install-verifier CI's `DebInstall`
+matrix runs in a pristine `ubuntu:<release>` container; `DebRelease` only
+attaches the asset once all three pass. Never build a release `.deb` on a newer
+host.
+
 ## Input handling
 
 Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` under `WM_KEYDOWN` (around line 355). New shortcuts go there. The README documents the full list (WASD, M, F, V, L, Space, Tab, Esc, etc.).
