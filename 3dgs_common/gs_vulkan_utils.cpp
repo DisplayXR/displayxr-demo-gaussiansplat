@@ -87,6 +87,7 @@ GsImage gsCreateImage2D(VkDevice device,
     GsImage img;
     img.width = width;
     img.height = height;
+    img.format = format;
 
     VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ici.imageType = VK_IMAGE_TYPE_2D;
@@ -150,6 +151,128 @@ void gsDestroyImage(VkDevice device, GsImage& img)
     }
     img.width = 0;
     img.height = 0;
+    img.format = VK_FORMAT_UNDEFINED;
+}
+
+bool gsIsSrgbFormat(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_B8G8R8A8_SRGB:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static VkFormat gsUnormSiblingOf(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+    default: return format;
+    }
+}
+
+bool gsEnsureSwapchainScratch(VkDevice device,
+                              VkPhysicalDevice physDevice,
+                              GsImage& scratch,
+                              uint32_t width,
+                              uint32_t height,
+                              VkFormat swapchainFormat)
+{
+    if (!gsIsSrgbFormat(swapchainFormat)) {
+        return true;
+    }
+    const VkFormat want = gsUnormSiblingOf(swapchainFormat);
+    if (scratch.image != VK_NULL_HANDLE && scratch.format == want &&
+        scratch.width == width && scratch.height == height) {
+        return true;
+    }
+    gsDestroyImage(device, scratch);
+    // SAMPLED only so gsCreateImage2D's view is valid; the scratch is
+    // transfer-only in practice.
+    scratch = gsCreateImage2D(device, physDevice, width, height, want,
+                              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                  VK_IMAGE_USAGE_SAMPLED_BIT);
+    return scratch.image != VK_NULL_HANDLE;
+}
+
+void gsCmdBlitToSwapchain(VkCommandBuffer cmd,
+                          VkImage src,
+                          uint32_t srcW,
+                          uint32_t srcH,
+                          VkImage dst,
+                          VkFormat dstFormat,
+                          int32_t dstX,
+                          int32_t dstY,
+                          uint32_t dstW,
+                          uint32_t dstH,
+                          VkFilter filter,
+                          const GsImage& scratch)
+{
+    const bool viaScratch = gsIsSrgbFormat(dstFormat) && scratch.image != VK_NULL_HANDLE &&
+                            dstW <= scratch.width && dstH <= scratch.height;
+
+    VkImageBlit blit = {};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[0] = {0, 0, 0};
+    blit.srcOffsets[1] = {(int32_t)srcW, (int32_t)srcH, 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+
+    if (!viaScratch) {
+        if (gsIsSrgbFormat(dstFormat)) {
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                fprintf(stderr, "gs_vulkan_utils: no UNORM scratch for the sRGB swapchain — "
+                                "blitting directly, colours will be encoded twice (washed out)\n");
+            }
+        }
+        blit.dstOffsets[0] = {dstX, dstY, 0};
+        blit.dstOffsets[1] = {dstX + (int32_t)dstW, dstY + (int32_t)dstH, 1};
+        vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+        return;
+    }
+
+    // scratch -> TRANSFER_DST (its last use, if any, was the copy read below).
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = scratch.image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+
+    // UNORM -> UNORM: scale + channel swizzle, no colour conversion.
+    blit.dstOffsets[0] = {0, 0, 0};
+    blit.dstOffsets[1] = {(int32_t)dstW, (int32_t)dstH, 1};
+    vkCmdBlitImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+
+    // Size-compatible formats (UNORM sibling -> *_SRGB): a raw byte copy.
+    VkImageCopy c = {};
+    c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.srcOffset = {0, 0, 0};
+    c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.dstOffset = {dstX, dstY, 0};
+    c.extent = {dstW, dstH, 1};
+    vkCmdCopyImage(cmd, scratch.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                   dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
 }
 
 bool gsUploadBuffer(VkDevice device,

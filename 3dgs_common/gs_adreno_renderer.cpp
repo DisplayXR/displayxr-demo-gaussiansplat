@@ -907,7 +907,7 @@ void GsAdrenoRenderer::updateUniforms(uint32_t slot,
 
 // ═══════════════════════════════ renderEye ══════════════════════════════════
 
-void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFormat*/,
+void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainFormat,
                                  uint32_t /*imageWidth*/, uint32_t /*imageHeight*/,
                                  uint32_t viewportX, uint32_t viewportY,
                                  uint32_t viewportWidth, uint32_t viewportHeight,
@@ -932,6 +932,8 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     // of them are only known-complete once this fence signals.
     const uint32_t slot = (uint32_t)(frameCounter_ % kFrameRing);
     vkWaitForFences(device_, 1, &ringFence_[slot], VK_TRUE, UINT64_MAX);
+    // The slot's scratch is idle now too; only an sRGB swapchain needs one.
+    gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_[slot], width_, height_, swapchainFormat);
 
     const bool tsOn = (timestampPeriod_ > 0.0f && tsPool_[slot] != VK_NULL_HANDLE);
     VkQueryPool tsq = tsOn ? tsPool_[slot] : VK_NULL_HANDLE;
@@ -1118,16 +1120,12 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat /*swapchainFor
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &sb);
 
-    VkImageBlit blit = {};
-    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.srcOffsets[0] = {0, 0, 0};
-    blit.srcOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
-    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    blit.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
-    blit.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth), (int32_t)(viewportY + viewportHeight), 1};
     VkFilter filter = (rw == viewportWidth && rh == viewportHeight) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    vkCmdBlitImage(cmd, renderImage_[slot].image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, filter);
+    // Byte-exact onto an sRGB swapchain too (no second encode) — see
+    // gsCmdBlitToSwapchain in gs_vulkan_utils.h.
+    gsCmdBlitToSwapchain(cmd, renderImage_[slot].image, rw, rh, swapchainImage, swapchainFormat,
+        (int32_t)viewportX, (int32_t)viewportY, viewportWidth, viewportHeight, filter,
+        swapScratch_[slot]);
 
     sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1311,6 +1309,7 @@ void GsAdrenoRenderer::cleanupScene() {
     dumpW_ = dumpH_ = 0;
     for (uint32_t s = 0; s < kFrameRing; s++) {
         gsDestroyImage(device_, renderImage_[s]);
+        gsDestroyImage(device_, swapScratch_[s]);
         gsDestroyBuffer(device_, uniformBuffer_[s]); gsDestroyBuffer(device_, attrBuffer_[s]);
         gsDestroyBuffer(device_, keysEvenBuffer_[s]); gsDestroyBuffer(device_, keysOddBuffer_[s]);
         gsDestroyBuffer(device_, valsEvenBuffer_[s]); gsDestroyBuffer(device_, valsOddBuffer_[s]);

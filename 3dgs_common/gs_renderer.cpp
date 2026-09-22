@@ -1370,6 +1370,9 @@ void GsRenderer::renderEye(VkImage swapchainImage,
 {
     if (!hasScene()) return;
 
+    // Every eye below ends in vkQueueWaitIdle, so the scratch is idle here.
+    gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_, width_, height_, swapchainFormat);
+
     // Render-scale: drive the entire compute pipeline (projection, tile grid,
     // sort, per-pixel composite) at a reduced internal resolution rw x rh, then
     // upscale-blit to the full viewport region below. The projection is fully
@@ -1713,10 +1716,11 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
             layoutRender_, 0, 2, renderSets, 0, nullptr);
 
-        // Never apply manual sRGB encoding — the swapchain is SRGB format,
-        // so the compositor's sampler decodes sRGB→linear on read, and the
-        // display surface re-encodes linear→sRGB on output (single gamma).
-        // Manual linearToSrgb() would cause double encoding (washed out colors).
+        // Never apply manual sRGB encoding: the splat colours are already
+        // display-referred (3DGS composites in encoded space) and must reach
+        // the swapchain as those exact bytes — which gsCmdBlitToSwapchain
+        // guarantees, sRGB swapchain or not. Manual linearToSrgb() here would
+        // encode them a second time (washed out colors).
         uint32_t renderPC[4] = {rw, rh, 0u,
                                 transparentBg ? 1u : 0u};
         vkCmdPushConstants(cmd, layoutRender_, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -1761,21 +1765,13 @@ void GsRenderer::renderEye(VkImage swapchainImage,
         // Blit the scaled render region (rw x rh) up to the full viewport
         // region of the swapchain (handles RGBA→BGRA format conversion + the
         // render-scale upscale). LINEAR so the upscale is smooth (NEAREST when
-        // 1:1 — identical result, marginally cheaper).
-        VkImageBlit blitRegion = {};
-        blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blitRegion.srcOffsets[0] = {0, 0, 0};
-        blitRegion.srcOffsets[1] = {(int32_t)rw, (int32_t)rh, 1};
-        blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        blitRegion.dstOffsets[0] = {(int32_t)viewportX, (int32_t)viewportY, 0};
-        blitRegion.dstOffsets[1] = {(int32_t)(viewportX + viewportWidth),
-                                    (int32_t)(viewportY + viewportHeight), 1};
+        // 1:1 — identical result, marginally cheaper). Byte-exact onto an
+        // sRGB swapchain too (no second encode) — see gsCmdBlitToSwapchain.
         VkFilter blitFilter = (rw == viewportWidth && rh == viewportHeight)
                                   ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-        vkCmdBlitImage(cmd,
-            renderImage_.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            swapchainImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            1, &blitRegion, blitFilter);
+        gsCmdBlitToSwapchain(cmd, renderImage_.image, rw, rh, swapchainImage, swapchainFormat,
+            (int32_t)viewportX, (int32_t)viewportY, viewportWidth, viewportHeight, blitFilter,
+            swapScratch_);
 
         // Barrier: swapchain image → COLOR_ATTACHMENT_OPTIMAL
         imb2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2236,6 +2232,7 @@ void GsRenderer::cleanupScene()
 
     // Destroy render image
     gsDestroyImage(device_, renderImage_);
+    gsDestroyImage(device_, swapScratch_);
 
     // #112 pre-cull silhouette coverage
     gsDestroyImage(device_, coverageImage_);

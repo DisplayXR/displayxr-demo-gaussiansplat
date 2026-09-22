@@ -309,6 +309,7 @@ private:
 
     // ── Internal render image ────────────────────────────────────────────
     GsImage renderImage_;  // R8G8B8A8_UNORM, width_ x height_
+    GsImage swapScratch_;  // UNORM sibling of an sRGB swapchain (gsCmdBlitToSwapchain); empty otherwise
 
     // ── Pre-cull silhouette coverage (#112) ──────────────────────────────
     // ~1 texel per 16x16 render pixels, capped at 128 per side, so the stores
