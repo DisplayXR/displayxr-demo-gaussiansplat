@@ -35,9 +35,11 @@
 #include <string>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <vector>
 
 #include "gs_adreno_renderer.h"
 #include "gs_camera_rig.h"   // GsCameraRig — the photo-lifted rig, FILE-driven here
+#include "gs_perf_knobs.h"   // gsperf::lookup — DXR_GS_* / debug.dxr.gs.* resolution
 
 // XR_DXR_view_rig (#396 W7): vendored DisplayXR extension header.
 #include <openxr/XR_DXR_view_rig.h>
@@ -1014,18 +1016,16 @@ gs_init()
 }
 
 // Copy butterfly.spz out of the APK assets into app-private storage (the
-// SPZ loader takes a filesystem path), then load it into the renderer.
-bool
-load_butterfly(struct android_app *app)
+// SPZ loader takes a filesystem path). Returns the staged path, or an empty
+// string on failure.
+std::string
+stage_bundled_scene(struct android_app *app)
 {
-	if (!g_gs_ready) {
-		return false;
-	}
 	AAssetManager *mgr = app->activity->assetManager;
 	AAsset *asset = AAssetManager_open(mgr, "butterfly.spz", AASSET_MODE_BUFFER);
 	if (asset == nullptr) {
 		LOGE("butterfly.spz not found in assets");
-		return false;
+		return std::string();
 	}
 	const void *buf = AAsset_getBuffer(asset);
 	const off_t len = AAsset_getLength(asset);
@@ -1041,13 +1041,93 @@ load_butterfly(struct android_app *app)
 	AAsset_close(asset);
 	if (!ok) {
 		LOGE("failed to stage butterfly.spz to %s", path.c_str());
+		return std::string();
+	}
+	return path;
+}
+
+// Debug scene override — `DXR_GS_SCENE` / `debug.dxr.gs.scene`, the same
+// env-var-then-system-property family as the `DXR_GS_*` performance knobs
+// (gs_perf_knobs.h), read through the same `gsperf::lookup`. This arm has no
+// command line, so a system property is the only way to point a scripted
+// benchmark or a demo rehearsal at a file that is not the bundled butterfly.
+//
+// The value may be an absolute path OR a bare filename. Prefer the bare form:
+// `PROP_VALUE_MAX` is 92 bytes and an absolute path under the app's external
+// files dir is already 63 of them, so a longer asset name would be silently
+// TRUNCATED by the property system and the miss would look like "file not
+// found". A bare name is resolved against the readable directories below, most
+// app-private first.
+//
+// On /data/local/tmp: it is where adb-driven harnesses naturally push, and its
+// mode (0771 shell:shell) lets any uid traverse it, but SELinux gives an
+// `untrusted_app` domain no read access to `shell_data_file` on a modern
+// device, so a push there is typically UNREADABLE from here. It is kept last in
+// the list as a best-effort for a permissive/rooted unit; the search order
+// makes the app's own external files dir — which needs no runtime permission
+// and which `adb push` can write — the path that actually works. Whichever
+// candidate wins is logged, so a run never has to guess which file it measured.
+std::string
+resolve_scene_override(struct android_app *app)
+{
+	char raw[PROP_VALUE_MAX] = {0};
+	if (!gsperf::lookup("DXR_GS_SCENE", "debug.dxr.gs.scene", raw, sizeof(raw))) {
+		return std::string();
+	}
+	const std::string want(raw);
+	if (want.empty()) {
+		return std::string();
+	}
+
+	std::vector<std::string> candidates;
+	if (want.find('/') != std::string::npos) {
+		candidates.push_back(want); // an absolute/relative path, taken as given
+	} else {
+		if (app->activity->externalDataPath != nullptr) {
+			candidates.push_back(std::string(app->activity->externalDataPath) + "/" + want);
+		}
+		if (app->activity->internalDataPath != nullptr) {
+			candidates.push_back(std::string(app->activity->internalDataPath) + "/" + want);
+		}
+		candidates.push_back("/sdcard/Download/" + want);
+		candidates.push_back("/data/local/tmp/" + want);
+	}
+
+	for (const std::string &c : candidates) {
+		if (access(c.c_str(), R_OK) == 0) {
+			return c;
+		}
+	}
+	LOGW("debug.dxr.gs.scene='%s' is not readable from this app "
+	     "(tried %zu path(s), first '%s') — falling back to the bundled scene",
+	     want.c_str(), candidates.size(),
+	     candidates.empty() ? "" : candidates.front().c_str());
+	return std::string();
+}
+
+// Resolve the scene (override, else the bundled butterfly), load it into the
+// renderer, then run the rig waterfall + auto-fit over whatever was loaded.
+bool
+load_scene(struct android_app *app)
+{
+	if (!g_gs_ready) {
 		return false;
 	}
+	std::string path = resolve_scene_override(app);
+	const bool overridden = !path.empty();
+	if (!overridden) {
+		path = stage_bundled_scene(app);
+	}
+	if (path.empty()) {
+		return false;
+	}
+	LOGI("Auto-loading scene: %s%s", path.c_str(),
+	     overridden ? " (debug.dxr.gs.scene)" : " (bundled)");
 	if (!g_gs.loadScene(path.c_str())) {
 		LOGE("GsRenderer::loadScene failed for %s", path.c_str());
 		return false;
 	}
-	LOGI("Loaded butterfly.spz: %u gaussians", g_gs.gaussianCount());
+	LOGI("Loaded %s: %u gaussians", path.c_str(), g_gs.gaussianCount());
 
 	// Which rig frames this scene? The file decides (there are no CLI overrides
 	// on this arm) — a `camera` block means the camera rig, its absence means
@@ -1843,7 +1923,7 @@ handle_cmd(struct android_app *app, int32_t cmd)
 			    create_swapchains() &&
 			    create_reference_space() &&
 			    gs_init() &&
-			    load_butterfly(app);
+			    load_scene(app);
 			LOGI(ok ? "Bring-up complete." : "Bring-up failed; see logs.");
 		}
 		break;

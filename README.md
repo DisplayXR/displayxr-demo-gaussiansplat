@@ -556,6 +556,37 @@ one `GsAdreno: knobs …` / `GsRenderer: knobs …` line per session with the
 resolved values — a timing measurement without that line is not reproducible.
 Per-stage GPU timings come from the throttled `GS_TS` line.
 
+### Scene override on Android (`debug.dxr.gs.scene`)
+
+The Android leg has no command line, so the bundled `butterfly.spz` used to be
+the only scene it could ever show. `DXR_GS_SCENE` / `debug.dxr.gs.scene` — the
+same env-var-then-system-property lookup as the knobs above — names a
+`.sog`/`.spz`/`.ply` to load **instead**. Unset, or set to something this app
+cannot read, and the bundled scene loads exactly as before.
+
+```bash
+adb push ports_hint_only.sog /sdcard/Android/data/com.displayxr.gausssplat_vk_android/files/
+adb shell setprop debug.dxr.gs.scene ports_hint_only.sog
+adb shell setprop debug.dxr.gs.keep 0.5          # the knobs still apply
+```
+
+**Prefer a bare filename.** `PROP_VALUE_MAX` is 92 bytes and the app's external
+files dir alone is 63 of them, so a longer absolute path is silently TRUNCATED
+by the property system and the miss looks like "file not found". A bare name is
+resolved against `externalDataPath`, `internalDataPath`, `/sdcard/Download/`
+and `/data/local/tmp/`, in that order; a value containing `/` is taken as a
+path verbatim. `/data/local/tmp` is listed last and will usually **fail**: an
+`untrusted_app` SELinux domain has no read access to `shell_data_file`, so an
+`adb push` there is unreadable from the app on a stock device. The app's own
+external files dir is the path that works and needs no runtime permission.
+
+The resolved path is logged (`Auto-loading scene: … (debug.dxr.gs.scene)`,
+`Loaded …: N gaussians`), so a run never has to guess which file it measured.
+Rig selection is unchanged and entirely file-driven: a `.sog` carrying a
+`camera` block takes the camera rig, a hint-only block resolves what it can,
+and a block-less file falls through to the photo-lift auto-detect — the
+`Photo-lift signature:` and `Camera rig:` lines report which.
+
 ## Agent tools (MCP)
 
 When the runtime's MCP capability is enabled (`DISPLAYXR_MCP=1` or the
