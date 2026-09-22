@@ -143,10 +143,24 @@ if [ "$MODE" = restore ]; then
     if [ -n "$L" ] && [ "${L%% *}" != "$HANDLE" ]; then
         echo "HELD: $L"; exit 1
     fi
-    say "restoring the released APK from the GitHub release"
+    # Restore the EXACT build that was here, not merely "the latest release":
+    # the run records it, because the pad is shared and the next session's test
+    # may key on that version. RESTORE_TAG overrides; no record and no override
+    # falls back to the latest release, and says so.
+    tag="${RESTORE_TAG:-}"
+    if [ -z "$tag" ] && [ -f "$OUT/installed_before.txt" ]; then
+        tag=$(sed -n 's/^versionName=//p' "$OUT/installed_before.txt" | head -1)
+    fi
     tmp=$(mktemp -d)
-    gh release download -R DisplayXR/displayxr-demo-gaussiansplat -p '*.apk' -D "$tmp" \
-        || die "could not download the released APK (try: gh release list -R DisplayXR/displayxr-demo-gaussiansplat)"
+    if [ -n "$tag" ]; then
+        say "restoring $tag (recorded before the run)"
+        gh release download "$tag" -R DisplayXR/displayxr-demo-gaussiansplat -p '*.apk' -D "$tmp" \
+            || die "could not download the APK for $tag (gh release view $tag -R DisplayXR/displayxr-demo-gaussiansplat)"
+    else
+        say "no recorded pre-run version and no RESTORE_TAG — falling back to the LATEST release"
+        gh release download -R DisplayXR/displayxr-demo-gaussiansplat -p '*.apk' -D "$tmp" \
+            || die "could not download the released APK (try: gh release list -R DisplayXR/displayxr-demo-gaussiansplat)"
+    fi
     apk=$(find "$tmp" -name '*.apk' | head -1)
     adb uninstall "$PKG" >/dev/null 2>&1
     adb install "$apk" || die "install of $apk failed"
@@ -235,6 +249,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 adb shell dumpsys usagestats > "$OUT/usagestats_start.txt" 2>/dev/null
+printf 'versionName=%s\nversionCode=%s\n' "${installed:-}" "${installed_code:-}" > "$OUT/installed_before.txt"
 
 # ── install ──────────────────────────────────────────────────────────────────
 say "uninstalling $PKG (was ${installed:-<absent>}) — signature differs, so -r cannot work"
