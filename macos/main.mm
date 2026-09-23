@@ -62,6 +62,7 @@
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"       // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "gs_scene_fit.h"        // the shared, depth-aware display-rig fit
+#include "color_policy.h"        // dxr::DisplayReferredToSceneLinear — the sRGB EOTF the placeholder clear needs
 #include "launch_args.h"         // dxr::ParseLaunchArgs — the shared --key=value grammar
 #include "atlas_capture.h"
 #include "auto_fit.h"             // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
@@ -2079,8 +2080,14 @@ static void CleanupOpenXR(AppXrSession& xr) {
 // Placeholder rendering (clear to dark gray when no scene loaded)
 // ============================================================================
 
+// See the note on windows/main.cpp::RenderPlaceholder: `vkCmdClearColorImage`
+// converts through the image's FORMAT, so an authored display-referred colour
+// handed to the `_SRGB` swapchain this leg prefers is ENCODED on the way in and
+// comes out too bright ({0.125, 0.14, 0.15} stored (99, 105, 108) instead of
+// the authored (32, 36, 38)). Linearise first on an `_SRGB` target; leave alpha
+// alone, which an `_SRGB` format does not encode.
 static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
-                               VkImage image, uint32_t w, uint32_t h,
+                               VkImage image, VkFormat format, uint32_t w, uint32_t h,
                                float yaw, float pitch) {
     VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     ai.commandPool = pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1;
@@ -2098,10 +2105,17 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    // Tint color based on camera direction so drag-rotation gives visual feedback
+    // Tint color based on camera direction so drag-rotation gives visual
+    // feedback. Authored display-referred (sRGB-encoded), like every colour
+    // picked by eye.
     float ny = (yaw / 3.14159f) * 0.5f + 0.5f;   // 0..1 over ±π
     float np = (pitch / 1.5f) * 0.5f + 0.5f;       // 0..1 over ±1.5 rad
-    VkClearColorValue cc = {{0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f, 1.0f}};
+    const float tintRgb[3] = {0.05f + ny * 0.15f, 0.08f + np * 0.12f, 0.15f};
+    const bool srgbTarget = gsIsSrgbFormat(format);
+    auto ch = [&](int i) {
+        return srgbTarget ? dxr::DisplayReferredToSceneLinear(tintRgb[i]) : tintRgb[i];
+    };
+    VkClearColorValue cc = {{ch(0), ch(1), ch(2), 1.0f}};
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &range);
 
@@ -3555,7 +3569,8 @@ int main(int argc, char** argv) {
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
-                                    targetImage, xr.swapchain.width, xr.swapchain.height,
+                                    targetImage, swapFormat,
+                                    xr.swapchain.width, xr.swapchain.height,
                                     g_input.yaw, g_input.pitch);
                             }
 
