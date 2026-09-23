@@ -34,10 +34,8 @@ FetchContent_Declare(
     # native Wayland in one binary, chosen by capability), shared with the
     # runtime's test apps and the other demos. The Android leg keeps its own
     # pin (android/src/main/cpp/CMakeLists.txt), untouched.
-    # TEMPORARY: the displayxr-common PR commit (displayxr-common#58); switch to
-    # `GIT_TAG v2.20.0` + `GIT_SHALLOW TRUE` once that tag is cut.
-    GIT_TAG 13d2b2eb897cba9dbb7750ca072e6612c2ab325f
-    GIT_SHALLOW FALSE
+    GIT_TAG v2.20.0
+    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
 
