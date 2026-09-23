@@ -56,6 +56,7 @@ endif()
 
 add_executable(gaussian_splatting_handle_vk_linux
     main.cpp
+    clickthrough.cpp # input-region punch-through (Ctrl+T transparent mode)
 )
 
 target_include_directories(gaussian_splatting_handle_vk_linux PRIVATE

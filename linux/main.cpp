@@ -91,6 +91,10 @@
 #include "gs_scene_fit.h"         // the shared, depth-aware display-rig fit
 #include "launch_args.h"          // dxr::ParseLaunchArgs — the shared --key=value grammar
 #include "mode_switch.h"          // dxr::ModeSwitch — the shared 2D<->3D ramp (V / 0-8 keys)
+#include "clip_policy.h"          // dxr::ResolveClipPlanes — the transparent-mode ZDP clip
+#include "color_policy.h"         // dxr::DisplayReferredToSceneLinear (placeholder clear)
+#include "gs_vulkan_utils.h"      // gsIsSrgbFormat
+#include "clickthrough.h"         // input-region punch-through (Ctrl+T transparent mode)
 #pragma pop_macro("None")
 
 // ============================================================================
@@ -220,6 +224,80 @@ static int32_t g_absoluteModeRequested = -1;
 // connection).
 static DxrLinuxWindow g_window;
 static DxrWeaveSnap g_weaveSnap;
+
+// Ctrl+T: opaque <-> transparent background — the Windows leg's
+// g_transparentBg. The session is created transparent-capable (an ARGB window
+// + transparentBackgroundEnabled, both fixed at creation, as Windows'
+// xr_session.cpp sets it unconditionally); this flag only flips what the
+// renderer writes: alpha 1 (opaque) or 1 - T, so the pixels no splat covers
+// show the desktop. Starts OPAQUE (Windows parity) unless --transparent.
+// g_transparentCapable drops to false when the window system has no ARGB
+// visual or there is no app window (hosted-NULL), and Ctrl+T then refuses.
+static bool g_transparentCapable = true;
+static bool g_transparentBg = false;
+
+// The Windows leg's RenderPlaceholder: clear the whole atlas to the viewer's
+// slate while no scene is loaded, and hand it back in COLOR_ATTACHMENT_OPTIMAL
+// (the layout renderEye leaves and the click-through expects). Opaque in both
+// modes, as on Windows, so an empty transparent window stays visible and
+// clickable instead of vanishing.
+static VkCommandPool g_placeholderPool = VK_NULL_HANDLE;
+
+static void RenderPlaceholder(VkDevice device, VkQueue queue, uint32_t queueFamily,
+                              VkImage image, VkFormat format) {
+    if (g_placeholderPool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = queueFamily;
+        if (vkCreateCommandPool(device, &pci, nullptr, &g_placeholderPool) != VK_SUCCESS) return;
+    }
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = g_placeholderPool;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    if (vkAllocateCommandBuffers(device, &ai, &cmd) != VK_SUCCESS) return;
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmd, &bi);
+
+    const VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = range;
+    b.srcAccessMask = 0;
+    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+
+    // Authored display-referred (sRGB-encoded), like every colour picked by eye.
+    static const float kPlaceholderRgb[3] = {0.1f, 0.1f, 0.12f};
+    const bool srgbTarget = gsIsSrgbFormat(format);
+    auto ch = [&](int i) {
+        return srgbTarget ? dxr::DisplayReferredToSceneLinear(kPlaceholderRgb[i]) : kPlaceholderRgb[i];
+    };
+    VkClearColorValue color = {{ch(0), ch(1), ch(2), 1.0f}};
+    vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &color, 1, &range);
+
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    b.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &b);
+    vkEndCommandBuffer(cmd);
+
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(queue);
+    vkFreeCommandBuffers(device, g_placeholderPool, 1, &cmd);
+}
 
 static void SignalHandler(int sig) {
     (void)sig;
@@ -518,6 +596,7 @@ struct AppXrSession {
 
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
+    bool hasDepthBudgetExt = false;      //!< XR_DXR_depth_budget (the transparent-mode rear clip)
     bool hasXlibBindingExt = false;
     bool hasWaylandBindingExt = false;
     //! Window platform resolved before xrCreateInstance; Auto = hosted-NULL.
@@ -571,6 +650,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) xr.hasDepthBudgetExt = true;
     }
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
@@ -578,6 +658,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    if (xr.hasDepthBudgetExt) enabled.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
     // Window platform, resolved BEFORE xrCreateInstance so only the binding the
     // session will chain is enabled. A capability probe (connection attempt +
     // what the compositor advertises), never session env vars; an explicit
@@ -771,8 +852,11 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
 
     // Handle app: the window helper hands back the binding for its platform
     // (xlib, or Wayland + its surface-geometry struct), bound to the CONTENT
-    // (never the header bar), opaque (transparentBackgroundEnabled = false).
-    // Falls back to hosted-NULL (no window binding — the runtime self-creates a
+    // (never the header bar), with transparentBackgroundEnabled set when the
+    // window is transparent-capable — the runtime fixes the swapchain's alpha
+    // mode here, so Ctrl+T can only work if the session starts this way. Opaque
+    // frames write alpha 1 throughout, which composites exactly like an opaque
+    // session. Falls back to hosted-NULL (no window binding — the runtime self-creates a
     // window at native resolution) when there is no app window.
     const bool useAppWindow = xr.hasAppWindow;
 
@@ -781,7 +865,11 @@ static bool CreateSession(AppXrSession& xr, VkInstance vkInstance, VkPhysicalDev
     si.systemId = xr.systemId;
     XR_CHECK(xrCreateSession(xr.instance, &si, &xr.session));
     if (useAppWindow) g_window.attach_session(xr.instance, xr.session);   // Wayland geometry feed
-    LOG_INFO("Session created (%s)", useAppWindow ? g_window.describe().c_str() : "hosted-NULL");
+    LOG_INFO("Session created (%s%s)", useAppWindow ? g_window.describe().c_str() : "hosted-NULL",
+             (useAppWindow && g_transparentCapable)
+                 ? (g_transparentBg ? ", transparent-capable — starting TRANSPARENT"
+                                    : ", transparent-capable — starting opaque (Ctrl+T toggles)")
+                 : ", opaque only (no Ctrl+T)");
 
     if (xr.pfnEnumerateDisplayRenderingModesEXT && xr.session != XR_NULL_HANDLE) {
         uint32_t modeCount = 0;
@@ -994,6 +1082,9 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.panel_height = (uint32_t)prh;
     desc.title = "DisplayXR Gaussian Splat Viewer";
     desc.app_id = "com.displayxr.gaussiansplat";
+    desc.transparent = g_transparentCapable;   // ARGB visual / alpha surface: Ctrl+T can work
+    desc.keep_above = g_transparentCapable && g_transparentBg;             // --transparent floats
+    desc.transparent_background = g_transparentCapable && g_transparentBg; // no header bar while transparent
     desc.x11_header_bar = true;     // LMB on the bar moves the window (snapped)
     desc.x11_drag_button = 0;       // LMB below the bar orbits; no drag-anywhere button
     desc.wayland_drag_button = 0;
@@ -1008,11 +1099,19 @@ static bool CreateAppWindow(AppXrSession& xr) {
         return false;
     }
     xr.hasAppWindow = true;
+    if (g_transparentCapable && !g_window.is_transparent()) {
+        // X11 screen without an ARGB visual: the handle path stays (it is what
+        // weaves window-relative); only transparency is lost.
+        g_transparentCapable = false;
+        g_transparentBg = false;
+    }
     uint32_t cw = w, ch = h;
     g_window.current_size(&cw, &ch);
     xr.xWinW = cw;
     xr.xWinH = ch;
-    LOG_INFO("Created %ux%u window on %s", cw, ch, g_window.connection_description().c_str());
+    LOG_INFO("Created %ux%u %s window on %s", cw, ch,
+             g_window.is_transparent() ? "transparent-capable" : "opaque",
+             g_window.connection_description().c_str());
     return true;
 }
 
@@ -1101,6 +1200,22 @@ static double NowSec() {
 //! sits over the window.
 static void MarkUserInput() { g_lastInputTimeSec = NowSec(); }
 
+// Ctrl+T — Windows' transparentBgToggleRequested + kBorderlessMsg. The header
+// bar hides while transparent (Windows goes borderless), the window floats
+// above other apps, and the click-through region is re-applied (or dropped)
+// by ClickthroughUpdate on the next frame, its only owner.
+static void ToggleTransparentBackground() {
+    if (!g_transparentCapable) {
+        LOG_WARN("Ctrl+T ignored — this session is not transparent-capable "
+                 "(no 32-bit ARGB visual, or hosted-NULL)");
+        return;
+    }
+    g_transparentBg = !g_transparentBg;
+    LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+    g_window.set_transparent_background(g_transparentBg);
+    if (!g_window.is_fullscreen()) g_window.set_keep_above(g_transparentBg);
+}
+
 // Handle the app window's input events (displayxr::linux_window — the same
 // stream on X11 and Wayland: X11 keysyms, content-relative pixels).
 //
@@ -1120,6 +1235,7 @@ static void MarkUserInput() { g_lastInputTimeSec = NowSec(); }
 //   F11                     fullscreen               input_handler.cpp:237
 //   ESC / Q                 quit                     windows/main.cpp:1732
 //   Ctrl+O                  open a scene             windows/main.cpp:1743
+//   Ctrl+T                  transparent background   input_handler.cpp (Ctrl+T)
 //
 // The header bar, the window drag and F11 are the helper's; the orbit drag is
 // incremental and accumulates every Motion event.
@@ -1155,6 +1271,10 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
                 // into a ModeSwitch request and the sequencer fires
                 // xrRequestDisplayRenderingModeDXR on the right frame.
                 g_cycleModeRequested = true;
+                break;
+            case XK_t: case XK_T:
+                // Ctrl+T = transparent background. Strict: bare T does nothing.
+                if (ctrl) ToggleTransparentBackground();
                 break;
             case XK_m: case XK_M:
                 g_animateEnabled = !g_animateEnabled;
@@ -1363,6 +1483,12 @@ int main(int argc, char** argv) {
             cliScenePath = g_launch.src;
         else if (!g_launch.positionalPath.empty())
             cliScenePath = g_launch.positionalPath;
+        // --transparent: start in transparent mode (Windows parity:
+        // g_transparentBg = g_launch.transparent).
+        if (g_launch.transparent) {
+            g_transparentBg = true;
+            LOG_INFO("launch: --transparent");
+        }
         if (g_launch.srcKind == dxr::LaunchSrcKind::Url)
             LOG_WARN("launch: --src URL is not fetched on Linux; pass a local path");
 
@@ -1420,6 +1546,11 @@ int main(int argc, char** argv) {
     // rect). Falls back to hosted-NULL when no window system answers (also
     // the CI-safe path — CI never runs this).
     CreateAppWindow(xr);
+    if (!xr.hasAppWindow) {
+        // hosted-NULL: the runtime's own window is opaque — no Ctrl+T.
+        g_transparentCapable = false;
+        g_transparentBg = false;
+    }
 
     if (!GetVulkanGraphicsRequirements(xr)) { CleanupOpenXR(xr); return 1; }
 
@@ -1776,6 +1907,17 @@ int main(int argc, char** argv) {
                 }
             }
 
+            // XR_DXR_depth_budget (windows/main.cpp #100): the runtime's
+            // advisory rear depth budget, appended to the SAME viewState chain
+            // after view_rig so both survive. Its `type` stays 0 unless a
+            // runtime that knows the struct fills it — that is how "filled" is
+            // told from "not". Only the display rig consults it (the camera
+            // rig clips at its pivot, as on Windows). No content bounds / mask
+            // are chained on this leg, so the runtime measures its fallback
+            // region (the whole canvas).
+            XrRearDepthBudgetDXR depthBudget{};
+            if (xr.hasDepthBudgetExt) dxr::ChainRearDepthBudget(viewState, depthBudget);
+
             uint32_t runtimeViewCount = xr.maxViewCount > 8 ? 8 : (xr.maxViewCount ? xr.maxViewCount : 2);
             XrView views[8] = {};
             for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
@@ -1940,6 +2082,7 @@ int main(int argc, char** argv) {
                         int srcView = eye < (int)runtimeViewCount ? eye : 0;
                         float viewMat[16], projMat[16];
                         float clipNear = 0.0f, clipFar = 0.0f;
+                        float clipCull = 0.0f; // renderEye's far cull; 0 = none (Windows' clip.clipFar)
                         XrFovf fov = views[srcView].fov;
                         if (useRig && camRig) {
                             // Tangent-space window shift for the asset's own
@@ -1958,11 +2101,12 @@ int main(int argc, char** argv) {
                             // (a deconverged lift puts the sky at the depth
                             // worker's cap); a splat rasteriser sorts rather
                             // than depth-tests, so the huge near:far ratio costs
-                            // no precision. This leg never renders transparent,
-                            // so there is no ZDP-clipped variant to choose.
+                            // no precision. Transparent mode still clips at the
+                            // ZDP, which here is the pivot (windows/main.cpp).
                             clipNear = kGsCameraRigNearM;
-                            clipFar  = kGsCameraRigFarM;
+                            clipFar  = g_transparentBg ? g_camRig.pivotM : kGsCameraRigFarM;
                             if (clipFar < clipNear + 1e-4f) clipFar = clipNear + 1e-4f;
+                            clipCull = g_transparentBg ? clipFar : 0.0f;
                             mat4_view_from_xr_pose(viewMat, views[srcView].pose);
                             if (camOrbiting) {
                                 // view * scene: rigid, so the gaussian
@@ -1974,9 +2118,31 @@ int main(int argc, char** argv) {
                             mat4_from_xr_fov(projMat, fov, clipNear, clipFar);
                         } else if (useRig) {
                             float ez = RigLocalEyeZ(cameraPose, views[srcView].pose.position);
-                            clipNear = (ez - virtualDisplayHeight > 1e-4f) ? (ez - virtualDisplayHeight) : 1e-4f;
-                            clipFar = ez + 1000.0f * virtualDisplayHeight;
-                            if (clipFar < clipNear + 1e-4f) clipFar = clipNear + 1e-4f;
+                            // The Windows leg's one clip rule (clip_policy.h): opaque
+                            // = unrestricted; transparent = the runtime's rear depth
+                            // budget, or the standalone ZDP clip when it reports none.
+                            const XrRearDepthBudgetDXR* budgetPtr =
+                                (xr.hasDepthBudgetExt && depthBudget.type == XR_TYPE_REAR_DEPTH_BUDGET_DXR)
+                                    ? &depthBudget : nullptr;
+                            const dxr::ClipPlanes clip = dxr::ResolveClipPlanes(
+                                ez, virtualDisplayHeight, budgetPtr, g_transparentBg, /*standalone=*/true);
+                            if (eye == 0) {
+                                // One line per change of the applied rear offset
+                                // (rounded to 0.01 vH) — what the Windows HUD shows.
+                                static int s_lastCenti = -1;
+                                const int centi = (int)lroundf(clip.farOffsetVH * 100.0f);
+                                if (centi != s_lastCenti) {
+                                    s_lastCenti = centi;
+                                    LOG_INFO("Rear clip: farOffsetVH=%.2f (%s, transparent=%d)",
+                                             clip.farOffsetVH,
+                                             budgetPtr ? dxr::RearDepthBudgetStateName(budgetPtr->state)
+                                                       : "no budget",
+                                             g_transparentBg ? 1 : 0);
+                                }
+                            }
+                            clipNear = clip.near_z;
+                            clipFar = clip.far_z;
+                            clipCull = clip.clipFar;
                             mat4_view_from_xr_pose(viewMat, views[srcView].pose);
                             mat4_from_xr_fov(projMat, views[srcView].fov, clipNear, clipFar);
                         } else {
@@ -2006,11 +2172,59 @@ int main(int argc, char** argv) {
                                 xr.swapchain.width, xr.swapchain.height,
                                 vpX, vpY, renderW, renderH,
                                 viewMat, projMat,
-                                /*transparentBg=*/false,
-                                clipNear, clipFar, /*clipFadeFrac=*/0.15f);
+                                g_transparentBg,
+                                clipNear, clipCull, /*clipFadeFrac=*/0.15f);
+                        } else if (eye == 0) {
+                            // Nothing loaded yet: the Windows leg's slate
+                            // placeholder, not stale swapchain contents (which
+                            // the click-through would also read as coverage).
+                            RenderPlaceholder(vkDevice, graphicsQueue, queueFamilyIndex,
+                                              targetImage, swapFormat);
                         }
                     }
                     DxrAliasInactiveViews(projectionViews.data(), views, runtimeViewCount, (uint32_t)eyeCount);
+
+                    // #833 click-through (windows/main.cpp's g_punch): while
+                    // transparent, shape the window's INPUT region from the
+                    // frame's own alpha — first and last view unioned — so
+                    // clicks pass through to the desktop around the splats.
+                    // Before the release: it hands the atlas back in
+                    // COLOR_ATTACHMENT_OPTIMAL, the layout the runtime expects.
+                    if (xr.hasAppWindow) {
+                        uint32_t winPxW = 0, winPxH = 0;
+                        g_window.current_size(&winPxW, &winPxH);
+                        const uint32_t lastEye = (uint32_t)(eyeCount - 1);
+                        ClickthroughParams cp;
+                        cp.dev = vkDevice;
+                        cp.phys = physDevice;
+                        cp.queue = graphicsQueue;
+                        cp.queueFamily = queueFamilyIndex;
+                        cp.viewImage = targetImage;
+                        cp.viewFormat = swapFormat;
+                        cp.tileW = renderW;
+                        cp.tileH = renderH;
+                        cp.firstTileX = 0;
+                        cp.firstTileY = 0;
+                        cp.lastTileX = (lastEye % tileColumns) * renderW;
+                        cp.lastTileY = (lastEye / tileColumns) * renderH;
+                        cp.twoViews = eyeCount > 1;
+                        cp.window = &g_window;
+                        cp.winW = winPxW;
+                        cp.winH = winPxH;
+                        cp.transparentBg = g_transparentBg;
+                        // A WM-decorated X11 window or a fullscreen one is never
+                        // shaped: the frame needs the whole window for
+                        // move/resize, and a fullscreen overlay has nothing
+                        // beside it to click through to.
+                        static const bool s_wmDecorated = [] {
+                            const char* e = getenv("DXR_X11_WM_DECORATIONS");
+                            return e != nullptr && e[0] != '\0' && strcmp(e, "0") != 0;
+                        }();
+                        cp.decorated = g_window.is_fullscreen() ||
+                                       (s_wmDecorated && g_window.backend() == DxrWindowBackend::X11);
+                        cp.chromeVisible = g_window.header_bar_visible();
+                        ClickthroughUpdate(cp);
+                    }
                     ReleaseSwapchainImage(xr);
                 }
             }
@@ -2024,6 +2238,8 @@ int main(int argc, char** argv) {
     LOG_INFO("Shutting down");
     if (xr.session) xrRequestExitSession(xr.session);
     vkDeviceWaitIdle(vkDevice);
+    ClickthroughDestroy(vkDevice);
+    if (g_placeholderPool != VK_NULL_HANDLE) vkDestroyCommandPool(vkDevice, g_placeholderPool, nullptr);
     g_gsRenderer.cleanup();
     CleanupOpenXR(xr);
     vkDestroyDevice(vkDevice, nullptr);
