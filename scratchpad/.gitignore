@@ -5,3 +5,6 @@ android_bench*/
 *.spz
 *.ply
 *.apk
+web_bench*/
+websyn/
+__pycache__/
