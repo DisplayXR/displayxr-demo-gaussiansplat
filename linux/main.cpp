@@ -1529,14 +1529,25 @@ int main(int argc, char** argv) {
                 LOG_INFO("mode switch requested: %u (%u view%s) -> %d (%u view%s)",
                          cur, currentVC, currentVC == 1 ? "" : "s",
                          want, targetVC, targetVC == 1 ? "" : "s");
+                // From the ramp's own value while one is in flight, else the
+                // steady value the frame is actually rendering with.
                 g_modeSwitch.request((uint32_t)want, targetVC, cur, currentVC,
-                                     g_ipdFactor, g_steadyIpd);
+                                     g_modeSwitch.active() ? g_modeSwitch.ipd() : g_steadyIpd,
+                                     g_steadyIpd);
             }
 
+            // The ramp's output ONLY while a switch is in flight. Idle,
+            // ModeSwitch::update() reports its last ramp value — 0 before the
+            // first switch — and taking it then gave every frame ipdFactor 0:
+            // both eyes at one position, zero parallax, a woven image that
+            // reads as flat 2D. Idle renders the steady strength (which also
+            // tracks +/- at once), as modelviewer's UpdateModeSwitch does.
             float rampIpd = g_steadyIpd;
             bool fire = false;
             uint32_t fireMode = cur;
-            g_modeSwitch.update(dt, &rampIpd, &fire, &fireMode);
+            if (g_modeSwitch.active()) {
+                g_modeSwitch.update(dt, &rampIpd, &fire, &fireMode);
+            }
             g_ipdFactor = rampIpd;
             if (fire && fireMode != xr.currentRenderingMode) {
                 const XrResult mr = xr.pfnRequestDisplayRenderingModeEXT(xr.session, fireMode);
