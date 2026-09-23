@@ -42,6 +42,77 @@ import re
 import statistics
 import sys
 
+# ── weave / composite cadence, from a `logcat -d -v epoch` capture ───────────
+# NEITHER line carries a timestamp of its own — each carries only a counter — so
+# the interval is logcat's epoch stamp over the counter delta. That pairing is
+# what makes a 1-in-300 throttled line an EXACT cadence rather than an estimate.
+#
+#   runtime, tag `monado.comp_multi_weave_submit`
+#     (comp_multi_weave_android.c:2181; tag is monado.<__func__>, not XRT)
+#     ... weave(#1036): SELF-SUBMIT SPLIT active (frame=301): pre-weave batch …
+#     split_frames is POST-incremented -> printed 1, 301, 601, 901 …  dN = 300
+#     Gated on xrt_display_processor_is_self_submitting(): TRUE for the Leia
+#     CNSDK DP, FALSE for sim_display. Silence on this tag therefore means the
+#     active DP is not the Leia plug-in — it does NOT mean the weave stalled.
+#     No prop, no service restart: DXR_ANDROID_WEAVE_SPLIT defaults true and its
+#     sysprop name is 33 chars, past Android's 32-char PROP_NAME_MAX, so it is
+#     structurally unreachable and cannot have been switched off.
+#
+#   browser, tag `chromium` ([DisplayXR] is a message prefix, never a tag)
+#     (patch 0106 -> skia_output_surface_impl_on_gpu.cc WeaveCompositedSurface)
+#     [DisplayXR] inline-3D occlusion composite: over-plane 1600x1000 drawn=1 …
+#       … events=241)
+#     Throttle `n < 3 || n % 120 == 0` with events=(n+1) -> 1, 2, 3, 121, 241 …
+#     so dN = 120 only AFTER the opening burst; the 1->2->3 pairs are 1 frame
+#     apart and would read as a wildly high frame rate. They are dropped below.
+WEAVE_PATTERNS = [
+    ("runtime weave submit", "monado.comp_multi_weave_submit",
+     re.compile(r"^\s*(?P<ts>\d+\.\d+).*?\bframe=(?P<n>\d+)")),
+    ("browser inline-3D composite", "chromium",
+     re.compile(r"^\s*(?P<ts>\d+\.\d+).*?inline-3D occlusion composite.*?\bevents=(?P<n>\d+)")),
+]
+
+
+def weave_interval(path):
+    """Print submit/composite intervals from a `logcat -d -v epoch` capture."""
+    text = open(path, errors="replace").read().splitlines()
+    any_hit = False
+    for name, tag, rx in WEAVE_PATTERNS:
+        pts = []
+        for line in text:
+            m = rx.search(line)
+            if m:
+                pts.append((float(m.group("ts")), int(m.group("n"))))
+        print("\n## %s  (tag `%s`)" % (name, tag))
+        if len(pts) < 2:
+            print("   %d line(s) — need >= 2 to measure an interval." % len(pts))
+            if not pts and tag.startswith("monado"):
+                print("   Silence here means the active display processor is not the Leia")
+                print("   plug-in (sim_display is not self-submitting), NOT a stalled weave.")
+            continue
+        any_hit = True
+        rows = []
+        for (t0, n0), (t1, n1) in zip(pts, pts[1:]):
+            dn, dt = n1 - n0, t1 - t0
+            # Drop the opening 1->2->3 burst: those pairs are one frame apart and
+            # would read as a frame rate the device never sustained.
+            if dn < 10 or dt <= 0:
+                continue
+            rows.append((dt / dn * 1000.0, dn, dt))
+        if not rows:
+            print("   only the opening burst — no throttled pair to measure.")
+            continue
+        per = [r[0] for r in rows]
+        print("   %d interval(s) over %d lines; dN=%d per step" % (len(rows), len(pts), rows[0][1]))
+        print("   per-frame: median %.2f ms (%.1f fps)  min %.2f  max %.2f"
+              % (statistics.median(per), 1000.0 / statistics.median(per), min(per), max(per)))
+    if not any_hit:
+        print("\nNo usable cadence pairs. Capture with:")
+        print("   adb logcat -d -v epoch -s chromium | grep 'inline-3D occlusion composite'")
+        print("   adb logcat -d -v epoch -s monado.comp_multi_weave_submit")
+    return 0
+
+
 SAMPLE_RE = re.compile(r"^#SAMPLE\s+(?P<body>.*)$")
 META_RE = re.compile(r"^#META\s+(?P<body>.*)$")
 STATS_RE = re.compile(r"^#STATS\s+(?P<body>.*)$")
@@ -291,6 +362,8 @@ def main():
     ap.add_argument("dir", nargs="?", help="directory of <config>.log files")
     ap.add_argument("--extract-stats", metavar="FILE",
                     help="print the stats JSON found in FILE and exit")
+    ap.add_argument("--weave-interval", metavar="FILE",
+                    help="weave-submit / composite cadence from a `logcat -v epoch` capture")
     ap.add_argument("--native", default=None,
                     help="native rows: a .md table, or a bench_android.sh output dir. "
                          "Default: ../results/android_np02j_table.md, else ../android_bench")
@@ -298,6 +371,9 @@ def main():
     a = ap.parse_args()
 
     here = os.path.dirname(os.path.abspath(__file__))
+
+    if a.weave_interval:
+        return weave_interval(a.weave_interval)
 
     if a.extract_stats:
         try:
