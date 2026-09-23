@@ -46,6 +46,11 @@ import time
 
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+# Bounded by default, and overridable from the environment so the benchmark can
+# tighten them without editing code. Nothing here may block indefinitely.
+CONNECT_TIMEOUT = float(os.environ.get("CDP_CONNECT_TIMEOUT", 5))
+RECV_TIMEOUT = float(os.environ.get("CDP_RECV_TIMEOUT", 10))
+
 
 def log(*a):
     print(*a, file=sys.stderr)
@@ -55,7 +60,7 @@ def log(*a):
 # Chrome's DevTools HTTP endpoint rejects requests whose Host header is neither
 # "localhost" nor a bare IP (DNS-rebinding protection), so the Host is pinned
 # explicitly rather than left to http.client's default.
-def http_json(port, path, host="127.0.0.1", timeout=5.0):
+def http_json(port, path, host="127.0.0.1", timeout=CONNECT_TIMEOUT):
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request("GET", path, headers={"Host": "localhost:%d" % port,
@@ -87,15 +92,60 @@ def list_targets(port, host="127.0.0.1"):
     return http_json(port, "/json", host=host)
 
 
-def pick_page(targets, match=None):
-    """First `page` target whose url/title contains `match` (or any page)."""
+def pick_page(targets, match=None, match_all=None):
+    """The `page` target matching EVERY required substring.
+
+    `match_all` exists because `am force-stop` does not close tabs: they restore
+    on the next launch, so /json lists every previous config's page and a loose
+    single-substring match picks one at random. Two ways that goes wrong, both
+    silent: a backgrounded tab's rAF is throttled so it never reaches `done`,
+    and an EARLIER config's tab still holds a frozen `done` object that would be
+    read as THIS config's result. Requiring engine= AND rs= (AND asset= for the
+    Tahoe arm) makes the selection unambiguous.
+
+    Returns None if zero match; raises LookupError if several do, because a tie
+    means the caller's discriminator is not discriminating and silently taking
+    the first is how a wrong number gets published.
+    """
     pages = [t for t in targets if t.get("type") == "page"
              and t.get("webSocketDebuggerUrl")]
+    need = list(match_all or [])
     if match:
-        hit = [t for t in pages
-               if match in t.get("url", "") or match in t.get("title", "")]
-        pages = hit
+        need.append(match)
+    for sub in need:
+        pages = [t for t in pages
+                 if sub in t.get("url", "") or sub in t.get("title", "")]
+    if len(pages) > 1 and need:
+        raise LookupError(
+            "%d page targets all match %r — refusing to guess: %s"
+            % (len(pages), need, [t.get("url") for t in pages]))
     return pages[0] if pages else None
+
+
+def close_other_pages(port, keep_id, host="127.0.0.1"):
+    """Close every page target except `keep_id`, over the BROWSER endpoint.
+
+    Target.closeTarget is a browser-level command, so it needs the
+    webSocketDebuggerUrl from /json/version, not a page's own socket.
+    """
+    closed, failed = [], []
+    ver = http_json(port, "/json/version", host=host)
+    burl = ver.get("webSocketDebuggerUrl")
+    if not burl:
+        return closed, ["no browser webSocketDebuggerUrl in /json/version"]
+    c = CDP(burl)
+    try:
+        for t in list_targets(port, host=host):
+            if t.get("type") != "page" or t.get("id") == keep_id:
+                continue
+            try:
+                c.call("Target.closeTarget", {"targetId": t["id"]})
+                closed.append(t.get("url", "")[:120])
+            except Exception as e:
+                failed.append("%s: %s" % (t.get("id"), e))
+    finally:
+        c.close()
+    return closed, failed
 
 
 # ────────────────────────── WebSocket side (RFC 6455) ────────────────────────
@@ -103,7 +153,7 @@ class WebSocket(object):
     """The minimum client that CDP needs: text frames, client masking,
     continuation frames, ping/pong, 64-bit lengths. No extensions, no TLS."""
 
-    def __init__(self, url, timeout=30.0):
+    def __init__(self, url, timeout=RECV_TIMEOUT, connect_timeout=CONNECT_TIMEOUT):
         # ws://127.0.0.1:9222/devtools/page/<id>
         if not url.startswith("ws://"):
             raise ValueError("only ws:// is supported here, got %r" % url)
@@ -112,7 +162,12 @@ class WebSocket(object):
         path = "/" + path
         host, _, port = netloc.partition(":")
         port = int(port or 80)
-        self.sock = socket.create_connection((host, port), timeout=timeout)
+        # Separate connect and recv budgets. Against the NP02J over adb-forward
+        # a dead socket must fail FAST (nothing is listening), while a live
+        # Runtime.evaluate on a busy page legitimately takes a moment. One
+        # shared 30 s timeout made a dead transport look like a slow page for
+        # four hours on 2026-09-22.
+        self.sock = socket.create_connection((host, port), timeout=connect_timeout)
         self.sock.settimeout(timeout)
         self._buf = b""
         key = base64.b64encode(os.urandom(16)).decode()
@@ -224,7 +279,7 @@ class WebSocket(object):
 
 # ───────────────────────────────── CDP ───────────────────────────────────────
 class CDP(object):
-    def __init__(self, ws_url, timeout=30.0):
+    def __init__(self, ws_url, timeout=RECV_TIMEOUT):
         self.ws = WebSocket(ws_url, timeout=timeout)
         self._id = 0
 
@@ -259,12 +314,12 @@ class CDP(object):
 
 
 def evaluate_on_port(port, expression, match=None, host="127.0.0.1",
-                     timeout=20.0, await_promise=False):
+                     timeout=20.0, await_promise=False, match_all=None):
     """One-shot: endpoint -> target -> evaluate -> value. Raises on failure."""
     wait_endpoint(port, host=host, timeout=timeout)
-    tgt = pick_page(list_targets(port, host=host), match)
+    tgt = pick_page(list_targets(port, host=host), match, match_all)
     if tgt is None:
-        raise LookupError("no page target matching %r" % (match,))
+        raise LookupError("no page target matching %r / %r" % (match, match_all))
     c = CDP(tgt["webSocketDebuggerUrl"])
     try:
         return c.evaluate(expression, await_promise=await_promise)
@@ -360,6 +415,13 @@ def main():
     ap.add_argument("--version", action="store_true", help="dump /json/version")
     ap.add_argument("--match", default=None,
                     help="substring of the target page's URL or title")
+    ap.add_argument("--match-all", dest="match_all", action="append", default=[],
+                    help="substring the target MUST contain; repeatable. Every one "
+                         "must match, and an ambiguous result is an error, not a guess.")
+    ap.add_argument("--list-brief", action="store_true",
+                    help="one line per target: <type> <url>")
+    ap.add_argument("--close-others", action="store_true",
+                    help="close every page target except the matched one")
     ap.add_argument("--eval", dest="expr", default=None,
                     help="JS expression; its value is printed on stdout")
     ap.add_argument("--await-promise", action="store_true")
@@ -375,6 +437,10 @@ def main():
         if a.version:
             print(json.dumps(http_json(a.port, "/json/version", host=a.host), indent=2))
             return 0
+        if a.list_brief:
+            for t in list_targets(a.port, host=a.host):
+                print("%s %s" % (t.get("type"), t.get("url", "")))
+            return 0
         if a.list:
             tg = list_targets(a.port, host=a.host)
             print(json.dumps([{k: t.get(k) for k in
@@ -385,11 +451,29 @@ def main():
         log("no DevTools endpoint on %s:%d — %s" % (a.host, a.port, e))
         return 3
 
+    if a.close_others:
+        try:
+            wait_endpoint(a.port, host=a.host, timeout=a.timeout)
+            tgt = pick_page(list_targets(a.port, host=a.host), a.match, a.match_all)
+            keep = tgt.get("id") if tgt else None
+            closed, failed = close_other_pages(a.port, keep, host=a.host)
+            print("kept: %s" % ((tgt or {}).get("url") or "<none matched>"))
+            for u in closed:
+                print("closed: %s" % u)
+            for f in failed:
+                print("close FAILED: %s" % f)
+        except Exception as e:
+            print("close-others failed: %s" % e)
+        if not a.expr:
+            return 0
+
     if not a.expr:
-        ap.error("one of --list / --version / --eval / --selftest is required")
+        ap.error("one of --list / --list-brief / --version / --eval / "
+                 "--close-others / --selftest is required")
     try:
         val = evaluate_on_port(a.port, a.expr, match=a.match, host=a.host,
-                               timeout=a.timeout, await_promise=a.await_promise)
+                               timeout=a.timeout, await_promise=a.await_promise,
+                               match_all=a.match_all)
     except LookupError as e:
         log(str(e))
         return 4

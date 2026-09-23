@@ -151,7 +151,7 @@ def parse_log(path):
          "rotation": "?", "browser": "?", "reader": "none",
          "warm_s": None, "win_s": None, "done_t": None,
          "cdp_ready": "?", "stats": None, "samples": [], "phases": [],
-         "wedge": 0}
+         "wedge": 0, "foreground": "", "foreground_end": "", "readerr": []}
     with open(path, errors="replace") as fh:
         for line in fh:
             m = STATS_RE.match(line)
@@ -162,7 +162,8 @@ def parse_log(path):
             if m:
                 f = kv(m.group("body"))
                 for k in ("config", "engine", "assetkey", "rs", "url", "rotation",
-                          "browser", "reader", "cdp_ready"):
+                          "browser", "reader", "cdp_ready", "foreground",
+                          "foreground_end"):
                     if k in f:
                         r[k] = f[k]
                 for k in ("warm_s", "win_s", "done_t"):
@@ -183,6 +184,8 @@ def parse_log(path):
                 s["thermal"] = int(n.group(1)) if n else None
                 tp = f.get("gpu_temp", "NA")
                 s["temp"] = int(tp) if tp.lstrip("-").isdigit() else None
+                s["wake"] = f.get("wake", "")
+                s["busy0"] = f.get("gpubusy", "").strip() in ("0 0", "0  0", "")
                 r["samples"].append(s)
                 continue
             m = PHASE_RE.match(line)
@@ -191,6 +194,8 @@ def parse_log(path):
                 continue
             if WEDGE_RE.match(line):
                 r["wedge"] += 1
+            if line.startswith("#READERR"):
+                r["readerr"].append(line[len("#READERR"):].strip())
     return r
 
 
@@ -384,9 +389,75 @@ def main():
               "evidence for those; read the numbers off it or re-run just those configs "
               "with `--only=`." % ", ".join("`%s`" % c for c in missing_rows))
     readers = sorted({r["reader"] for r in rows})
-    print("* Readers used: %s. `logcat` is the primary path (the page's single "
-          "`[stats]` console line); `cdp` and `uiautomator` are fallbacks."
-          % ", ".join("`%s`" % x for x in readers))
+    print("* Readers used: %s. **CDP is the primary path** — it is the only reader "
+          "that has ever returned a number on this device. `logcat` is a demoted "
+          "fallback: on this official/release build the page's `[stats]` console "
+          "line is not mirrored into logcat at all." % ", ".join("`%s`" % x for x in readers))
+
+    # ── DEVICE-STATE FORENSICS ──
+    # A config that measured nothing because the DISPLAY WENT TO SLEEP looks
+    # identical, in the stats columns, to one that measured nothing because the
+    # reader broke. The sampler can tell them apart, so it must.
+    asleep, idle, adbfail, wrongfg = [], [], [], []
+    for r in rows:
+        sel = r["samples"]
+        if not sel:
+            continue
+        na = sum(1 for s_ in sel if s_["clk"] is None)
+        if na > len(sel) // 2:
+            adbfail.append("`%s` (%d/%d reads unanswered)" % (r["config"], na, len(sel)))
+        live = [s_ for s_ in sel if s_["clk"]]
+        # A MAJORITY rule, not `all`: the first sample of a config often carries
+        # the previous config's stale gpubusy counters, and one such sample must
+        # not veto the diagnosis of a config that rendered nothing.
+        if live:
+            parked = sum(1 for s_ in live if s_["clk"] <= 300 * 10**6 and s_["busy0"])
+            if parked >= 0.9 * len(live):
+                idle.append("`%s` (%d/%d samples parked)" % (r["config"], parked, len(live)))
+        if any(s_.get("wake") and "Awake" not in s_["wake"] for s_ in sel):
+            asleep.append("`%s`" % r["config"])
+        fg = r["foreground_end"] or r["foreground"]
+        if fg and "org.chromium.chrome" not in fg:
+            wrongfg.append("`%s` -> %s" % (r["config"], fg))
+    if idle:
+        print("* **The GPU never left its idle floor** for %s: clock pinned at the "
+              "minimum with `gpubusy` at zero for the whole config. Nothing was "
+              "rendered — this is a DEVICE problem (display asleep / app not "
+              "foreground), not a slow renderer and not a reader bug." % ", ".join(idle))
+    if asleep:
+        print("* **The display was not `Awake`** during %s. A hands-off run injects no "
+              "input, so the pad's display timeout is the single most dangerous "
+              "variable in it; hold it with `svc power stayon true`." % ", ".join(asleep))
+    if wrongfg:
+        print("* **Chrome was not the foreground window** at the end of %s. `am start` "
+              "reporting `Starting: Intent …` says nothing about visibility."
+              % ", ".join(wrongfg))
+    if adbfail:
+        print("* **adb stopped answering** during %s — the sampler's reads came back "
+              "empty. Every adb call in the run loop must be bounded (the run of "
+              "2026-09-22 had none and blocked for 2 h 55 m)." % ", ".join(adbfail))
+    errs = sorted({e for r in rows for e in r["readerr"]})
+    if errs:
+        print("* Reader errors recorded: %s" % "; ".join("`%s`" % e[:120] for e in errs[:4]))
+
+    # ── vsync quantisation ──
+    # Two different renderers reporting the SAME median to the decimal is not a
+    # tie, it is a cap: the measurement is pacing-bound and does not compare the
+    # engines at all.
+    meds = {}
+    for r in rows:
+        if r["stats"] and r["stats"].get("ms_median"):
+            meds.setdefault(round(float(r["stats"]["ms_median"]), 2), []).append(r["config"])
+    for v, cs in meds.items():
+        engs = {c.split("_")[0] for c in cs}
+        if len(cs) > 1 and len(engs) > 1:
+            n60 = v / 16.67
+            print("* **%s report an identical `ms_median` of %.2f ms** — %.1fx a 60 Hz "
+                  "vblank. Two different renderers do not agree to the decimal by "
+                  "chance: these rows are pinned to a presentation cadence and do "
+                  "**not** discriminate the engines. Compare them only at a setting "
+                  "that gets off the cap."
+                  % (", ".join("`%s`" % c for c in cs), v, n60))
     bad_rot = [r["config"] for r in rows if r["rotation"] not in ("rotation=1", "?")]
     if bad_rot:
         print("* **Wrong orientation** for %s — landscape (`rotation=1`) is the measured "
