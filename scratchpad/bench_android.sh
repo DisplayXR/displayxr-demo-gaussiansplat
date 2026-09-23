@@ -195,13 +195,20 @@ if adb shell "test -e $LOCK" 2>/dev/null && [ -z "$L" ]; then
     echo "HELD: empty lock file = held by unknown. A human must resolve this."
     exit 1
 fi
-if [ -n "$L" ]; then
+OURS=0
+if [ -n "$L" ] && [ "${L%% *}" = "$HANDLE" ]; then
+    # Re-entrant: this session already took the lock (e.g. to reserve the pad
+    # for a human's hands-on before the run). Keep it; release it on exit.
+    OURS=1
+    say "lock is already OURS: $L"
+elif [ -n "$L" ]; then
     echo "HELD: $L"
     echo "Do nothing. Message the holder; never clear a foreign lock outside the"
     echo "four-step liveness rule (displayxr-installer#56)."
     exit 1
+else
+    say "lock is FREE"
 fi
-say "lock is FREE"
 
 if [ "$DRY" = 1 ]; then
     say "--dry-run: stopping before the first device write. Nothing was changed."
@@ -210,8 +217,12 @@ fi
 
 # ── take the lock (atomic, proves it is ours), then arm the restore trap ─────
 [ -x "$PAD_LOCK_SH" ] || die "pad-lock.sh not found at $PAD_LOCK_SH — it is the ONLY sanctioned writer of $LOCK; do not hand-write one"
-PAD_SERIAL="$PAD_SERIAL" "$PAD_LOCK_SH" take "$HANDLE" "$PURPOSE" || die "could not take the pad lock"
-HELD_BY_US=1
+if [ "$OURS" = 1 ]; then
+    HELD_BY_US=1
+else
+    PAD_SERIAL="$PAD_SERIAL" "$PAD_LOCK_SH" take "$HANDLE" "$PURPOSE" || die "could not take the pad lock"
+    HELD_BY_US=1
+fi
 
 mkdir -p "$OUT"
 
