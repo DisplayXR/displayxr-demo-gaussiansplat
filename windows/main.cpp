@@ -31,6 +31,7 @@
 #include "gs_scene_fit.h"  // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "display3d_view.h"
 #include "view_rig_math.h"
+#include "color_policy.h"  // dxr::DisplayReferredToSceneLinear — the sRGB EOTF the placeholder clear needs
 #include "clip_policy.h"   // dxr::ResolveClipPlanes / ChainRearDepthBudget / RearDepthBudgetStateName (#100)
 #include "content_bounds.h" // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (#100 v2 ROI)
 #include "content_mask.h"   // dxr::ContentMaskFromCoverage / ChainContentMask (#100 v3 silhouette ROI)
@@ -1872,9 +1873,24 @@ static void UpdatePerformanceStats(PerformanceStats& stats) {
     }
 }
 
-// Render a simple "no scene" placeholder by clearing to dark gray
+// Render a simple "no scene" placeholder by clearing to dark gray.
+//
+// `vkCmdClearColorImage` is NOT a byte write — like every other image write it
+// converts through the image's FORMAT. This app asks for an honest `_SRGB`
+// swapchain (displayxr-common's color_policy.h picks it), so a clear value goes
+// in as scene-linear and is sRGB-ENCODED on the way to memory: the authored
+// {0.1, 0.1, 0.12} stored (89, 89, 97) where the authored bytes are (26, 26,
+// 31) — far too bright. So the authored display-referred colour is linearised
+// first, and the hardware's encode puts the authored bytes back.
+//
+// This is the same question #124 answered for the splat path (which composites
+// display-referred into an UNORM target and reaches the swapchain by a
+// byte-exact copy), reusing its predicate `gsIsSrgbFormat`. This clear was the
+// one write left going in raw. Alpha is deliberately untouched: an `_SRGB`
+// format encodes RGB only, its alpha channel is plain UNORM.
 static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdPool,
-                               VkImage image, uint32_t width, uint32_t height) {
+                               VkImage image, VkFormat format,
+                               uint32_t width, uint32_t height) {
     VkCommandBufferAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocInfo.commandPool = cmdPool;
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -1900,7 +1916,14 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 
-    VkClearColorValue clearColor = {{0.1f, 0.1f, 0.12f, 1.0f}};
+    // Authored display-referred (sRGB-encoded), like every colour picked by eye.
+    static const float kPlaceholderRgb[3] = {0.1f, 0.1f, 0.12f};
+    const bool srgbTarget = gsIsSrgbFormat(format);
+    auto ch = [&](int i) {
+        return srgbTarget ? dxr::DisplayReferredToSceneLinear(kPlaceholderRgb[i])
+                          : kPlaceholderRgb[i];
+    };
+    VkClearColorValue clearColor = {{ch(0), ch(1), ch(2), 1.0f}};
     VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
 
@@ -3004,7 +3027,8 @@ static void RenderThreadFunc(
                                 }
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
-                                    (*swapchainVkImages)[imageIndex], xr->swapchain.width, xr->swapchain.height);
+                                    (*swapchainVkImages)[imageIndex], colorFormat,
+                                    xr->swapchain.width, xr->swapchain.height);
                             }
 
                             // 'I' key: snapshot the multi-view atlas the runtime
