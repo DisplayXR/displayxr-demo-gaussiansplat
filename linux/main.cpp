@@ -95,6 +95,8 @@
 #include "color_policy.h"         // dxr::DisplayReferredToSceneLinear (placeholder clear)
 #include "gs_vulkan_utils.h"      // gsIsSrgbFormat
 #include "clickthrough.h"         // input-region punch-through (Ctrl+T transparent mode)
+#include "content_bounds.h"       // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (depth-budget ROI)
+#include "content_mask.h"         // dxr::ContentMaskFromCoverage / ChainContentMask (silhouette ROI)
 #pragma pop_macro("None")
 
 // ============================================================================
@@ -519,7 +521,15 @@ static void RefitForContent() {
     g_fitVHeight = vh;
 }
 
+// World-space scene AABB for the depth-budget content-bounds ROI
+// (XrContentBoundsDXR) — windows/main.cpp's CacheSceneAabbForContentRoi_locked.
+// getSceneBBox() scans every splat, so it is cached once per load.
+static float g_contentAabbMin[3] = {0.0f, 0.0f, 0.0f};
+static float g_contentAabbMax[3] = {0.0f, 0.0f, 0.0f};
+static bool  g_contentAabbValid = false;
+
 static void ApplyRigForLoadedScene() {
+    g_contentAabbValid = g_gsRenderer.getSceneBBox(g_contentAabbMin, g_contentAabbMax);
     const GsSceneCamera& cam = g_gsRenderer.sceneCamera();
     // The last step of the waterfall: when nothing has declared a rig, ask the
     // cloud whether it looks like a photograph. A `.spz` or `.ply` conversion
@@ -597,6 +607,7 @@ struct AppXrSession {
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
     bool hasDepthBudgetExt = false;      //!< XR_DXR_depth_budget (the transparent-mode rear clip)
+    uint32_t depthBudgetExtVersion = 0;  //!< the RUNTIME's version: v3+ takes the content mask
     bool hasXlibBindingExt = false;
     bool hasWaylandBindingExt = false;
     //! Window platform resolved before xrCreateInstance; Auto = hosted-NULL.
@@ -650,7 +661,10 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
-        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) xr.hasDepthBudgetExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+            xr.hasDepthBudgetExt = true;
+            xr.depthBudgetExtVersion = ext.extensionVersion;
+        }
     }
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
 
@@ -659,6 +673,8 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     if (xr.hasDepthBudgetExt) enabled.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_depth_budget: %s (v%u)", xr.hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
+             xr.depthBudgetExtVersion);
     // Window platform, resolved BEFORE xrCreateInstance so only the binding the
     // session will chain is enabled. A capability probe (connection attempt +
     // what the compositor advertises), never session env vars; an explicit
@@ -1011,7 +1027,8 @@ static void ReleaseSwapchainImage(AppXrSession& xr) {
 }
 
 static void EndFrame(AppXrSession& xr, XrTime displayTime,
-    XrCompositionLayerProjectionView* projViews, uint32_t viewCount) {
+    XrCompositionLayerProjectionView* projViews, uint32_t viewCount,
+    const void* frameEndNext = nullptr) {
     XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     layer.space = xr.localSpace;
     layer.viewCount = viewCount;
@@ -1019,6 +1036,7 @@ static void EndFrame(AppXrSession& xr, XrTime displayTime,
     layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
     const XrCompositionLayerBaseHeader* layers[] = {(const XrCompositionLayerBaseHeader*)&layer};
     XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
+    ei.next = frameEndNext;
     ei.displayTime = displayTime;
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     ei.layerCount = (viewCount > 0) ? 1 : 0;
@@ -1086,8 +1104,11 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.keep_above = g_transparentCapable && g_transparentBg;             // --transparent floats
     desc.transparent_background = g_transparentCapable && g_transparentBg; // no header bar while transparent
     desc.x11_header_bar = true;     // LMB on the bar moves the window (snapped)
-    desc.x11_drag_button = 0;       // LMB below the bar orbits; no drag-anywhere button
-    desc.wayland_drag_button = 0;
+    // RMB drags the window from anywhere in the content (the demos'
+    // convention, windows/main.cpp's RmbWindowDrag) — the only way to move it
+    // once Ctrl+T hides the bar. LMB below the bar stays the scene orbit.
+    desc.x11_drag_button = 3;
+    desc.wayland_drag_button = 3;
     desc.has_position = explicitPos || panelKnown;
     desc.x = px;
     desc.y = py;
@@ -1637,6 +1658,9 @@ int main(int argc, char** argv) {
     if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex,
                            xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("3DGS renderer init failed");
+    // The session is transparent-capable, so opaque frames must write alpha 1
+    // everywhere (the graphics renderer otherwise emits coverage alpha).
+    g_gsRenderer.setHonorTransparentBg(true);
 
     // Tile basis: the app window when we own one (window × scaleXY, #729-style);
     // else the full panel (hosted-NULL renders display-sized).
@@ -1787,6 +1811,9 @@ int main(int argc, char** argv) {
         if (!BeginFrame(xr, fs)) continue;
 
         std::vector<XrCompositionLayerProjectionView> projectionViews;
+        // XR_DXR_depth_budget ROI for this frame's xrEndFrame (content
+        // bounds, then the silhouette mask in front of it), or null.
+        const void* frameEndNext = nullptr;
         if (fs.shouldRender) {
             // On the CAMERA rig the declared pose is the capture camera's REST
             // pose and never the orbit: a drag turns the scene (see
@@ -2077,6 +2104,14 @@ int main(int argc, char** argv) {
                         {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW});
                     VkImage targetImage = swapchainImages[imageIndex].image;
                     VkFormat swapFormat = (VkFormat)xr.swapchain.format;
+                    float eyeViewProj[8][16];  // per-eye proj*view, for the content-bounds ROI
+
+                    // Depth-budget v3 silhouette ROI (windows/main.cpp #112): the
+                    // pre-cull coverage raster, armed while transparent — the
+                    // mask must be the silhouette at UNRESTRICTED budget, not the
+                    // clipped alpha, or the rear clip oscillates (runtime#1470).
+                    const bool hasContentMaskV3 = xr.hasDepthBudgetExt && xr.depthBudgetExtVersion >= 3;
+                    g_gsRenderer.setSilhouetteCoverage(hasContentMaskV3 && g_transparentBg && xr.hasAppWindow);
 
                     for (int eye = 0; eye < eyeCount; eye++) {
                         int srcView = eye < (int)runtimeViewCount ? eye : 0;
@@ -2149,6 +2184,7 @@ int main(int argc, char** argv) {
                             mat4_view_from_xr_pose(viewMat, views[srcView].pose);
                             mat4_from_xr_fov(projMat, views[srcView].fov, 0.01f, 100.0f);
                         }
+                        if (eye < 8) mat4_multiply(eyeViewProj[eye], projMat, viewMat);
 
                         uint32_t tileX = (uint32_t)(eye % (int)tileColumns);
                         uint32_t tileY = (uint32_t)(eye / (int)tileColumns);
@@ -2225,6 +2261,67 @@ int main(int argc, char** argv) {
                         cp.chromeVisible = g_window.header_bar_visible();
                         ClickthroughUpdate(cp);
                     }
+
+                    // XR_DXR_depth_budget ROI (windows/main.cpp #100 v2/v3): tell
+                    // the runtime WHERE the content is so it measures the
+                    // background's disparity there, not over the whole canvas.
+                    //  - bounds: the cached scene AABB projected through every
+                    //    rendered eye, canvas-normalised, always chained;
+                    //  - mask: the pre-cull silhouette, chained in front of the
+                    //    bounds while transparent (v3 runtimes only).
+                    static XrContentBoundsDXR s_contentBoundsChain{};
+                    static XrContentMaskDXR s_contentMaskChain{};
+                    static std::vector<uint8_t> s_silhouetteCov;
+                    static std::vector<uint8_t> s_contentMaskCells;
+                    bool haveBounds = false, haveMask = false;
+                    XrRect2Df boundsRect{};
+                    if (xr.hasDepthBudgetExt && useRig && eyeCount > 0 && g_contentAabbValid &&
+                        g_gsRenderer.hasScene()) {
+                        const float* vp[8];
+                        const uint32_t n = (uint32_t)(eyeCount < 8 ? eyeCount : 8);
+                        for (uint32_t e = 0; e < n; e++) vp[e] = eyeViewProj[e];
+                        if (dxr::ProjectAabbToCanvasBounds(g_contentAabbMin, g_contentAabbMax, vp, n, &boundsRect)) {
+                            XrFrameEndInfo proxy{};
+                            proxy.next = nullptr;
+                            dxr::ChainContentBounds(proxy, s_contentBoundsChain, boundsRect);
+                            frameEndNext = proxy.next;
+                            haveBounds = true;
+                        }
+                    }
+                    if (hasContentMaskV3 && g_transparentBg && xr.hasAppWindow) {
+                        const uint32_t covW = g_gsRenderer.silhouetteCoverageWidth();
+                        const uint32_t covH = g_gsRenderer.silhouetteCoverageHeight();
+                        uint32_t winPxW = 0, winPxH = 0;
+                        g_window.current_size(&winPxW, &winPxH);
+                        if (g_gsRenderer.readSilhouetteCoverage(s_silhouetteCov) && covW > 0 && covH > 0 &&
+                            s_silhouetteCov.size() >= (size_t)covW * covH && winPxW > 0 && winPxH > 0) {
+                            uint32_t maskW = covW < dxr::kContentMaskRecommendedCells ? covW : dxr::kContentMaskRecommendedCells;
+                            uint32_t maskH = covH < dxr::kContentMaskRecommendedCells ? covH : dxr::kContentMaskRecommendedCells;
+                            if (dxr::ContentMaskFromCoverage(s_silhouetteCov.data(), covW, covH, covW,
+                                    winPxW, winPxH, /*srcRectPx=*/nullptr, maskW, maskH, s_contentMaskCells) &&
+                                dxr::ContentMaskCoverageCells(s_contentMaskCells) > 0) {
+                                XrFrameEndInfo proxy{};
+                                proxy.next = frameEndNext;
+                                if (dxr::ChainContentMask(proxy, s_contentMaskChain, s_contentMaskCells, maskW, maskH)) {
+                                    frameEndNext = proxy.next;
+                                    haveMask = true;
+                                }
+                            }
+                        }
+                    }
+                    {
+                        // One line when the ROI kind changes (not per frame).
+                        static int s_lastRoi = -1;
+                        const int roi = (haveBounds ? 1 : 0) | (haveMask ? 2 : 0);
+                        if (roi != s_lastRoi) {
+                            s_lastRoi = roi;
+                            LOG_INFO("Depth-budget ROI: %s%s (bounds %.2f,%.2f %.2fx%.2f)",
+                                     haveMask ? "silhouette mask + " : "",
+                                     haveBounds ? "content bounds" : "none (runtime measures the whole canvas)",
+                                     boundsRect.offset.x, boundsRect.offset.y,
+                                     boundsRect.extent.width, boundsRect.extent.height);
+                        }
+                    }
                     ReleaseSwapchainImage(xr);
                 }
             }
@@ -2232,7 +2329,7 @@ int main(int argc, char** argv) {
 
         EndFrame(xr, fs.predictedDisplayTime,
             projectionViews.empty() ? nullptr : projectionViews.data(),
-            (uint32_t)projectionViews.size());
+            (uint32_t)projectionViews.size(), frameEndNext);
     }
 
     LOG_INFO("Shutting down");

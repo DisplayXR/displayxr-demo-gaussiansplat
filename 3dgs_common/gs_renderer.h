@@ -184,6 +184,10 @@ struct GsRenderer {
     // one uniform branch per gaussian and writes nothing.
     void setSilhouetteCoverage(bool on) { silhouetteOn_ = on; }
     bool silhouetteCoverage() const { return silhouetteOn_; }
+    //! API parity with GsAdrenoRenderer::setHonorTransparentBg. This renderer
+    //! always honours `transparentBg` (render.comp writes alpha 1 when opaque),
+    //! so it is a no-op here.
+    void setHonorTransparentBg(bool) {}
     uint32_t silhouetteCoverageWidth() const { return coverageW_; }
     uint32_t silhouetteCoverageHeight() const { return coverageH_; }
 

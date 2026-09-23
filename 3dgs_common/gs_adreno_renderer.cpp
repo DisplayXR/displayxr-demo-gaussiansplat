@@ -912,7 +912,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
                                  uint32_t viewportX, uint32_t viewportY,
                                  uint32_t viewportWidth, uint32_t viewportHeight,
                                  const float viewMatrix[16], const float projMatrix[16],
-                                 bool /*transparentBg*/, float clipNearViewSpace,
+                                 bool transparentBg, float clipNearViewSpace,
                                  float clipFarViewSpace, float clipFadeFrac) {
     if (!sceneLoaded_) return;
     const uint32_t N = numGaussians_;
@@ -1084,7 +1084,11 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
         0, 1, &mb, 0, nullptr, 0, nullptr);
 
     // ── 4. instanced alpha-blended quad draw into renderImage_ (scaled region) ──
-    VkClearValue clear = {}; clear.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    // Opaque (when the caller opted in): start at alpha 1 — the premultiplied
+    // blend (dstA *= 1 - srcA, + srcA) then keeps every pixel at alpha 1 and
+    // the colour is unchanged over black. Otherwise coverage alpha 1 - T.
+    const float clearAlpha = (honorTransparentBg_ && !transparentBg) ? 1.0f : 0.0f;
+    VkClearValue clear = {}; clear.color = {{0.0f, 0.0f, 0.0f, clearAlpha}};
     VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rp.renderPass = renderPass_; rp.framebuffer = framebuffer_[slot];
     rp.renderArea = {{0, 0}, {rw, rh}};
