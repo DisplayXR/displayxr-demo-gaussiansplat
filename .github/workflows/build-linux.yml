@@ -9,9 +9,16 @@ name: Build Linux
 # seconds without building. Required context (main-protection ruleset):
 # Build Linux (alongside Build Windows + Build macOS).
 #
-# Build-green scope: compile gaussian_splatting_handle_vk_linux on ubuntu-latest.
-# CI has no display/GPU, so the app is never run here; on-screen validation is
-# a separate pass gated on the runtime's Linux Phase 1b + hardware.
+# Build-green scope: compile gaussian_splatting_handle_vk_linux on every
+# supported release (tri-LTS matrix, aggregated into the required "Build Linux"
+# context). CI has no display/GPU, so on-screen validation stays a separate
+# pass; the DebInstall matrix does launch the installed package, but only to
+# prove it gets past the dynamic loader.
+#
+# The Deb / DebInstall / DebRelease jobs make the packaged artifact portable
+# across 22.04, 24.04 and 26.04 (runtime #1656): built on the oldest release,
+# versioned Depends from dpkg-shlibdeps, and install-verified on all three
+# before it can be attached to a release.
 
 on:
   workflow_dispatch: {}
@@ -67,14 +74,40 @@ jobs:
           fi
           echo "Detected docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
 
+  # TRI-LTS MATRIX (mirrors displayxr-demo-modelviewer): the deployment target
+  # is Ubuntu 26.04, but 22.04 and 24.04 are supported releases too — the .deb
+  # must install and run on all three (#1656 in the runtime), so all three
+  # toolchains (GCC 11 / 13 / 15) are kept green here. 22.04/24.04 use hosted
+  # runners; 26.04 runs in a container (no hosted 26.04 runner yet).
   Build:
-    name: Build Linux
+    name: Build (Ubuntu ${{ matrix.lts }})
     needs: DetectChanges
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - lts: "22.04"
+            runner: ubuntu-22.04
+          - lts: "24.04"
+            runner: ubuntu-24.04
+          - lts: "26.04"
+            runner: ubuntu-latest
+            container: ubuntu:26.04
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — reporting success without building."
+
+      # In the 26.04 container we start as root with a bare image — install git
+      # BEFORE checkout (which shells out to git). No-op on the hosted runners.
+      - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          if [ "$(id -u)" = "0" ] && ! command -v git >/dev/null; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -88,17 +121,22 @@ jobs:
       # headers are present, OpenXR-SDK-Source flips on GLX platform support —
       # the loader includes <xcb/glx.h> and its gfxwrapper test helper links
       # Xxf86vm (the GLX-flip gotcha).
+      #
+      # SUDO shim so the same step works on hosted runners (non-root, has sudo)
+      # and in the container (root, no sudo). Vendor-neutral libegl-dev/libgl-dev
+      # so the names resolve across 22.04/24.04/26.04.
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
+          SUDO=""; [ "$(id -u)" != "0" ] && SUDO=sudo
+          $SUDO apt-get update
+          DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y \
+            build-essential cmake ninja-build pkg-config git ca-certificates curl python3 \
             libvulkan-dev vulkan-validationlayers glslang-tools \
             zlib1g-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
       # Assert the SPIR-V + zlib toolchain is actually present (fail loudly, not
@@ -126,36 +164,81 @@ jobs:
           test -x build/linux/gaussian_splatting_handle_vk_linux || {
             echo "::error::gaussian_splatting_handle_vk_linux was not produced"; exit 1; }
 
-  # Build the demo .deb and, on a v* tag, attach it to the GitHub Release — the
-  # asset the Linux meta-bundle fetches (runtime #781 Phase 3). Runs on every PR
-  # too (build-only) so a broken package_deb_linux.sh is caught before release.
-  # Single base (ubuntu-latest) on a VM, not the build matrix — one artifact.
+  # Aggregate context. The main-protection ruleset requires the check "Build
+  # Linux"; the matrix legs report as "Build (Ubuntu <lts>)", so this job keeps
+  # the required context reporting and green only when EVERY leg passed. (The
+  # alternative — switching the ruleset to the three per-leg contexts, as
+  # displayxr-demo-modelviewer did — needs a repo-admin change, not a PR.)
+  BuildLinux:
+    name: Build Linux
+    needs: Build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate the tri-LTS matrix result
+        run: |
+          echo "Build matrix result: ${{ needs.Build.result }}"
+          [ "${{ needs.Build.result }}" = "success" ] || {
+            echo "::error::at least one Ubuntu leg failed"; exit 1; }
+
+  # Build the ONE demo .deb — the asset the Linux meta-bundle fetches (runtime
+  # #781 Phase 3; the bundle's glob expects exactly one). Runs on every PR too
+  # so a broken package_deb_linux.sh is caught before release; DebRelease below
+  # attaches it to a v* release once DebInstall has proved it.
+  #
+  # PORTABLE BY CONSTRUCTION (runtime #1656): the same .deb must install and run
+  # on Ubuntu 22.04, 24.04 and 26.04, so it is built on the OLDEST — an
+  # ubuntu:22.04 container (glibc 2.35 / GCC 11 floor). v1.27.1 was built on
+  # ubuntu-latest (24.04), needed GLIBC_2.38 / GLIBCXX_3.4.32, and declared an
+  # unversioned `libc6`, so apt installed it on 22.04 and the demo then died at
+  # exec. package_deb_linux.sh now derives versioned Depends with
+  # dpkg-shlibdeps, refuses a DT_NEEDED outside its cross-release STABLE_SONAMES
+  # list, and — with DXR_DEB_MAX_GLIBC — refuses a glibc floor above 22.04's.
+  #
+  # Deliberately the bare image's apt cmake (3.22.1), not a downloaded Kitware
+  # build: a hosted runner's modern CMake hides the repo's real floor
+  # (cmake_minimum_required 3.21), so the container is what actually tests it.
   Deb:
     needs: DetectChanges
     runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      DXR_DEB_MAX_GLIBC: "2.35" # Ubuntu 22.04 — the oldest supported release
     steps:
       - name: Docs-only short-circuit
         if: needs.DetectChanges.outputs.docs_only == 'true'
         run: echo "Doc-only change — skipping .deb build."
+
+      # Bare image, root: git before checkout (else checkout falls back to a
+      # tarball with no tags and git describe cannot version the .deb).
+      - name: Bootstrap container (git for checkout)
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            git ca-certificates curl
 
       - uses: actions/checkout@v5
         if: needs.DetectChanges.outputs.docs_only != 'true'
         with:
           fetch-depth: 0 # git describe needs tags for the .deb version
 
+      # Same list as the Build matrix + the packaging tools (dpkg-dev provides
+      # dpkg-deb and dpkg-shlibdeps; binutils provides objdump for the
+      # DT_NEEDED / symbol-version scan; fakeroot for the root-owned payload).
       - name: Install dependencies
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
-            libvulkan-dev vulkan-validationlayers glslang-tools \
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config python3 file binutils \
+            libvulkan-dev glslang-tools \
             zlib1g-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl1-mesa-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             dpkg-dev fakeroot
+          cmake --version | head -1
 
       - name: Build + package the demo .deb
         if: needs.DetectChanges.outputs.docs_only != 'true'
@@ -172,8 +255,66 @@ jobs:
           path: dist/*.deb
           if-no-files-found: error
 
-      - name: Attach .deb to the GitHub Release (tags only)
-        if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+  # Install the .deb from the Deb job into a PRISTINE container of every
+  # supported release, together with the latest released runtime .deb (the demo
+  # Depends on displayxr-runtime), and exercise it there
+  # (scripts/verify_deb_install_linux.sh): apt must resolve Depends from that
+  # release's archive without Recommends, `ldd -r` must be clean on every
+  # shipped ELF, every Depends/Recommends/Suggests name must exist there, the
+  # launcher must get past the dynamic loader, and `displayxr-cli selftest` must
+  # pass env-free on the packaged sim-display.
+  DebInstall:
+    name: DebInstall (Ubuntu ${{ matrix.lts }})
+    needs: [DetectChanges, Deb]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lts: ["22.04", "24.04", "26.04"]
+    steps:
+      - name: Docs-only short-circuit
+        if: needs.DetectChanges.outputs.docs_only == 'true'
+        run: echo "Doc-only change — no .deb to verify."
+
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      - uses: actions/download-artifact@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          name: displayxr-gaussiansplat-deb
+          path: dist
+
+      - name: Fetch the latest released runtime .deb
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo DisplayXR/displayxr-runtime \
+            --pattern 'displayxr-runtime_*_amd64.deb' --dir runtime-deb
+          ls runtime-deb
+
+      - name: apt install + ldd -r + launch smoke in clean ubuntu:${{ matrix.lts }}
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w "ubuntu:${{ matrix.lts }}" \
+            ./scripts/verify_deb_install_linux.sh \
+              dist/displayxr-gaussiansplat_*_amd64.deb runtime-deb/*.deb
+
+  # Attach the .deb to the GitHub Release on a v* tag — only once DebInstall has
+  # proved it on every supported release (a non-portable package can no longer
+  # be published).
+  DebRelease:
+    needs: [DetectChanges, Deb, DebInstall]
+    if: needs.DetectChanges.outputs.docs_only != 'true' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: displayxr-gaussiansplat-deb
+          path: dist
+
+      - name: Attach .deb to the GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*.deb
