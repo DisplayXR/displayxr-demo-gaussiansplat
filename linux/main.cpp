@@ -353,10 +353,94 @@ static std::string ExecutableDir() {
 // cannot be resolved falls back to the display rig with a WARN rather than
 // inventing intrinsics.
 //
-// There is no display-rig counterpart to call here: this leg has no auto-fit
-// (virtualDisplayHeight is a constant in the frame loop), so "display rig" IS
-// the behaviour the harness always had, and clearing g_cameraRigActive restores
-// it exactly.
+// The display rig's counterpart is ApplyAutoFitForLoadedScene (below the fit
+// helpers): frame the bounds against the live content rect.
+// ── Display-rig auto-fit (parity with the macOS / Windows legs) ─────────────
+//
+// This leg used to have NO auto-fit: a constant 1.5 m virtual display height
+// with the rig at the origin, whatever the scene and whatever the window. The
+// butterfly then overflowed the top of the content (both views clipped flat at
+// the top edge, black margin below) — the header bar only made the content
+// short enough to show it. Now the scene is framed exactly as the other legs
+// frame it: the shared GsFitFrameEx (3dgs_common/gs_scene_fit.h) on the bounds
+// measured at load, against the LIVE CONTENT rect (the bound surface, header
+// bar excluded), with the same comfort-compensated 80% fill; and re-run when
+// the content's aspect changes (a resize, the Wayland scale correction, F11),
+// so the framing never goes stale. Only the BASE vHeight moves on a refit:
+// the render path divides it by g_scaleFactor, so the user's zoom and orbit
+// are untouched.
+static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
+// The bounds carry a 1.10x comfort margin on every axis, so the fill handed to
+// the fit is 0.80 x 1.10 to net an 80% cap on the TRUE object (macOS / Windows
+// kAutoFitFill, same derivation).
+static constexpr float kAutoFitFill = 0.80f * 1.10f;
+static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
+static float g_fitVHeight = kFallbackVirtualDisplayHeightM;
+static float g_fitAspect = 0.0f;  //!< content aspect the current fit was derived for
+static bool  g_fitValid = false;
+
+static GsFitComfort ActiveFitComfort() {
+    GsFitComfort c;
+    if (g_rigFlags.hasFitDisparity) c.maxDisparityVH = g_rigFlags.fitDisparityVH;
+    return c;
+}
+
+//! The display-rig fit for a viewport, in the selected --fit mode. `flood` (and
+//! `legacy`, which on this leg frames the same bounds — the Linux renderers
+//! cache one set) keep the flat x/y rule; `depth` lets the disparity budget
+//! bound it. Same shape as the macOS / Windows RunFit.
+static GsFitFrameResult RunFit(float viewportW, float viewportH, float yaw, float pitch) {
+    GsFitFrameResult r = GsFitFrameEx(g_gsRenderer.fitBounds(), viewportW, viewportH, kAutoFitFill,
+                                      yaw, pitch, ActiveFitComfort());
+    if (g_rigFlags.fitMode != GsFitMode::Depth && r.valid) {
+        r.vHeight = r.vHeightFlat;
+        r.boundBy = (r.screenH > 0.0f && viewportH > 0.0f &&
+                     (r.screenW * viewportH / viewportW) > r.screenH) ? "width" : "height";
+    }
+    return r;
+}
+
+//! Frame the loaded scene against the content rect (g_windowW x g_windowH —
+//! the bound surface's pixels, header bar excluded).
+static void ApplyAutoFitForLoadedScene() {
+    const GsFitBounds& bounds = g_gsRenderer.fitBounds();
+    const float vpW = (float)g_windowW, vpH = (float)g_windowH;
+    if (!bounds.valid || !(vpW > 0.0f) || !(vpH > 0.0f)) {
+        g_fitValid = false;
+        g_fitVHeight = kFallbackVirtualDisplayHeightM;
+        LOG_WARN("Fit: no bounds to frame — falling back to vHeight %.3f", kFallbackVirtualDisplayHeightM);
+        return;
+    }
+    g_fitCenter[0] = bounds.center[0];
+    g_fitCenter[1] = bounds.center[1];
+    g_fitCenter[2] = bounds.center[2];
+    const GsFitFrameResult fr = RunFit(vpW, vpH, 0.0f, 0.0f);
+    float vh = fr.valid ? fr.vHeight : 0.0f;
+    if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+    g_fitVHeight = vh;
+    g_fitAspect = vpW / vpH;
+    g_fitValid = true;
+    LOG_INFO("Fit: center=(%.3f, %.3f, %.3f) screen=(%.3f, %.3f) content=%.0fx%.0f px aspect=%.3f "
+             "bound=%s vHeight=%.3f (flat %.3f, depth asks %.3f)",
+             bounds.center[0], bounds.center[1], bounds.center[2], fr.screenW, fr.screenH, vpW, vpH,
+             g_fitAspect, fr.boundBy, vh, fr.vHeightFlat, fr.vHeightDepth);
+}
+
+//! Re-derive the base vHeight when the CONTENT aspect changes (resize, the
+//! Wayland scale correction, F11). Zoom and orbit are preserved.
+static void RefitForContent() {
+    if (!g_fitValid || g_cameraRigActive || g_windowW == 0 || g_windowH == 0) return;
+    const float aspect = (float)g_windowW / (float)g_windowH;
+    if (g_fitAspect > 0.0f && std::fabs(aspect - g_fitAspect) < 1e-3f * g_fitAspect) return;
+    const GsFitFrameResult fr = RunFit((float)g_windowW, (float)g_windowH, g_dispOrbitYaw, g_dispOrbitPitch);
+    const float vh = fr.valid ? fr.vHeight : 0.0f;
+    if (!(vh > 1e-3f)) return;
+    LOG_INFO("Fit refit: content %ux%u aspect %.3f -> %.3f, bound=%s, base vHeight %.3f -> %.3f (zoom kept)",
+             g_windowW, g_windowH, g_fitAspect, aspect, fr.boundBy, g_fitVHeight, vh);
+    g_fitAspect = aspect;
+    g_fitVHeight = vh;
+}
+
 static void ApplyRigForLoadedScene() {
     const GsSceneCamera& cam = g_gsRenderer.sceneCamera();
     // The last step of the waterfall: when nothing has declared a rig, ask the
@@ -412,6 +496,7 @@ static void ApplyRigForLoadedScene() {
                  why.c_str());
     }
     g_cameraRigActive = false;
+    ApplyAutoFitForLoadedScene();
 }
 
 // ============================================================================
@@ -1456,7 +1541,6 @@ int main(int argc, char** argv) {
     LOG_INFO("  keys:  V = cycle 2D/3D | 0-8 = pick mode | M = turntable | SPACE = reset");
     LOG_INFO("         +/- = 3D strength | F11 = fullscreen | Ctrl+O = open | ESC/Q = quit");
 
-    const float virtualDisplayHeight = 1.5f;
     auto lastTime = std::chrono::high_resolution_clock::now();
     // Seed the idle clock so the turntable starts 10 s after launch rather
     // than on frame 1 — the same shape as Windows, where lastInputTimeSec is
@@ -1467,6 +1551,10 @@ int main(int argc, char** argv) {
         PollEvents(xr);
         PumpWindow(xr);    // input; the helper runs the header bar, the drag and F11
         PollFilePicker();  // async zenity result → loadScene
+        RefitForContent(); // the content aspect changed -> re-derive the framed vHeight
+        // This frame's base virtual display height: the scene's fit (the
+        // render path divides it by g_scaleFactor for the wheel zoom).
+        const float virtualDisplayHeight = g_fitValid ? g_fitVHeight : kFallbackVirtualDisplayHeightM;
 
         // NOTE: this used to re-assert the app's own rendering mode HERE, every
         // frame, for as long as the session ran — so nothing outside the process
@@ -1608,7 +1696,13 @@ int main(int argc, char** argv) {
                 // same two angles, so a drag simply moves where the turntable
                 // resumes from rather than fighting it.
                 quat_from_yaw_pitch(g_dispOrbitYaw, g_dispOrbitPitch, &cameraPose.orientation);
-                cameraPose.position = {0, 0, 0};
+                // The rig orbits the FRAMED centre (the fit), as on macOS /
+                // Windows — not the world origin.
+                if (g_fitValid) {
+                    cameraPose.position = {g_fitCenter[0], g_fitCenter[1], g_fitCenter[2]};
+                } else {
+                    cameraPose.position = {0, 0, 0};
+                }
             }
 
             const bool useRig = xr.hasViewRigExt && xr.displayWidthM > 0 && xr.displayHeightM > 0;
