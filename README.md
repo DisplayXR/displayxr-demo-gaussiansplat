@@ -53,17 +53,23 @@ own constant): convergence is depth, and a jump in it reads as the whole scene
 lurching toward the viewer. Space eases the focus back to whatever the
 waterfall chose.
 
-### Linux (X11 / XWayland)
+### Linux (X11 or native Wayland)
 
-The Linux leg now carries the mouse, keyboard and mode-switch bindings above,
+One binary runs on X11 (XWayland included) or native Wayland. The window is
+displayxr-common's `displayxr::linux_window`, and the platform is chosen by
+capability at startup with `--platform=x11|wayland|auto`. The default `auto`
+picks native Wayland when the compositor is ready (fractional-scale +
+viewporter + the window-geometry extension) and X11 otherwise.
+
+The Linux leg carries the mouse, keyboard and mode-switch bindings above,
 transcribed from the Windows handler so a gesture means the same thing on both
-(`linux/main.cpp`'s `PumpXEvents` cites the `input_handler.cpp` line for each
-one). Left-drag orbit works on **both** rigs — it used to be camera-rig only,
+(`linux/main.cpp`'s `HandleWindowEvent` cites the `input_handler.cpp` line for
+each one). Left-drag orbit works on **both** rigs — it used to be camera-rig only,
 which meant the bundled `butterfly.spz` could not be turned at all.
 
 Two Linux-only differences, and they exist for the weave rather than for taste:
 
-**The window is undecorated, and you drag the top 28 px to move it.** The
+**The window draws its own header bar, and you drag the bar to move it.** The
 interlace phase is a function of the window's absolute position in physical
 panel pixels, so a window-manager-owned drag re-lands the phase on an arbitrary
 pixel every frame and the 3D shimmers. A mutter `_NET_WM_MOVERESIZE` grab
@@ -71,9 +77,11 @@ cannot be intercepted by the client, so the only cure is to take the drag away
 from the WM: the app owns the move and asks the display processor, through
 `xrWeaveSnapWindowRectDXR` (`XR_DXR_weave`), where the window may land. It then
 goes exactly there — snapping, not correcting, so the woven pattern is
-identical at every position the drag visits. The 28 px strip is the stand-in
-for the title bar Windows gets from the OS. `DXR_X11_WM_DECORATIONS=1` gives
-you a normal decorated window back and forfeits the snap.
+identical at every position the drag visits. On native Wayland the compositor
+runs the drag, constrained to the same positions. The bar sits above the 3D
+area, not over it, and is the stand-in for the title bar Windows gets from the
+OS. `DXR_X11_WM_DECORATIONS=1` gives you a normal WM-decorated X11 window back
+and forfeits the snap.
 
 On a runtime without `XR_DXR_weave`, or a display processor with no lattice of
 its own (`sim_display`), the call is absent or returns the target unchanged and

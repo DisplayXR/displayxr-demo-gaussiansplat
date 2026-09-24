@@ -6,10 +6,12 @@
 # CMakeLists.txt already added ../common and ../3dgs_common (exposing the
 # sr_common_base and gs_renderer targets) and ../openxr_includes.
 #
-# Handle app (#76): the app owns a decorated X11 window centered on the 3D
-# panel and passes it via XR_DXR_xlib_window_binding (hosted-NULL fallback when
-# no X server, which keeps the CI runner build-green). Renderer selection via
-# GS_RENDERER below.
+# Handle app (#76), ONE binary for X11 and native Wayland: the window is
+# displayxr-common's displayxr::linux_window (platform chosen by capability,
+# --platform=x11|wayland|auto), centered on the 3D panel and passed via
+# XR_DXR_xlib_window_binding or XR_DXR_wayland_surface_binding (hosted-NULL
+# fallback when no window system answers, which keeps the CI runner
+# build-green). Renderer selection via GS_RENDERER below.
 
 cmake_minimum_required(VERSION 3.21)
 
@@ -20,10 +22,12 @@ endif()
 find_package(Vulkan REQUIRED)
 message(STATUS "Found Vulkan: ${Vulkan_LIBRARY}")
 
-# X11 window + Xrandr panel query (handle app).
-find_package(X11 REQUIRED)
-if(NOT X11_Xrandr_LIB)
-    message(FATAL_ERROR "libXrandr not found (apt install libxrandr-dev) — needed for 3D-panel window centering.")
+# The window (X11 + native Wayland, header bar, drag) is displayxr-common's
+# displayxr::linux_window, added by ../common; it links its own window-system
+# libraries.
+if(NOT TARGET displayxr::linux_window)
+    message(FATAL_ERROR "displayxr::linux_window is not available — install libx11-dev "
+                        "(and libwayland-dev libxkbcommon-dev libdbus-1-dev for the native-Wayland leg)")
 endif()
 
 # OpenXR loader — CMake package (from CMAKE_PREFIX_PATH, e.g. the from-source
@@ -52,6 +56,7 @@ endif()
 
 add_executable(gaussian_splatting_handle_vk_linux
     main.cpp
+    clickthrough.cpp # input-region punch-through (Ctrl+T transparent mode)
 )
 
 target_include_directories(gaussian_splatting_handle_vk_linux PRIVATE
@@ -65,8 +70,7 @@ target_link_libraries(gaussian_splatting_handle_vk_linux PRIVATE
     gs_renderer
     OpenXR::openxr_loader
     Vulkan::Vulkan
-    X11::X11
-    ${X11_Xrandr_LIB}
+    displayxr::linux_window # the ONE Linux window: X11 or Wayland, header bar, drag
     ${CMAKE_DL_LIBS}
 )
 

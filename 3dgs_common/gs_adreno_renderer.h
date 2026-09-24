@@ -147,6 +147,15 @@ struct GsAdrenoRenderer {
     // clipped, so the Android path is bit-for-bit unchanged.
     void setSilhouetteCoverage(bool on) { silhouetteOn_ = on; }
     bool silhouetteCoverage() const { return silhouetteOn_; }
+
+    //! Make renderEye's `transparentBg` flag decide the output alpha, as it
+    //! does in GsRenderer: false -> alpha 1 everywhere (the clear starts at
+    //! alpha 1 and the premultiplied blend keeps it there), true -> coverage
+    //! alpha 1 - T. Off by default, which keeps the historical behaviour
+    //! (coverage alpha whatever the flag) for the legs that rely on it; the
+    //! Linux leg turns it on because its session is transparent-capable and
+    //! a PRE_MULTIPLIED surface shows alpha < 1 even in opaque mode.
+    void setHonorTransparentBg(bool on) { honorTransparentBg_ = on; }
     uint32_t silhouetteCoverageWidth() const { return coverageW_; }
     uint32_t silhouetteCoverageHeight() const { return coverageH_; }
 
@@ -273,6 +282,7 @@ private:
     uint32_t coverageW_ = 0;
     uint32_t coverageH_ = 0;
     bool silhouetteOn_ = false;
+    bool honorTransparentBg_ = false; //!< see setHonorTransparentBg
 
     // ── Compute pipelines (5) ──
     VkPipeline pipeCov3d_ = VK_NULL_HANDLE;

@@ -141,7 +141,7 @@ jobs:
             zlib1g-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev
 
       # Assert the SPIR-V + zlib toolchain is actually present (fail loudly, not
@@ -240,7 +240,7 @@ jobs:
             zlib1g-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
-            libwayland-dev libxkbcommon-dev libegl-dev libgl-dev libasound2-dev \
+            libwayland-dev libxkbcommon-dev libdbus-1-dev libegl-dev libgl-dev libasound2-dev \
             libxxf86vm-dev libxcb-glx0-dev \
             dpkg-dev fakeroot
           cmake --version | head -1
