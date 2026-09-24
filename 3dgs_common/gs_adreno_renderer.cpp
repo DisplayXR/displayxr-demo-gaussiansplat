@@ -1284,7 +1284,7 @@ bool GsAdrenoRenderer::pickGaussian(const float rayOrigin[3], const float rayDir
 
 void GsAdrenoRenderer::cleanupScene() {
     if (device_ == VK_NULL_HANDLE) return;
-    vkQueueWaitIdle(queue_);
+    if (queue_ != VK_NULL_HANDLE) vkQueueWaitIdle(queue_);
     auto dp = [&](VkPipeline& p){ if (p) { vkDestroyPipeline(device_, p, nullptr); p = VK_NULL_HANDLE; } };
     auto dl = [&](VkPipelineLayout& l){ if (l) { vkDestroyPipelineLayout(device_, l, nullptr); l = VK_NULL_HANDLE; } };
     auto ds = [&](VkDescriptorSetLayout& l){ if (l) { vkDestroyDescriptorSetLayout(device_, l, nullptr); l = VK_NULL_HANDLE; } };
@@ -1338,6 +1338,13 @@ void GsAdrenoRenderer::cleanup() {
     }
     ringReady_ = false;
     if (cmdPool_) { vkDestroyCommandPool(device_, cmdPool_, nullptr); cmdPool_ = VK_NULL_HANDLE; }
+    // Forget the device and queue, as GsRenderer::cleanup does. The app calls
+    // cleanup() before vkDestroyDevice, and the renderer is usually a global
+    // whose destructor runs again at exit(); without this, that second
+    // cleanup() re-entered cleanupScene() and called vkQueueWaitIdle on the
+    // destroyed queue (a loader abort on every clean exit).
+    device_ = VK_NULL_HANDLE;
+    queue_ = VK_NULL_HANDLE;
     initialized_ = false;
 }
 
