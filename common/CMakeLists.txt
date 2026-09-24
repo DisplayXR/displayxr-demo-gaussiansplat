@@ -37,7 +37,10 @@ FetchContent_Declare(
     # v2.21.0 adds the native-Wayland drag-lattice follow-ups: a table when a
     # drag reaches the 3D panel, probing off the render thread, a per-drag
     # summary (displayxr-common#59, runtime#1697).
-    GIT_TAG v2.21.0
+    # v2.23.0: the native-Wayland drag stays phase-snapped at ANY output scale
+    # (150 %, 166.67 %, ...), not only 100/200 % (displayxr-common#61,
+    # runtime#1709).
+    GIT_TAG v2.23.0
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
