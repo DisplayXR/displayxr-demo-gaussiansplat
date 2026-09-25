@@ -59,6 +59,9 @@
 #include <string>
 #include <array>
 #include <chrono>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -90,6 +93,7 @@
 #include "gs_camera_rig.h"        // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "gs_scene_fit.h"         // the shared, depth-aware display-rig fit
 #include "launch_args.h"          // dxr::ParseLaunchArgs — the shared --key=value grammar
+#include "url_fetch.h"            // dxr::FetchUrlToCache — --src=<url> (libcurl on Linux)
 #include "mode_switch.h"          // dxr::ModeSwitch — the shared 2D<->3D ramp (V / 0-8 keys)
 #include "clip_policy.h"          // dxr::ResolveClipPlanes — the transparent-mode ZDP clip
 #include "color_policy.h"         // dxr::DisplayReferredToSceneLinear (placeholder clear)
@@ -1194,7 +1198,11 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.panel_top = pry;
     desc.panel_width = (uint32_t)prw;
     desc.panel_height = (uint32_t)prh;
-    desc.title = "DisplayXR Gaussian Splat Viewer";
+    // --title is a SUFFIX, never a replacement (Windows CreateAppWindow).
+    static std::string s_title;
+    s_title = "DisplayXR Gaussian Splat Viewer";
+    if (!g_launch.title.empty()) s_title += " - " + g_launch.title;
+    desc.title = s_title.c_str();
     desc.app_id = "com.displayxr.gaussiansplat";
     desc.transparent = g_transparentCapable;   // ARGB visual / alpha surface: Ctrl+T can work
     desc.keep_above = g_transparentCapable && g_transparentBg;             // --transparent floats
@@ -1299,6 +1307,90 @@ static void PollFilePicker() {
         ApplyRigForLoadedScene();
     } else {
         LOG_WARN("file picker: load failed for %s", g_pickerBuf.c_str());
+    }
+}
+
+// ============================================================================
+// --src=<url> — download to the per-user cache, then load (Windows StartUrlFetch)
+// ============================================================================
+//
+// The Windows leg's flow on displayxr-common's desktop-Linux fetcher (the same
+// dxr::FetchUrlToCache: SHA-1-named cache files, byte cap, timeouts; libcurl
+// loaded at run time). Cache: $XDG_CACHE_HOME/displayxr/gaussiansplat. As on
+// Windows, the URL a redirect chain lands on is re-checked with the STRICT
+// (protocol) policy whatever the launch path. The worker never loads; the
+// finished path is handed to the main thread (PollSrcFetch), like a Ctrl+O
+// pick. No toast layer on this leg: what Windows toasts is logged, progress
+// throttled to ~1 Hz.
+
+static std::atomic<bool> g_fetchInFlight{false};
+static std::mutex g_fetchMutex;
+static bool g_fetchDone = false;   //!< under g_fetchMutex
+static std::string g_fetchPath;    //!< under g_fetchMutex
+
+static void StartUrlFetch(const std::string& url, uint64_t maxBytes, bool noCache) {
+    bool expected = false;
+    if (!g_fetchInFlight.compare_exchange_strong(expected, true)) {
+        LOG_WARN("Download refused, one already in flight: %s (Busy - a download is already running)",
+                 url.c_str());
+        return;
+    }
+    LOG_INFO("Fetching --src URL: %s (maxBytes=%llu noCache=%d)", url.c_str(), (unsigned long long)maxBytes,
+             noCache ? 1 : 0);
+    std::thread([url, maxBytes, noCache]() {
+        dxr::UrlFetchOptions opts;
+        opts.cacheDir = dxr::DefaultCacheDir("gaussiansplat");
+        opts.allowedExtensions = {".ply", ".spz"};  // .sog is not a loadable format here
+        opts.maxBytes = maxBytes;
+        opts.noCache = noCache;
+        opts.urlAllowed = [](const std::string& finalUrl) {
+            const bool allowed = dxr::LaunchPolicyAllowsUrl(finalUrl, /*fromProtocol=*/true);
+            if (!allowed) LOG_WARN("Redirect target refused by launch policy: %s", finalUrl.c_str());
+            return allowed;
+        };
+        auto lastLog = std::chrono::steady_clock::now();
+        opts.progress = [&lastLog](uint64_t done, uint64_t total) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastLog < std::chrono::seconds(1)) return;
+            lastLog = now;
+            if (total > 0)
+                LOG_INFO("Downloading  %llu%%  (%.1f / %.1f MB)", (unsigned long long)(done * 100ull / total),
+                         (double)done / (1024.0 * 1024.0), (double)total / (1024.0 * 1024.0));
+            else
+                LOG_INFO("Downloading  %.1f MB", (double)done / (1024.0 * 1024.0));
+        };
+        const dxr::UrlFetchResult r = dxr::FetchUrlToCache(url, opts);
+        if (!r.ok) {
+            LOG_ERROR("Download failed for %s: %s", url.c_str(), r.error.c_str());
+            g_fetchInFlight.store(false);
+            return;
+        }
+        LOG_INFO("Downloaded %llu bytes%s -> %s", (unsigned long long)r.bytes, r.fromCache ? " (cache hit)" : "",
+                 r.path.c_str());
+        {
+            std::lock_guard<std::mutex> lock(g_fetchMutex);
+            g_fetchPath = r.path;
+            g_fetchDone = true;
+        }
+        g_fetchInFlight.store(false);
+    }).detach();
+}
+
+//! Main thread: load what the fetch worker delivered.
+static void PollSrcFetch() {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(g_fetchMutex);
+        if (!g_fetchDone) return;
+        g_fetchDone = false;
+        path.swap(g_fetchPath);
+    }
+    LOG_INFO("Loading scene: %s", path.c_str());
+    if (g_gsRenderer.loadScene(path.c_str())) {
+        LOG_INFO("Loaded %s (%u gaussians)", path.c_str(), g_gsRenderer.gaussianCount());
+        ApplyRigForLoadedScene();
+    } else {
+        LOG_ERROR("--src: load failed for %s", path.c_str());
     }
 }
 
@@ -1612,8 +1704,7 @@ int main(int argc, char** argv) {
             g_transparentBg = true;
             LOG_INFO("launch: --transparent");
         }
-        if (g_launch.srcKind == dxr::LaunchSrcKind::Url)
-            LOG_WARN("launch: --src URL is not fetched on Linux; pass a local path");
+        // --src URL: fetched once the window exists (StartUrlFetch, main()).
         // --pose / --margin / --vh: statements about how the ASSET is framed,
         // folded into every framing (ApplyAutoFitForLoadedScene) as on Windows.
         // --rect is placed in CreateAppWindow.
@@ -1784,6 +1875,13 @@ int main(int argc, char** argv) {
         if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
     }
 
+    // --src=<url>: the download replaces the bundled scene. Nothing is
+    // auto-loaded meanwhile — flashing the butterfly first would show a scene
+    // the caller never asked for (Windows g_suppressBundledAutoLoad).
+    if (g_launch.srcKind == dxr::LaunchSrcKind::Url) {
+        LOG_INFO("Bundled auto-load skipped: the launch named its own asset");
+        StartUrlFetch(g_launch.src, g_launch.maxBytes, g_launch.noCache);
+    } else
     // Auto-load bundled butterfly.spz (copied next to the exe by CMake).
     { std::string scene = ExecutableDir() + "/butterfly.spz";
       if (!cliScenePath.empty()) scene = cliScenePath;
@@ -1819,6 +1917,7 @@ int main(int argc, char** argv) {
         PollEvents(xr);
         PumpWindow(xr);    // input; the helper runs the header bar, the drag and F11
         PollFilePicker();  // async zenity result → loadScene
+        PollSrcFetch();    // a finished --src download → loadScene
         RefitForContent(); // the content aspect changed -> re-derive the framed vHeight
         // This frame's base virtual display height: the scene's fit (the
         // render path divides it by g_scaleFactor for the wheel zoom).

@@ -201,6 +201,15 @@ fi
 
 INSTALLED_KB="$(du -sk "$STAGE/usr" | cut -f1)"
 
+# Recommends: `--src=<url>` downloads through libcurl, which displayxr-common
+# loads with dlopen at the first fetch rather than linking it — the t64
+# transition renamed its package (libcurl4 -> libcurl4t64), so it can be
+# neither a STABLE_SONAMES DT_NEEDED nor one Depends name on every release.
+# `curl` IS one name on 22.04, 24.04 and 26.04 and pulls the libcurl the
+# fetcher opens; without it, --src URLs report "no HTTP library" and local
+# files work as before. (DebInstall checks the name exists on each release.)
+RECOMMENDS="curl"
+
 cat > "$STAGE/DEBIAN/control" <<EOF
 Package: $PKG
 Version: $VERSION
@@ -208,6 +217,7 @@ Section: graphics
 Priority: optional
 Architecture: $ARCH
 Depends: $DEPENDS
+Recommends: $RECOMMENDS
 Installed-Size: $INSTALLED_KB
 Maintainer: The DisplayXR Project <noreply@displayxr.dev>
 Homepage: https://github.com/DisplayXR/$REPO_SLUG

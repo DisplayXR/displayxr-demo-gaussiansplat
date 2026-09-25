@@ -368,7 +368,7 @@ gaussian_splatting_handle_vk_win.exe --transparent --src=https://host/scene.spz
 | `--no-cache` | Re-download even on a cache hit (dev aid). |
 | `--allow-local` | Native callers only: permit a `file:`/local `src` inside a protocol URL. A web page cannot set this — it is an argv flag, not a URL field. |
 
-**On Linux** (`gaussian_splatting_handle_vk_linux`) `--transparent`, `--rect`, `--pose` and `--margin` (and `--vh`) follow
+**On Linux** (`gaussian_splatting_handle_vk_linux`) `--transparent`, `--rect`, `--pose`, `--margin`, `--vh`, `--src` and `--title` follow
 the same rules. `--rect` is the CONTENT rect in desktop device pixels: X root
 coordinates on X11; on native Wayland the runtime's device convention (a
 monitor's logical origin times its scale, plus the monitor-relative logical
@@ -379,7 +379,13 @@ surface is sized at the target monitor's scale and moved through the
 `window-geometry@displayxr.org` GNOME extension once its first frame is
 presented. Expect up to 1 px of rounding at a fractional scale, or under
 XWayland at a scaled desktop. A `--rect` window is always windowed, even at the
-panel's size. `--src` URLs are not downloaded on Linux yet: pass a local path.
+panel's size. `--src=<url>` downloads exactly as on Windows (same policy,
+redirect re-check, cap, timeouts and SHA-1-named cache files) into
+`$XDG_CACHE_HOME/displayxr/<viewer>` (`~/.cache/...` by default), through
+libcurl loaded at run time — the `.deb` Recommends `curl`, which provides it;
+without it a URL reports "no HTTP library" and local paths work as before.
+`--title` is appended to the window title. With no toast layer on Linux, the
+download progress and any error go to the log.
 
 Flags are `--key=value`, never `--key value`. `--` ends flag parsing.
 
