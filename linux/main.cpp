@@ -59,6 +59,9 @@
 #include <string>
 #include <array>
 #include <chrono>
+#include <atomic>
+#include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -90,6 +93,7 @@
 #include "gs_camera_rig.h"        // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "gs_scene_fit.h"         // the shared, depth-aware display-rig fit
 #include "launch_args.h"          // dxr::ParseLaunchArgs — the shared --key=value grammar
+#include "url_fetch.h"            // dxr::FetchUrlToCache — --src=<url> (libcurl on Linux)
 #include "mode_switch.h"          // dxr::ModeSwitch — the shared 2D<->3D ramp (V / 0-8 keys)
 #include "clip_policy.h"          // dxr::ResolveClipPlanes — the transparent-mode ZDP clip
 #include "color_policy.h"         // dxr::DisplayReferredToSceneLinear (placeholder clear)
@@ -144,6 +148,12 @@ static uint32_t g_windowW = 1920, g_windowH = 1080;
 // and `--rig=` overrides. g_cameraRigActive is the single live flag; when it is
 // false every path below behaves exactly as it did before.
 static dxr::LaunchArgs g_launch;        //!< shared flags (--src/--vh/--pose/...)
+// --pose=YAW,PITCH[,ZOOM] / --margin / --vh: statements about how the ASSET
+// is presented, re-applied on every framing (the Windows leg's g_posePinned /
+// g_marginPinned / g_vhPinned). g_openingPoseHeld keeps the turntable off the
+// opening pose until the first real input, as on Windows.
+static bool  g_posePinned = false;
+static bool  g_openingPoseHeld = false;
 static GsRigFlags      g_rigFlags;      //!< rig flags (--rig/--fx/--size/...)
 static GsCameraRig     g_camRig;        //!< resolved camera rig, valid while active
 static bool            g_cameraRigActive = false;
@@ -454,6 +464,15 @@ static constexpr float kFallbackVirtualDisplayHeightM = 1.5f;
 // the fit is 0.80 x 1.10 to net an 80% cap on the TRUE object (macOS / Windows
 // kAutoFitFill, same derivation).
 static constexpr float kAutoFitFill = 0.80f * 1.10f;
+static constexpr float kBoundsComfort = 1.10f;
+//! The fill this framing uses: the launcher's --margin when it sent one (the
+//! page calibrated it per asset), else the 80% default — comfort-compensated
+//! the same way in both cases (Windows AutoFitFill).
+static float AutoFitFill() {
+    if (g_launch.hasMargin && g_launch.margin > 0.0f && g_launch.margin <= 1.0f)
+        return g_launch.margin * kBoundsComfort;
+    return kAutoFitFill;
+}
 static float g_fitCenter[3] = {0.0f, 0.0f, 0.0f};
 static float g_fitVHeight = kFallbackVirtualDisplayHeightM;
 static float g_fitAspect = 0.0f;  //!< content aspect the current fit was derived for
@@ -470,7 +489,7 @@ static GsFitComfort ActiveFitComfort() {
 //! cache one set) keep the flat x/y rule; `depth` lets the disparity budget
 //! bound it. Same shape as the macOS / Windows RunFit.
 static GsFitFrameResult RunFit(float viewportW, float viewportH, float yaw, float pitch) {
-    GsFitFrameResult r = GsFitFrameEx(g_gsRenderer.fitBounds(), viewportW, viewportH, kAutoFitFill,
+    GsFitFrameResult r = GsFitFrameEx(g_gsRenderer.fitBounds(), viewportW, viewportH, AutoFitFill(),
                                       yaw, pitch, ActiveFitComfort());
     if (g_rigFlags.fitMode != GsFitMode::Depth && r.valid) {
         r.vHeight = r.vHeightFlat;
@@ -478,6 +497,39 @@ static GsFitFrameResult RunFit(float viewportW, float viewportH, float yaw, floa
                      (r.screenW * viewportH / viewportW) > r.screenH) ? "width" : "height";
     }
     return r;
+}
+
+//! The framed pose Space returns to: the rest pose, or the launch --pose.
+static float g_fitYaw = 0.0f, g_fitPitch = 0.0f, g_fitZoom = 1.0f;
+
+//! Fold a --pose launch hint into the framed pose and land the live display
+//! rig on it. No-op when no --pose was supplied (the orbit is left alone, as
+//! before). SIGN CONVENTION — identical to the Windows leg's
+//! ApplyLaunchPoseToFit, where the derivation is recorded: the page turns the
+//! SUBJECT under a fixed camera, this demo orbits the rig about a fixed
+//! subject, so rig yaw = -page yaw and rig pitch = -page pitch. Zoom is a
+//! multiplier on the fit in both (here g_scaleFactor, which the render path
+//! divides the base vHeight by).
+static void ApplyLaunchPoseToFit() {
+    if (!g_posePinned) return;
+    constexpr float kDeg2Rad = 0.01745329252f;
+    g_fitYaw = -g_launch.poseYawDeg * kDeg2Rad;
+    g_fitPitch = -g_launch.posePitchDeg * kDeg2Rad;
+    // The display rig's own pitch clamp (the drag's +/-1.4 rad).
+    if (g_fitPitch > 1.4f) g_fitPitch = 1.4f;
+    if (g_fitPitch < -1.4f) g_fitPitch = -1.4f;
+    g_fitZoom = (g_launch.poseZoom > 0.01f) ? g_launch.poseZoom : 1.0f;
+    g_dispOrbitYaw = g_fitYaw;
+    g_dispOrbitPitch = g_fitPitch;
+    g_scaleFactor = g_fitZoom;
+    // The turntable must not spin off the opening pose while nobody has
+    // touched anything. Re-armed on every framing, cleared by the first input.
+    g_openingPoseHeld = true;
+    LOG_INFO("Launch --pose applied: page yaw=%.1fdeg pitch=%.1fdeg zoom=%.3f -> "
+             "rig yaw=%.1fdeg pitch=%.1fdeg scaleFactor=%.3f (mirrored: the page turns "
+             "the subject, the rig orbits it)",
+             g_launch.poseYawDeg, g_launch.posePitchDeg, g_launch.poseZoom,
+             g_fitYaw * 57.2957795f, g_fitPitch * 57.2957795f, g_fitZoom);
 }
 
 //! Frame the loaded scene against the content rect (g_windowW x g_windowH —
@@ -497,9 +549,16 @@ static void ApplyAutoFitForLoadedScene() {
     const GsFitFrameResult fr = RunFit(vpW, vpH, 0.0f, 0.0f);
     float vh = fr.valid ? fr.vHeight : 0.0f;
     if (!(vh > 1e-3f)) vh = kFallbackVirtualDisplayHeightM;
+    // --vh wins over the guess: the launcher knows the metres the asset was
+    // authored at; auto-fit only infers them from the bounding box.
+    if (g_launch.hasVh && g_launch.vh > 1e-3f) {
+        LOG_INFO("Auto-fit vHeight %.3f overridden by --vh=%.3f", vh, g_launch.vh);
+        vh = g_launch.vh;
+    }
     g_fitVHeight = vh;
     g_fitAspect = vpW / vpH;
     g_fitValid = true;
+    ApplyLaunchPoseToFit();
     LOG_INFO("Fit: center=(%.3f, %.3f, %.3f) screen=(%.3f, %.3f) content=%.0fx%.0f px aspect=%.3f "
              "bound=%s vHeight=%.3f (flat %.3f, depth asks %.3f)",
              bounds.center[0], bounds.center[1], bounds.center[2], fr.screenW, fr.screenH, vpW, vpH,
@@ -507,9 +566,11 @@ static void ApplyAutoFitForLoadedScene() {
 }
 
 //! Re-derive the base vHeight when the CONTENT aspect changes (resize, the
-//! Wayland scale correction, F11). Zoom and orbit are preserved.
+//! Wayland scale correction, F11). Zoom and orbit are preserved. A pinned --vh
+//! is an absolute statement in metres, so it does not follow the viewport.
 static void RefitForContent() {
     if (!g_fitValid || g_cameraRigActive || g_windowW == 0 || g_windowH == 0) return;
+    if (g_launch.hasVh) return;
     const float aspect = (float)g_windowW / (float)g_windowH;
     if (g_fitAspect > 0.0f && std::fabs(aspect - g_fitAspect) < 1e-3f * g_fitAspect) return;
     const GsFitFrameResult fr = RunFit((float)g_windowW, (float)g_windowH, g_dispOrbitYaw, g_dispOrbitPitch);
@@ -617,6 +678,10 @@ struct AppXrSession {
     float nominalViewerZ = 0.5f;
     uint32_t displayPixelWidth = 0, displayPixelHeight = 0;
     int32_t displayScreenLeft = 0;     // 3D-panel top-left in virtual-desktop px (INV-1.3)
+    // XR_DXR_display_info v18: the panel monitor's full desktop rect and whether
+    // the runtime really located the panel (the --rect clamp's gate).
+    XrRect2Di displayDesktopRect = {};
+    bool displayPanelConfirmed = false;
     int32_t displayScreenTop = 0;
 
     // App-owned window (g_window). False = hosted-NULL fallback. xWinW/H is
@@ -737,9 +802,20 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         XrDisplayInfoDXR di = {(XrStructureType)XR_TYPE_DISPLAY_INFO_DXR};
         XrDisplayDesktopPositionDXR desktopPos = {};
         desktopPos.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+        // display_info v18: the full panel rect, for --rect clamping. Additive
+        // and separately chained — an older runtime just leaves it zero.
+        XrDisplayDesktopInfoDXR desktopInfo = {};
+        desktopInfo.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+        desktopPos.next = &desktopInfo;
         di.next = &desktopPos;
         sp.next = &di;
         if (XR_SUCCEEDED(xrGetSystemProperties(xr.instance, xr.systemId, &sp))) {
+            xr.displayDesktopRect = desktopInfo.desktopRect;
+            xr.displayPanelConfirmed = desktopInfo.isPanelConfirmed == XR_TRUE;
+            LOG_INFO("Display desktop rect: (%d, %d) %dx%d panelConfirmed=%s device='%s'",
+                     xr.displayDesktopRect.offset.x, xr.displayDesktopRect.offset.y,
+                     xr.displayDesktopRect.extent.width, xr.displayDesktopRect.extent.height,
+                     xr.displayPanelConfirmed ? "yes" : "no", desktopInfo.deviceName);
             xr.displayWidthM = di.displaySizeMeters.width;
             xr.displayHeightM = di.displaySizeMeters.height;
             xr.nominalViewerZ = di.nominalViewerPositionInDisplaySpace.z;
@@ -1062,6 +1138,8 @@ static const unsigned int kDefaultWindowH = 1080;
 
 // Create the window: 1920x1080 content centred on the 3D panel (a panel-sized
 // GAUSS_WINDOW goes fullscreen on it, INV-1.3), with the shared header bar.
+// --rect=X,Y,W,H (the undock contract) puts the CONTENT at exactly that
+// desktop device-px rect instead, windowed, on X11 and Wayland alike.
 // Returns false when no window could be made -> hosted-NULL.
 static bool CreateAppWindow(AppXrSession& xr) {
     if (xr.windowBackend == DxrWindowBackend::Auto) return false;
@@ -1084,6 +1162,28 @@ static bool CreateAppWindow(AppXrSession& xr) {
             LOG_INFO("GAUSS_WINDOW override: %ux%u%s", w, h, n >= 4 ? " at an absolute position" : "");
         }
     }
+    // --rect wins over GAUSS_WINDOW and the default: the undock contract's
+    // explicit content rect, desktop device px. Windows-leg policy: exactly the
+    // rect the caller measured, nudged INTO the panel only when the runtime
+    // confirmed the panel; placed on BOTH backends by request_initial_rect.
+    if (g_launch.hasRect) {
+        int32_t rx = g_launch.rectX, ry = g_launch.rectY;
+        dxr::ClampRectIntoPanel(rx, ry, g_launch.rectW, g_launch.rectH, xr.displayDesktopRect.offset.x,
+                                xr.displayDesktopRect.offset.y, xr.displayDesktopRect.extent.width,
+                                xr.displayDesktopRect.extent.height, xr.displayPanelConfirmed);
+        LOG_INFO("Launch rect: requested (%d,%d %dx%d) -> final (%d,%d %dx%d) panel=(%d,%d %dx%d) confirmed=%d "
+                 "dpr=%.2f",
+                 g_launch.rectX, g_launch.rectY, g_launch.rectW, g_launch.rectH, rx, ry, g_launch.rectW,
+                 g_launch.rectH, xr.displayDesktopRect.offset.x, xr.displayDesktopRect.offset.y,
+                 xr.displayDesktopRect.extent.width, xr.displayDesktopRect.extent.height,
+                 xr.displayPanelConfirmed ? 1 : 0, g_launch.hasDpr ? g_launch.dpr : 0.0f);
+        w = (unsigned int)g_launch.rectW;
+        h = (unsigned int)g_launch.rectH;
+        explicitPos = true;
+        px = rx;
+        py = ry;
+        g_window.request_initial_rect(rx, ry, (uint32_t)g_launch.rectW, (uint32_t)g_launch.rectH);
+    }
     if (!explicitPos && panelKnown) {
         px = prx + (prw - (int)w) / 2;
         py = pry + (prh - (int)h) / 2;
@@ -1098,7 +1198,11 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.panel_top = pry;
     desc.panel_width = (uint32_t)prw;
     desc.panel_height = (uint32_t)prh;
-    desc.title = "DisplayXR Gaussian Splat Viewer";
+    // --title is a SUFFIX, never a replacement (Windows CreateAppWindow).
+    static std::string s_title;
+    s_title = "DisplayXR Gaussian Splat Viewer";
+    if (!g_launch.title.empty()) s_title += " - " + g_launch.title;
+    desc.title = s_title.c_str();
     desc.app_id = "com.displayxr.gaussiansplat";
     desc.transparent = g_transparentCapable;   // ARGB visual / alpha surface: Ctrl+T can work
     desc.keep_above = g_transparentCapable && g_transparentBg;             // --transparent floats
@@ -1112,7 +1216,8 @@ static bool CreateAppWindow(AppXrSession& xr) {
     desc.has_position = explicitPos || panelKnown;
     desc.x = px;
     desc.y = py;
-    desc.fullscreen_on_wayland = panelKnown && (int)w == prw && (int)h == prh;
+    // (A --rect window is always windowed: request_initial_rect overrides.)
+    desc.fullscreen_on_wayland = !g_launch.hasRect && panelKnown && (int)w == prw && (int)h == prh;
 
     if (!g_window.create(xr.windowBackend, desc)) {
         LOG_WARN("%s window creation failed — using hosted-NULL windowing",
@@ -1205,6 +1310,90 @@ static void PollFilePicker() {
     }
 }
 
+// ============================================================================
+// --src=<url> — download to the per-user cache, then load (Windows StartUrlFetch)
+// ============================================================================
+//
+// The Windows leg's flow on displayxr-common's desktop-Linux fetcher (the same
+// dxr::FetchUrlToCache: SHA-1-named cache files, byte cap, timeouts; libcurl
+// loaded at run time). Cache: $XDG_CACHE_HOME/displayxr/gaussiansplat. As on
+// Windows, the URL a redirect chain lands on is re-checked with the STRICT
+// (protocol) policy whatever the launch path. The worker never loads; the
+// finished path is handed to the main thread (PollSrcFetch), like a Ctrl+O
+// pick. No toast layer on this leg: what Windows toasts is logged, progress
+// throttled to ~1 Hz.
+
+static std::atomic<bool> g_fetchInFlight{false};
+static std::mutex g_fetchMutex;
+static bool g_fetchDone = false;   //!< under g_fetchMutex
+static std::string g_fetchPath;    //!< under g_fetchMutex
+
+static void StartUrlFetch(const std::string& url, uint64_t maxBytes, bool noCache) {
+    bool expected = false;
+    if (!g_fetchInFlight.compare_exchange_strong(expected, true)) {
+        LOG_WARN("Download refused, one already in flight: %s (Busy - a download is already running)",
+                 url.c_str());
+        return;
+    }
+    LOG_INFO("Fetching --src URL: %s (maxBytes=%llu noCache=%d)", url.c_str(), (unsigned long long)maxBytes,
+             noCache ? 1 : 0);
+    std::thread([url, maxBytes, noCache]() {
+        dxr::UrlFetchOptions opts;
+        opts.cacheDir = dxr::DefaultCacheDir("gaussiansplat");
+        opts.allowedExtensions = {".ply", ".spz"};  // .sog is not a loadable format here
+        opts.maxBytes = maxBytes;
+        opts.noCache = noCache;
+        opts.urlAllowed = [](const std::string& finalUrl) {
+            const bool allowed = dxr::LaunchPolicyAllowsUrl(finalUrl, /*fromProtocol=*/true);
+            if (!allowed) LOG_WARN("Redirect target refused by launch policy: %s", finalUrl.c_str());
+            return allowed;
+        };
+        auto lastLog = std::chrono::steady_clock::now();
+        opts.progress = [&lastLog](uint64_t done, uint64_t total) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastLog < std::chrono::seconds(1)) return;
+            lastLog = now;
+            if (total > 0)
+                LOG_INFO("Downloading  %llu%%  (%.1f / %.1f MB)", (unsigned long long)(done * 100ull / total),
+                         (double)done / (1024.0 * 1024.0), (double)total / (1024.0 * 1024.0));
+            else
+                LOG_INFO("Downloading  %.1f MB", (double)done / (1024.0 * 1024.0));
+        };
+        const dxr::UrlFetchResult r = dxr::FetchUrlToCache(url, opts);
+        if (!r.ok) {
+            LOG_ERROR("Download failed for %s: %s", url.c_str(), r.error.c_str());
+            g_fetchInFlight.store(false);
+            return;
+        }
+        LOG_INFO("Downloaded %llu bytes%s -> %s", (unsigned long long)r.bytes, r.fromCache ? " (cache hit)" : "",
+                 r.path.c_str());
+        {
+            std::lock_guard<std::mutex> lock(g_fetchMutex);
+            g_fetchPath = r.path;
+            g_fetchDone = true;
+        }
+        g_fetchInFlight.store(false);
+    }).detach();
+}
+
+//! Main thread: load what the fetch worker delivered.
+static void PollSrcFetch() {
+    std::string path;
+    {
+        std::lock_guard<std::mutex> lock(g_fetchMutex);
+        if (!g_fetchDone) return;
+        g_fetchDone = false;
+        path.swap(g_fetchPath);
+    }
+    LOG_INFO("Loading scene: %s", path.c_str());
+    if (g_gsRenderer.loadScene(path.c_str())) {
+        LOG_INFO("Loaded %s (%u gaussians)", path.c_str(), g_gsRenderer.gaussianCount());
+        ApplyRigForLoadedScene();
+    } else {
+        LOG_ERROR("--src: load failed for %s", path.c_str());
+    }
+}
+
 //! Monotonic seconds. The turntable's idle gate is a duration, so a steady
 //! clock is what it needs — not wall time, which can step.
 static double NowSec() {
@@ -1219,7 +1408,10 @@ static double NowSec() {
 //! hover does not. Transcribed rather than broadened, because a hover-resets
 //! version would mean the turntable never starts on a machine whose pointer
 //! sits over the window.
-static void MarkUserInput() { g_lastInputTimeSec = NowSec(); }
+static void MarkUserInput() {
+    g_lastInputTimeSec = NowSec();
+    g_openingPoseHeld = false;   // the opening pose has served its purpose
+}
 
 // Ctrl+T — Windows' transparentBgToggleRequested + kBorderlessMsg. The header
 // bar hides while transparent (Windows goes borderless), the window floats
@@ -1304,9 +1496,11 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
             case XK_space:
                 // Reset the view: orbit back to rest, zoom and 3D strength back
                 // to their defaults. Windows' resetViewRequested does the same.
-                g_dispOrbitYaw = 0.0f; g_dispOrbitPitch = 0.0f;
+                // The framed pose, which is the launch --pose when one was
+                // supplied (Windows: Space returns to g_fitYaw/Pitch/Zoom).
+                g_dispOrbitYaw = g_fitYaw; g_dispOrbitPitch = g_fitPitch;
                 g_camOrbitYaw = 0.0f;  g_camOrbitPitch = 0.0f;
-                g_scaleFactor = 1.0f;
+                g_scaleFactor = g_fitZoom;
                 g_steadyIpd = 1.0f;
                 MarkUserInput();
                 LOG_INFO("SPACE: view reset");
@@ -1510,8 +1704,17 @@ int main(int argc, char** argv) {
             g_transparentBg = true;
             LOG_INFO("launch: --transparent");
         }
-        if (g_launch.srcKind == dxr::LaunchSrcKind::Url)
-            LOG_WARN("launch: --src URL is not fetched on Linux; pass a local path");
+        // --src URL: fetched once the window exists (StartUrlFetch, main()).
+        // --pose / --margin / --vh: statements about how the ASSET is framed,
+        // folded into every framing (ApplyAutoFitForLoadedScene) as on Windows.
+        // --rect is placed in CreateAppWindow.
+        if (g_launch.hasPose) {
+            g_posePinned = true;
+            LOG_INFO("launch: --pose yaw=%.1fdeg pitch=%.1fdeg zoom=%.3f (page convention)",
+                     g_launch.poseYawDeg, g_launch.posePitchDeg, g_launch.poseZoom);
+        }
+        if (g_launch.hasMargin) LOG_INFO("launch: --margin=%.3f", g_launch.margin);
+        if (g_launch.hasVh) LOG_INFO("launch: --vh=%.3f m", g_launch.vh);
 
         std::vector<std::string> rigWarn;
         GsParseRigFlags(argc, argv, g_rigFlags, &rigWarn);
@@ -1672,6 +1875,13 @@ int main(int argc, char** argv) {
         if (xr.displayPixelHeight > 0) g_windowH = xr.displayPixelHeight;
     }
 
+    // --src=<url>: the download replaces the bundled scene. Nothing is
+    // auto-loaded meanwhile — flashing the butterfly first would show a scene
+    // the caller never asked for (Windows g_suppressBundledAutoLoad).
+    if (g_launch.srcKind == dxr::LaunchSrcKind::Url) {
+        LOG_INFO("Bundled auto-load skipped: the launch named its own asset");
+        StartUrlFetch(g_launch.src, g_launch.maxBytes, g_launch.noCache);
+    } else
     // Auto-load bundled butterfly.spz (copied next to the exe by CMake).
     { std::string scene = ExecutableDir() + "/butterfly.spz";
       if (!cliScenePath.empty()) scene = cliScenePath;
@@ -1699,13 +1909,15 @@ int main(int argc, char** argv) {
     auto lastTime = std::chrono::high_resolution_clock::now();
     // Seed the idle clock so the turntable starts 10 s after launch rather
     // than on frame 1 — the same shape as Windows, where lastInputTimeSec is
-    // stamped by the startup pose application.
-    MarkUserInput();
+    // stamped by the startup pose application. (Not MarkUserInput: that is a
+    // real input, and would release the --pose hold before anyone touched it.)
+    g_lastInputTimeSec = NowSec();
 
     while (g_running && !xr.exitRequested) {
         PollEvents(xr);
         PumpWindow(xr);    // input; the helper runs the header bar, the drag and F11
         PollFilePicker();  // async zenity result → loadScene
+        PollSrcFetch();    // a finished --src download → loadScene
         RefitForContent(); // the content aspect changed -> re-derive the framed vHeight
         // This frame's base virtual display height: the scene's fit (the
         // render path divides it by g_scaleFactor for the wheel zoom).
@@ -1741,8 +1953,15 @@ int main(int argc, char** argv) {
         // it. Rate and sign are the shared handler's: +18 deg/s, which is the
         // OPPOSITE sense from a rightward display-rig drag (also true on
         // Windows).
+        // Held too (Windows AutoOrbitSuppressed): on the launch --pose until the
+        // first input, and while the background is transparent — a floating
+        // object that spins by itself reads as a glitch. Linux has no
+        // workspace shell, so every session is standalone. The idle clock is
+        // held at "now" so the countdown restarts when the hold lifts.
         g_animationActive = false;
-        if (!g_cameraRigActive && g_animateEnabled && g_lastInputTimeSec > 0.0) {
+        if (g_openingPoseHeld || g_transparentBg) {
+            g_lastInputTimeSec = NowSec();
+        } else if (!g_cameraRigActive && g_animateEnabled && g_lastInputTimeSec > 0.0) {
             const double idleFor = NowSec() - g_lastInputTimeSec;
             g_animationActive = (idleFor > 10.0);
             if (g_animationActive)

@@ -43,7 +43,11 @@ FetchContent_Declare(
     # v2.24.0: the Wayland drag sends the compositor move at once and builds the
     # first lattice table on a worker; an optional bulk snap-grid provider is
     # added and not used here (displayxr-common#62, #63, runtime#1609, #1723).
-    GIT_TAG v2.24.0
+    # v2.25.0 (to be cut): DxrLinuxWindow::request_initial_rect — --rect opens
+    # the content at an exact desktop rect on X11 and Wayland — and the shared
+    # dxr::ClampRectIntoPanel --rect policy. Pinned to the branch until the tag
+    # exists; repin to v2.25.0 before merging.
+    GIT_TAG feat/linux-initial-rect
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
