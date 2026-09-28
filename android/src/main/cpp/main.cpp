@@ -37,6 +37,7 @@
 #include <unistd.h>
 
 #include "gs_adreno_renderer.h"
+#include "gs_vulkan_utils.h"  // gsChooseSwapchainFormat — _SRGB first (INV-4.6)
 #include "gs_camera_rig.h"   // GsCameraRig — the photo-lifted rig, FILE-driven here
 
 // XR_DXR_view_rig (#396 W7): vendored DisplayXR extension header.
@@ -920,20 +921,13 @@ create_swapchains()
 		log_xr_result("xrEnumerateSwapchainFormats(fill)", res);
 		return false;
 	}
-	const int64_t preferred[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM};
-	for (int64_t pref : preferred) {
-		for (uint32_t i = 0; i < format_count && g_swapchain_format == VK_FORMAT_UNDEFINED; ++i) {
-			if (formats[i] == pref) {
-				g_swapchain_format = (VkFormat)pref;
-			}
-		}
-		if (g_swapchain_format != VK_FORMAT_UNDEFINED) {
-			break;
-		}
-	}
-	if (g_swapchain_format == VK_FORMAT_UNDEFINED) {
-		g_swapchain_format = (VkFormat)formats[0];
-	}
+	// _SRGB first (INV-4.6). This leg used to prefer {R8G8B8A8_UNORM,
+	// B8G8R8A8_UNORM}; since runtime v2.21.7 (#1589) an UNORM swapchain is read
+	// as LINEAR and sRGB-encoded on the way to the panel, so the renderer's
+	// display-referred bytes were encoded twice — washed out on the tablet.
+	// On an _SRGB swapchain gsCmdBlitToSwapchain (scratch + vkCmdCopyImage)
+	// lands them byte-exact. Same helper as the macOS and Linux legs.
+	g_swapchain_format = (VkFormat)gsChooseSwapchainFormat(formats, format_count);
 	LOGI("Chose swapchain format: 0x%x", (uint32_t)g_swapchain_format);
 
 	for (uint32_t i = 0; i < kViewCount; ++i) {

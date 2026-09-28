@@ -70,6 +70,26 @@ GsImage gsCreateImage2D(VkDevice device,
 // Is `format` an 8-bit *_SRGB colour format?
 bool gsIsSrgbFormat(VkFormat format);
 
+// Pick the colour swapchain format from the runtime's xrEnumerateSwapchainFormats
+// list — the ONE choice every leg (macOS, Linux, Android) makes, so no leg can
+// drift from the rule again (INV-4.6).
+//
+// Returns the first 8-bit *_SRGB format in runtime order, else the first 8-bit
+// UNORM, else formats[0] (VK_FORMAT_UNDEFINED for an empty list).
+//
+// Why _SRGB is not optional: since DisplayXR runtime v2.21.7 (#1589/#1610) the
+// compositor reads a swapchain honestly, as OpenXR specifies — an _SRGB image
+// holds ENCODED colour, and anything else "will be treated as linear values"
+// and gets sRGB-encoded on the way to the panel. These renderers produce
+// display-referred bytes, so on an UNORM swapchain they are encoded a second
+// time: lifted blacks, desaturated, washed out (Android leg, v1.29.0 and
+// earlier, which preferred UNORM). On an _SRGB swapchain gsCmdBlitToSwapchain
+// lands the same bytes unchanged and they reach the panel as authored.
+//
+// DXR_SWAPCHAIN_ENCODING=unorm reverses the preference, for A/B only (it
+// reproduces the washed-out picture on a v2.21.7+ runtime).
+int64_t gsChooseSwapchainFormat(const int64_t* formats, uint32_t count);
+
 // Make `scratch` a (width x height) image in the UNORM sibling of
 // `swapchainFormat`, (re)creating it only when missing or of the wrong
 // size/format. No-op (returns true, leaves `scratch` empty) for a non-sRGB

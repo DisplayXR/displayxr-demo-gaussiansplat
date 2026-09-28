@@ -51,6 +51,34 @@ jobs:
           # header to a full runtime commit SHA; this proves the bytes match.
           python3 scripts/check_vendored_headers.py --drift
 
+      - name: Colour swapchain format is chosen _SRGB-first on every leg (INV-4.6)
+        run: |
+          # The splat renderers produce DISPLAY-REFERRED bytes. Since runtime
+          # v2.21.7 (#1589) an UNORM swapchain is read as LINEAR and sRGB-encoded
+          # on the way to the panel, so those bytes in an UNORM swapchain come out
+          # washed out. The Android leg preferred {R8G8B8A8_UNORM, B8G8R8A8_UNORM}
+          # through v1.29.0 while the desktop legs had moved to _SRGB — nothing
+          # noticed until a tablet eyeball. Every leg that enumerates swapchain
+          # formats must pick through the one shared rule,
+          # gsChooseSwapchainFormat (3dgs_common/gs_vulkan_utils.h). The Windows
+          # leg picks through displayxr-common (dxr::ChooseColorSwapchainFormat).
+          fail=0
+          for f in $(git ls-files 'android/*.cpp' 'linux/*.cpp' 'macos/*.mm' 'macos/*.cpp'); do
+            if grep -q 'xrEnumerateSwapchainFormats(' "$f" && ! grep -q 'gsChooseSwapchainFormat(' "$f"; then
+              echo "::error file=$f::enumerates swapchain formats but does not choose through gsChooseSwapchainFormat (INV-4.6)"
+              fail=1
+            fi
+          done
+          # A colour-format preference list that names only UNORM formats.
+          hits=$(git ls-files '*.cpp' '*.mm' '*.h' | xargs grep -nE '[{][[:space:]]*VK_FORMAT_[RB]8G8[RB]8A8_UNORM[[:space:]]*,[[:space:]]*VK_FORMAT_[RB]8G8[RB]8A8_UNORM[[:space:]]*[}]' || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::UNORM-only swapchain format preference list — display-referred bytes in it are encoded twice (INV-4.6)"
+            fail=1
+          fi
+          [ $fail -eq 0 ] && echo "OK: every leg chooses its colour swapchain _SRGB-first."
+          exit $fail
+
       - name: Workflow YAML is valid
         run: |
           python3 -m pip install --quiet pyyaml

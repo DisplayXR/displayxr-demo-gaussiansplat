@@ -177,6 +177,24 @@ behaviour is bit-for-bit unchanged.
 
 The runtime's VK native compositor handles the rest (atlas → display processor → present). The demo doesn't need to know the chroma-key / weave / DComp internals — those happen runtime-side based on the `XR_DXR_win32_window_binding` flags the demo sets at session create.
 
+**Colour swapchain: `_SRGB` first, on EVERY leg, through `gsChooseSwapchainFormat`.**
+The splat renderers write display-referred (sRGB-encoded) bytes into an
+`R8G8B8A8_UNORM` intermediate and move them to the swapchain with
+`gsCmdBlitToSwapchain` (blit into an UNORM-sibling scratch + `vkCmdCopyImage`,
+byte-exact). That is only right on an `_SRGB` swapchain: since runtime v2.21.7
+(runtime#1589, format-honest vk_native) an UNORM swapchain is read as LINEAR and
+sRGB-encoded on the way to the panel, so the same bytes come out washed out
+(authored `(229,182,127)` -> atlas `(243,220,187)`). Through v1.29.0 the Android
+leg preferred `{R8G8B8A8_UNORM, B8G8R8A8_UNORM}` while macOS/Linux had moved to
+`_SRGB`, so the demo was correct on a Mac and washed out on the tablet.
+`gsChooseSwapchainFormat` (3dgs_common/gs_vulkan_utils.h) is now the one choice
+for macOS, Linux and Android (Windows chooses through displayxr-common), and
+`lint.yml` fails a leg that enumerates formats without it.
+A/B: `DXR_SWAPCHAIN_ENCODING=unorm` (app, desktop) reproduces the wash-out;
+`DXR_COLOR_LEGACY_UNORM_ENCODED=1` (runtime; Android:
+`adb shell setprop debug.xrt.DXR_COLOR_LEGACY_UNORM_ENCODED 1`) restores the old
+UNORM passthrough.
+
 ## Projection / clip planes
 
 Near/far are **ZDP-anchored and per-eye**. `display3d_compute_view`/`_views` in `common/display3d_view.c` take `(near_offset, far_offset)` — **absolute** offsets, in virtual-display-height (vH) units, from each eye's perpendicular distance to the convergence plane (the virtual display / zero-disparity plane), where `eye_scaled.z` (`ez`) is that distance. Internally `near = ez − near_offset` and `far = ez + far_offset`, clamped so `near ≥ 1e-4` and `far > near` (`display3d_compute_projection` still does the low-level Kooima matrix math from the resolved absolute near/far — unchanged). The offsets are expressed in vH so they're independent of scene scale; `ez` is still needed to position them per-eye. Call-site values: `near_offset = vH` everywhere; `far_offset = 1000·vH` in opaque mode (far effectively at infinity), and **transparent mode passes `far_offset = 0`** so the far plane sits exactly at the ZDP (foreground-only — content behind the display is clipped to avoid see-through artifacts). `vH = tunables.virtual_display_height` (already zoom/scale-adjusted at the call site). The pick path (`display3d_compute_center_view`) just needs a well-conditioned frustum — the unprojected ray is a full line — so it passes `(vH, 1000·vH)` regardless of mode.

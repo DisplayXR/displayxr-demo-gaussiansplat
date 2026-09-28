@@ -97,7 +97,7 @@
 #include "mode_switch.h"          // dxr::ModeSwitch — the shared 2D<->3D ramp (V / 0-8 keys)
 #include "clip_policy.h"          // dxr::ResolveClipPlanes — the transparent-mode ZDP clip
 #include "color_policy.h"         // dxr::DisplayReferredToSceneLinear (placeholder clear)
-#include "gs_vulkan_utils.h"      // gsIsSrgbFormat
+#include "gs_vulkan_utils.h"      // gsIsSrgbFormat, gsChooseSwapchainFormat
 #include "clickthrough.h"         // input-region punch-through (Ctrl+T transparent mode)
 #include "content_bounds.h"       // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (depth-budget ROI)
 #include "content_mask.h"         // dxr::ContentMaskFromCoverage / ChainContentMask (silhouette ROI)
@@ -1016,11 +1016,11 @@ static bool CreateSwapchains(AppXrSession& xr) {
     std::vector<int64_t> fmts(fmtCount);
     xrEnumerateSwapchainFormats(xr.session, fmtCount, &fmtCount, fmts.data());
 
-    int64_t selectedFmt = fmts.empty() ? VK_FORMAT_B8G8R8A8_UNORM : fmts[0];
-    for (auto f : fmts) {
-        if (f == VK_FORMAT_B8G8R8A8_SRGB || f == VK_FORMAT_R8G8B8A8_SRGB) { selectedFmt = f; break; }
-        if (f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_R8G8B8A8_UNORM) selectedFmt = f;
-    }
+    // _SRGB first (INV-4.6) — the one rule, shared with every leg: see
+    // gsChooseSwapchainFormat. Display-referred bytes in an UNORM swapchain
+    // are encoded twice by a v2.21.7+ runtime.
+    int64_t selectedFmt = fmts.empty() ? (int64_t)VK_FORMAT_B8G8R8A8_UNORM
+                                       : gsChooseSwapchainFormat(fmts.data(), (uint32_t)fmts.size());
 
     // Worst-case-size across advertised modes (see swapchain-model.md).
     uint32_t w = views[0].recommendedImageRectWidth * 2;
