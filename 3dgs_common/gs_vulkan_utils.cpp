@@ -7,6 +7,7 @@
 
 #include "gs_vulkan_utils.h"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 uint32_t gsFindMemoryType(VkPhysicalDevice physDevice,
@@ -164,6 +165,41 @@ bool gsIsSrgbFormat(VkFormat format)
     default:
         return false;
     }
+}
+
+static bool gsIsUnorm8Format(int64_t format)
+{
+    return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM ||
+           format == VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+}
+
+int64_t gsChooseSwapchainFormat(const int64_t* formats, uint32_t count)
+{
+    if (formats == nullptr || count == 0) {
+        return VK_FORMAT_UNDEFINED;
+    }
+    const char* enc = getenv("DXR_SWAPCHAIN_ENCODING");
+    const bool preferUnorm = (enc != nullptr && strcmp(enc, "unorm") == 0);
+
+    int64_t firstSrgb = VK_FORMAT_UNDEFINED;
+    int64_t firstUnorm = VK_FORMAT_UNDEFINED;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (firstSrgb == VK_FORMAT_UNDEFINED && gsIsSrgbFormat((VkFormat)formats[i])) {
+            firstSrgb = formats[i];
+        }
+        if (firstUnorm == VK_FORMAT_UNDEFINED && gsIsUnorm8Format(formats[i])) {
+            firstUnorm = formats[i];
+        }
+    }
+    const int64_t first = preferUnorm ? firstUnorm : firstSrgb;
+    const int64_t second = preferUnorm ? firstSrgb : firstUnorm;
+    if (first != VK_FORMAT_UNDEFINED) {
+        return first;
+    }
+    if (second != VK_FORMAT_UNDEFINED) {
+        return second;
+    }
+    return formats[0];
 }
 
 static VkFormat gsUnormSiblingOf(VkFormat format)
