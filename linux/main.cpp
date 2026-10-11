@@ -101,6 +101,7 @@
 #include "clickthrough.h"         // input-region punch-through (Ctrl+T transparent mode)
 #include "content_bounds.h"       // dxr::ProjectAabbToCanvasBounds / ChainContentBounds (depth-budget ROI)
 #include "content_mask.h"         // dxr::ContentMaskFromCoverage / ChainContentMask (silhouette ROI)
+#include "gs_cursor_depth.h"      // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, splat ray cast
 #pragma pop_macro("None")
 
 // ============================================================================
@@ -235,6 +236,14 @@ static int32_t g_absoluteModeRequested = -1;
 // forfeits the snap). Destroyed LAST (the runtime's VkSurfaceKHR borrows its
 // connection).
 static DxrLinuxWindow g_window;
+// Depth-aware cursor (XR_DXR_cursor_depth): the runtime draws it in front of the
+// splats where they pop out of the glass; the app supplies the depth (the
+// renderer's splat ray cast). displayxr::linux_window is X11 OR Wayland, so this
+// leg feeds the pointer by hand (setPointerUV from Motion events) and hides the
+// OS cursor with the window's own set_cursor() - the helper's manual path.
+// Declared after g_window: destroyed BEFORE it.
+static dxr::CursorDepth g_cursor;
+static gsdemo::CursorDepthAdoption g_cursorAdopt;
 static DxrWeaveSnap g_weaveSnap;
 
 // Ctrl+T: opaque <-> transparent background — the Windows leg's
@@ -667,6 +676,7 @@ struct AppXrSession {
 
     bool hasDisplayInfoExt = false;
     bool hasViewRigExt = false;
+    uint32_t cursorDepthSpecVersion = 0; //!< XR_DXR_cursor_depth, 0 = not enabled
     bool hasDepthBudgetExt = false;      //!< XR_DXR_depth_budget (the transparent-mode rear clip)
     uint32_t depthBudgetExtVersion = 0;  //!< the RUNTIME's version: v3+ takes the content mask
     bool hasXlibBindingExt = false;
@@ -723,6 +733,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            gsdemo::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
@@ -737,6 +750,9 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     enabled.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
     if (xr.hasDisplayInfoExt) enabled.push_back(XR_DXR_DISPLAY_INFO_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
+    if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
     if (xr.hasDepthBudgetExt) enabled.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
     LOG_INFO("XR_DXR_depth_budget: %s (v%u)", xr.hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
              xr.depthBudgetExtVersion);
@@ -1581,6 +1597,8 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
         break;
 
     case DxrWindowEvent::Type::Motion:
+            if (!g_cursorAdopt.scripted() && xr.xWinW > 0 && xr.xWinH > 0)
+                g_cursor.setPointerUV((float)ev.x / (float)xr.xWinW, (float)ev.y / (float)xr.xWinH);
             if (g_camDragging && g_cameraRigActive && g_camRig.valid) {
                 MarkUserInput();
                 // Gain is per canvas FRACTION (GsOrbitFromDrag's contract), so a
@@ -1623,6 +1641,10 @@ static void HandleWindowEvent(AppXrSession& xr, const DxrWindowEvent& ev) {
                 if (g_dispOrbitPitch < -1.4f) g_dispOrbitPitch = -1.4f;
             }
             break;
+
+    case DxrWindowEvent::Type::PointerLeave:
+        if (!g_cursorAdopt.scripted()) g_cursor.clearPointerUV();   // off the canvas: no hint
+        break;
 
     case DxrWindowEvent::Type::Resize:
         // The CONTENT size (the bound window/surface, header bar excluded).
@@ -1861,6 +1883,9 @@ int main(int argc, char** argv) {
     if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex,
                            xr.swapchain.width, xr.swapchain.height))
         LOG_WARN("3DGS renderer init failed");
+    // Depth-aware cursor: every load from here on also builds the splat ray
+    // cast (on a worker). Off when the extension is absent / opted out.
+    g_gsRenderer.setCursorRayCast(xr.cursorDepthSpecVersion > 0);
     // The session is transparent-capable, so opaque frames must write alpha 1
     // everywhere (the graphics renderer otherwise emits coverage alpha).
     g_gsRenderer.setHonorTransparentBg(true);
@@ -1900,6 +1925,11 @@ int main(int argc, char** argv) {
                     "fallback — pass a .spz/.ply path or bundle butterfly.spz", scene.c_str());
 #endif
       } }
+
+    g_cursorAdopt.setup(g_cursor, g_gsRenderer.rayCaster(), xr.cursorDepthSpecVersion);
+    g_cursor.onDepthCursorShownChanged([](bool shown) {
+        g_window.set_cursor(shown ? DxrCursor::Hidden : DxrCursor::Default);
+    });
 
     LOG_INFO("=== Entering main loop ===");
     LOG_INFO("  mouse: drag = orbit | wheel = zoom | shift+wheel = 3D strength");
@@ -2168,6 +2198,7 @@ int main(int argc, char** argv) {
             XrView views[8] = {};
             for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
 
+            g_cursor.chain(locateInfo, viewState);
             XrResult locRes = xrLocateViews(xr.session, &locateInfo, &viewState,
                 runtimeViewCount, &runtimeViewCount, views);
 
@@ -2298,6 +2329,27 @@ int main(int argc, char** argv) {
                         eyeCount = capped;
                     }
                 }
+
+                // Depth-aware cursor: the views just located are what the NEXT
+                // frame's footprint rays are fired through, so describe this
+                // frame's rig, near cull (the same ez - vH the render path
+                // resolves through dxr::ResolveClipPlanes) and model transform.
+                g_cursor.afterLocate(views, (uint32_t)eyeCount);
+                {
+                    gsdemo::CursorSceneState& cs = g_cursorAdopt.state();
+                    cs.valid = true;
+                    float fx, fy, fz;
+                    quat_rotate_vec3(cameraPose.orientation, 0.0f, 0.0f, -1.0f, &fx, &fy, &fz);
+                    cs.forward[0] = fx; cs.forward[1] = fy; cs.forward[2] = fz;
+                    cs.displayRig = !camRig;
+                    cs.displayCenter[0] = cameraPose.position.x;
+                    cs.displayCenter[1] = cameraPose.position.y;
+                    cs.displayCenter[2] = cameraPose.position.z;
+                    cs.vH = virtualDisplayHeight;
+                    cs.nearDepth = kGsCameraRigNearM;
+                    cs.hasModel = camOrbiting && gsdemo::InvertAffine(camSceneOrbit, cs.cloudFromLocate);
+                }
+                if (g_cursorAdopt.endFrame(g_cursor)) LOG_INFO("%s", g_cursorAdopt.summary());
 
                 // Render tile = window × recommendedViewScaleXY (never the
                 // swapchain/display size) — the handle-app tiling rule
@@ -2560,6 +2612,7 @@ int main(int argc, char** argv) {
     CleanupOpenXR(xr);
     vkDestroyDevice(vkDevice, nullptr);
     vkDestroyInstance(vkInstance, nullptr);
+    g_cursor.enable(0);   // restores the OS cursor while the window still exists
     g_window.destroy();   // LAST: the runtime's VkSurfaceKHR borrowed this connection
     return 0;
 }

@@ -436,6 +436,10 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
     if (!createSceneResources()) { GS_LOGE("GsAdreno: createSceneResources failed"); return false; }
     dispatchCov3d();
 
+    // The CPU vertex copy is done with: hand it to the cursor ray cast's
+    // worker (gs_raycast.h) instead of dropping it — no copy, no load stall.
+    if (cursorRayCast_) rayCaster_.buildAsync(std::move(verts));
+
     sceneLoaded_ = true;
     GS_LOGI("GsAdreno: scene loaded (%u gaussians, sort wg=%u)", numGaussians_, numSortWorkgroups_);
     return true;
@@ -1322,6 +1326,7 @@ void GsAdrenoRenderer::cleanupScene() {
     }
 
     posX_.clear(); posY_.clear(); posZ_.clear();
+    rayCaster_.clear();
     sceneBBoxValid_ = false;
     numGaussians_ = 0;
     sceneLoaded_ = false;

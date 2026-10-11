@@ -53,6 +53,16 @@ own constant): convergence is depth, and a jump in it reads as the whole scene
 lurching toward the viewer. Space eases the focus back to whatever the
 waterfall chose.
 
+**Depth-aware cursor.** Where the splats pop out of the glass under the
+pointer, the runtime draws the cursor just in front of them (runtime ≥ v2.36,
+`XR_DXR_cursor_depth`; macOS and Linux today, Windows once the runtime's D3D
+compositors draw it). Over empty space, or content on or behind the glass, the
+OS cursor is unchanged. `DISPLAYXR_CURSOR_DEPTH=0` turns it off;
+`DISPLAYXR_CURSOR_DEPTH_UV=u,v` scripts the pointer (canvas UV, top-left
+origin) and logs the placement. The depth comes from a CPU ray cast that
+composites the splats front to back — see `3dgs_common/gs_raycast.h`, and
+`gs_raycast_probe <scene>` for its build and per-frame cost on any asset.
+
 ### Linux (X11 or native Wayland)
 
 One binary runs on X11 (XWayland included) or native Wayland. The window is

@@ -24,6 +24,7 @@
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"  // GsSceneMeasurements
 #include "gs_scene_fit.h"   // GsFitBounds  // GsVertex (used by filterFloaters signature)
+#include "gs_raycast.h"     // GsSplatRayCaster (depth-aware cursor)
 
 struct GsPickData {
     float px, py, pz;   // world-space position
@@ -100,6 +101,16 @@ struct GsRenderer {
                       float hitPos[3], float maxDistance = 100.0f,
                       const float viewMatrix[16] = nullptr,
                       float clipNear = 0.0f, float clipFar = 0.0f) const;
+
+    // Depth-aware cursor (XR_DXR_cursor_depth): arm BEFORE loadScene() and each
+    // load hands its CPU vertex copy (which it would otherwise drop after the
+    // upload) to a worker that builds the splat ray cast — the cursor's depth
+    // source (gs_raycast.h). Unlike pickGaussian, which returns the splat
+    // CENTRE nearest the ray, it returns where the front-to-back composite
+    // turns opaque: the surface the viewer sees. Off (default) = no extra
+    // memory and no work.
+    void setCursorRayCast(bool on) { cursorRayCast_ = on; }
+    const GsSplatRayCaster& rayCaster() const { return rayCaster_; }
 
     // World-space axis-aligned bounding box of loaded splat centers.
     // Returns false if no scene is loaded; otherwise writes min/max xyz.
@@ -379,6 +390,10 @@ private:
 
     // ── CPU pick data (compact: 20 bytes/gaussian) ─────────────────────
     std::vector<GsPickData> pickData_;
+
+    // ── Depth-aware cursor ray cast (see setCursorRayCast) ───────────────
+    bool cursorRayCast_ = false;
+    GsSplatRayCaster rayCaster_;
 
     // Outlier-trimmed scene bbox (splat centers), cached at scene load.
     // Used per-eye to compute the linear 16-bit sort-depth quantization range

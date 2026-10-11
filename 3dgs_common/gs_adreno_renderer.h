@@ -38,6 +38,7 @@
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"  // GsSceneMeasurements
 #include "gs_scene_fit.h"   // GsFitBounds  // GsVertex, GsSceneCamera
+#include "gs_raycast.h"     // GsSplatRayCaster (depth-aware cursor)
 
 #include <vulkan/vulkan.h>
 #include <string>
@@ -111,6 +112,13 @@ struct GsAdrenoRenderer {
                       float hitPos[3], float maxDistance = 100.0f,
                       const float viewMatrix[16] = nullptr,
                       float clipNear = 0.0f, float clipFar = 0.0f) const;
+
+    //! Depth-aware cursor (XR_DXR_cursor_depth) — mirrors GsRenderer: arm
+    //! BEFORE loadScene() and each load hands its CPU vertex copy to a worker
+    //! that builds the splat ray cast (gs_raycast.h). Off (the default, and
+    //! always on Android) = no extra memory and no work.
+    void setCursorRayCast(bool on) { cursorRayCast_ = on; }
+    const GsSplatRayCaster& rayCaster() const { return rayCaster_; }
 
     // Render one eye to a viewport region of a swapchain image. viewMatrix and
     // projMatrix are column-major float[16]. clipNearViewSpace/clipFarViewSpace
@@ -325,6 +333,8 @@ private:
 
     // ── CPU-side scene data (auto-framing + depth-quant range) ──
     std::vector<float> posX_, posY_, posZ_;  // gaussian centers
+    bool cursorRayCast_ = false;             // see setCursorRayCast()
+    GsSplatRayCaster rayCaster_;
     float sceneBBoxMin_[3] = {0, 0, 0};
     float sceneBBoxMax_[3] = {0, 0, 0};
     bool sceneBBoxValid_ = false;

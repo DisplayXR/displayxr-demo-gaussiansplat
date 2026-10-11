@@ -12,6 +12,7 @@
 // displayxr-common's copy (displayxr::rules) is the ONE implementation; the
 // demo-local vendored copy in openxr_includes/ was deleted (runtime#1612).
 #include "dxr_view_config.h"   // DxrSelectViewConfigType (runtime#1486 opt-in)
+#include "gs_cursor_depth.h"   // gsdemo::CursorDepthWanted (XR_DXR_cursor_depth)
 #include <cstring>
 
 // XR_DXR_view_rig (W7 of #396): the runtime owns the off-axis Kooima math and
@@ -37,6 +38,11 @@ bool XrDepthBudgetExtAvailable() { return s_hasDepthBudgetExt; }
 static uint32_t s_depthBudgetExtVersion = 0;
 
 uint32_t XrDepthBudgetExtVersion() { return s_depthBudgetExtVersion; }
+
+// XR_DXR_cursor_depth (runtime ADR-046): 0 = not enabled.
+static uint32_t s_cursorDepthSpecVersion = 0;
+
+uint32_t XrCursorDepthSpecVersion() { return s_cursorDepthSpecVersion; }
 
 // INV-1.3 / runtime#715: 3D panel top-left in OS virtual-desktop pixels
 // (top-down, origin = primary monitor top-left), from
@@ -119,6 +125,10 @@ bool InitializeOpenXR(XrSessionManager& xr) {
             s_hasDepthBudgetExt = true;
             s_depthBudgetExtVersion = ext.extensionVersion;
         }
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            gsdemo::CursorDepthWanted()) {
+            s_cursorDepthSpecVersion = ext.extensionVersion;
+        }
     }
 
     LOG_INFO("XR_KHR_vulkan_enable2: %s", hasVulkan ? "AVAILABLE" : "NOT FOUND");
@@ -130,6 +140,8 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     LOG_INFO("XR_DXR_mcp_tools: %s", xr.hasMcpToolsExt ? "AVAILABLE" : "NOT FOUND");
     LOG_INFO("XR_DXR_depth_budget: %s (v%u)", s_hasDepthBudgetExt ? "AVAILABLE" : "NOT FOUND",
         s_depthBudgetExtVersion);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", s_cursorDepthSpecVersion ? "ENABLED" : "off",
+        s_cursorDepthSpecVersion);
 
     if (!hasVulkan) {
         LOG_ERROR("XR_KHR_vulkan_enable2 extension not available");
@@ -163,6 +175,9 @@ bool InitializeOpenXR(XrSessionManager& xr) {
     }
     if (s_hasDepthBudgetExt) {
         enabledExtensions.push_back(XR_DXR_DEPTH_BUDGET_EXTENSION_NAME);
+    }
+    if (s_cursorDepthSpecVersion > 0) {
+        enabledExtensions.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
     }
 
     XrInstanceCreateInfo createInfo = {XR_TYPE_INSTANCE_CREATE_INFO};

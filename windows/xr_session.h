@@ -35,6 +35,11 @@ bool XrDepthBudgetExtAvailable();
 // Returns 0 when the extension itself is unavailable.
 uint32_t XrDepthBudgetExtVersion();
 
+// XR_DXR_cursor_depth (runtime ADR-046) spec version when ENABLED at
+// xrCreateInstance, else 0 (absent, or opted out with DISPLAYXR_CURSOR_DEPTH=0).
+// Same demo-side-static pattern as XrViewRigExtAvailable().
+uint32_t XrCursorDepthSpecVersion();
+
 // INV-1.3 / runtime#715: 3D panel top-left in virtual-desktop pixels from
 // XrDisplayDesktopPositionDXR (display_info v16), filled by InitializeOpenXR.
 // (0,0) = primary/unknown (safe default, incl. on older runtimes). Demo-side
