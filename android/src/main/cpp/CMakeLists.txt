@@ -171,6 +171,9 @@ add_library(gausssplat_vk_android SHARED
     # desktop legs so the framing is identical on every platform; this leg has
     # to list it explicitly because the source list here is CURATED, not a glob.
     ${GS_COMMON}/gs_scene_fit.cpp
+    # gs_adreno_renderer.cpp owns a GsSplatRayCaster (depth-aware cursor ray
+    # cast). Never armed on Android — compiled for the link, costs nothing.
+    ${GS_COMMON}/gs_raycast.cpp
     ${GS_COMMON}/gs_vulkan_utils.cpp
     ${SHADER_HEADERS})
 

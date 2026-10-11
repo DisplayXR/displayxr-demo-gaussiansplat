@@ -247,6 +247,8 @@ add_library(gs_renderer STATIC
     gs_camera_rig.cpp
     gs_scene_fit.h
     gs_scene_fit.cpp
+    gs_raycast.h
+    gs_raycast.cpp
     gs_vulkan_utils.h
     gs_vulkan_utils.cpp
     ${SHADER_HEADERS}
@@ -283,6 +285,17 @@ if(NOT ANDROID)
     set_target_properties(gs_fit_probe PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
     if(MSVC)
         set_target_properties(gs_fit_probe PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+
+    # gs_raycast_probe: build + per-frame cost of the cursor ray cast
+    # (gs_raycast.h) on real assets, checked against a brute-force composite.
+    add_executable(gs_raycast_probe gs_raycast_probe.cpp)
+    target_link_libraries(gs_raycast_probe PRIVATE gs_renderer)
+    set_target_properties(gs_raycast_probe PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    if(MSVC)
+        set_target_properties(gs_raycast_probe PROPERTIES
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
         )
     endif()

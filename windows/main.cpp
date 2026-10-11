@@ -44,6 +44,7 @@
 #include "atlas_capture.h"
 #include "auto_fit.h"         // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
 #include "auto_fit_canvas.h"  // dxr::AutoFitCanvas — the runtime-resolved viewport (shell tile)
+#include "gs_cursor_depth.h"  // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, splat ray cast
 #include "vk_overlay_kit.h"   // dxr::CachedLayerUploader (#837 — no per-frame HUD upload+wait)
 #include "vk_clickthrough_region.h" // dxr::ClickThroughRegion (#833 — transparent-mode punch-through)
 #include "win_window_drag.h"        // dxr::RmbWindowDrag (move the borderless overlay)
@@ -2010,6 +2011,15 @@ static void RenderThreadFunc(
 {
     LOG_INFO("[RenderThread] Started");
 
+    // Depth-aware cursor: the runtime draws it in front of the splats where
+    // they pop out of the glass; the app supplies the depth (the renderer's
+    // splat ray cast). Until the D3D11/D3D12 compositors draw it (runtime
+    // #1944) willDraw stays false here and the OS cursor stays: inert.
+    dxr::CursorDepth cursor;
+    gsdemo::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_gsRenderer.rayCaster(), XrCursorDepthSpecVersion());
+    if (!cursorAdopt.scripted()) cursor.setWindowWin32(hwnd);
+
     PerformanceStats perfStats = {};
     perfStats.lastTime = std::chrono::high_resolution_clock::now();
 
@@ -2439,6 +2449,7 @@ static void RenderThreadFunc(
                         uint32_t viewCount = 8;
                         XrView rawViews[8];
                         for (uint32_t i = 0; i < 8; i++) rawViews[i] = {XR_TYPE_VIEW};
+                        cursor.chain(locateInfo, viewState);
                         xrLocateViews(xr->session, &locateInfo, &viewState, 8, &viewCount, rawViews);
                         locatedViewCount = viewCount;  // runtime#1486 clamp input
                         for (uint32_t i = 0; i < viewCount && i < 8; i++) locatedViews[i] = rawViews[i];
@@ -2502,6 +2513,32 @@ static void RenderThreadFunc(
                         if (activeViewCount == 0) activeViewCount = 1u;
                         if (activeViewCount > 8) activeViewCount = 8u;
                         const int eyeCount = monoMode ? 1 : (int)activeViewCount;
+
+                        // Depth-aware cursor: the views just located are what the
+                        // NEXT frame's footprint rays are fired through, so describe
+                        // this frame's rig, near cull (ez - rigVH, as
+                        // dxr::ResolveClipPlanes resolves it) and model transform.
+                        cursor.afterLocate(rawViews, (uint32_t)eyeCount);
+                        {
+                            gsdemo::CursorSceneState& cs = cursorAdopt.state();
+                            cs.valid = true;
+                            float fx, fy, fz;
+                            quat_rotate_vec3(cameraPose.orientation, 0.0f, 0.0f, -1.0f, &fx, &fy, &fz);
+                            cs.forward[0] = fx; cs.forward[1] = fy; cs.forward[2] = fz;
+                            cs.displayRig = !camRig;
+                            cs.displayCenter[0] = cameraPose.position.x;
+                            cs.displayCenter[1] = cameraPose.position.y;
+                            cs.displayCenter[2] = cameraPose.position.z;
+                            cs.vH = rigVH;
+                            cs.nearDepth = kGsCameraRigNearM;
+                            cs.hasModel = false;
+                            if (camRig && (inputSnapshot.yaw != 0.0f || inputSnapshot.pitch != 0.0f)) {
+                                float sceneM[16];
+                                g_camRig.SceneOrbitMatrix(inputSnapshot.yaw, inputSnapshot.pitch, sceneM);
+                                cs.hasModel = gsdemo::InvertAffine(sceneM, cs.cloudFromLocate);
+                            }
+                        }
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // Per-view extent driven entirely by the current rendering
                         // mode's view_scale and the live window size. Atlas dims
@@ -4039,6 +4076,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
                                queueFamilyIndex, renderW, renderH)) {
             LOG_WARN("3DGS renderer init failed - scene rendering will not be available");
         } else {
+            // Depth-aware cursor: every load from here on (the startup one
+            // below included) also builds the splat ray cast, on a worker.
+            // Off when the extension is absent / opted out.
+            g_gsRenderer.setCursorRayCast(XrCursorDepthSpecVersion() > 0);
             // Startup scene selection. A local asset named on the command line
             // loads here, synchronously, exactly where the bundled sample would
             // have — the render thread does not exist yet, so this is the one

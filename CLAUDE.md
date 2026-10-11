@@ -217,6 +217,37 @@ So the two artefacts diverge deliberately: `SetWindowRgn` keeps the **clipped** 
 
 **Pick respects the same visibility window.** `GsRenderer::pickGaussian(..., viewMatrix, clipNear, clipFar)` rejects double-click/recenter candidates whose **view-space forward depth** `dot(center − eye, fwd)` (fwd = `−(V[2],V[6],V[10])`) falls outside `[clipNear, clipFar]` — the same window the renderer clips to — so splats clipped in front of the near plane (or behind the ZDP in foreground mode) can never be focused. It uses forward depth, not ray-parameter `t`, so it's correct for off-axis rays. A full ray miss returns `false` → no recenter. The call sites pass `centerView.near_z` and (transparent only) `centerView.eye_display.z` as the far plane.
 
+## Depth-aware cursor (`XR_DXR_cursor_depth`)
+
+The runtime draws the cursor in front of content that pops out of the glass
+(runtime ADR-046 Amendment 2); the app supplies only the depth under the
+pointer. Adoption follows the modelviewer pilot (its `docs/depth-cursor.md`):
+`dxr::CursorDepth` from displayxr-common v2.29.0, wired per leg through
+`common/gs_cursor_depth.h` (`gsdemo::CursorDepthAdoption`: opt-out
+`DISPLAYXR_CURSOR_DEPTH=0`, scripted pointer `DISPLAYXR_CURSOR_DEPTH_UV=u,v`,
+throttled cost line). Windows is wired but inert until the D3D compositors draw
+the cursor (runtime #1944).
+
+**The depth source is `GsSplatRayCaster` (`3dgs_common/gs_raycast.h`), NOT
+`pickGaussian`.** The pick returns the splat *centre* nearest the ray — haze in
+front or a back-face splat — and is O(N) per ray. The ray cast returns where the
+front-to-back alpha composite first reaches 0.5 opacity (each splat evaluated
+exactly as the rasteriser composites it: peak Gaussian along the ray, 0.99
+clamp, 1/255 floor; splats < 0.1 opacity and floaters left out), walked through
+an implicit 8-ary BVH over Morton-sorted splats with a front-to-back node heap.
+It is exact against a brute-force composite (`gs_raycast_probe` checks it).
+Both renderers hand their CPU vertex copy, after upload, to a worker that builds
+it (`setCursorRayCast(true)` BEFORE `loadScene()`; off = no memory, no work).
+The leg refreshes `CursorSceneState` every frame: the rig forward, the near cull
+(display rig `ez - vH`; camera rig `kGsCameraRigNearM`) and the camera-rig orbit
+as an inverse model transform. Rays are in the locate space; an affine map keeps
+`t`.
+
+Precision trap kept in `evalSplat`: re-origin the ray at its Euclidean closest
+approach before applying `S^-1` (and use doubles) — a flat surfel's `S^-1` is
+~1e4 along its normal and `c - b²/a` on the long vector cancels, reporting
+splats 7σ off the ray as opaque hits.
+
 ## Transparency support
 
 The DisplayXR runtime since **v1.3.0** (the [v1.3.0 release](https://github.com/DisplayXR/displayxr-runtime/releases/tag/v1.3.0) added it; any current runtime supports it) provides Vulkan transparent-window support via a VK→D3D11 KMT-shared-texture → DComp + flip-model swapchain bridge. App-side contract:

@@ -979,6 +979,9 @@ bool GsRenderer::loadScene(const char* plyPath)
         fprintf(stderr, "GsRenderer: failed to upload vertex data\n");
         return false;
     }
+    // The CPU vertex copy is done with: hand it to the cursor ray cast's
+    // worker (gs_raycast.h) instead of dropping it — no copy, no load stall.
+    if (cursorRayCast_) rayCaster_.buildAsync(std::move(vertices));
 
     // Create descriptor sets (must be after buffer creation)
     if (!createDescriptorSets()) {
@@ -2243,6 +2246,7 @@ void GsRenderer::cleanupScene()
 
     pickData_.clear();
     pickData_.shrink_to_fit();
+    rayCaster_.clear();
 
     sceneLoaded_ = false;
     numGaussians_ = 0;

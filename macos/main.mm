@@ -67,6 +67,7 @@
 #include "atlas_capture.h"
 #include "auto_fit.h"             // dxr::AutoFitVHeight / FitTransition (shared width-aware framing)
 #include "auto_fit_canvas.h"      // dxr::AutoFitCanvas — the runtime-resolved viewport
+#include "gs_cursor_depth.h"      // depth-aware cursor (XR_DXR_cursor_depth): runtime-drawn, splat ray cast
 
 // ============================================================================
 // Logging
@@ -1198,6 +1199,10 @@ struct AppXrSession {
     // and returns render-ready XrView{pose, fov}; the app deletes its own.
     bool hasViewRigExt = false;
 
+    // XR_DXR_cursor_depth (runtime ADR-046): the runtime draws a depth cursor
+    // in front of content that pops out under the pointer. 0 = not enabled.
+    uint32_t cursorDepthSpecVersion = 0;
+
     // Enumerated rendering mode info
     uint32_t renderingModeCount = 0;
     char renderingModeNames[8][XR_MAX_SYSTEM_NAME_SIZE] = {};
@@ -1641,6 +1646,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
         if (strcmp(ext.extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0) xr.hasAtlasCaptureExt = true;
         if (strcmp(ext.extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0) xr.hasMcpToolsExt = true;
         if (strcmp(ext.extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) xr.hasViewRigExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0 &&
+            gsdemo::CursorDepthWanted())
+            xr.cursorDepthSpecVersion = ext.extensionVersion;
     }
 
     if (!hasVulkan) { LOG_ERROR("XR_KHR_vulkan_enable not available"); return false; }
@@ -1653,6 +1661,9 @@ static bool InitializeOpenXR(AppXrSession& xr) {
     if (xr.hasMcpToolsExt) enabled.push_back(XR_DXR_MCP_TOOLS_EXTENSION_NAME);
     if (xr.hasViewRigExt) enabled.push_back(XR_DXR_VIEW_RIG_EXTENSION_NAME);
     LOG_INFO("XR_DXR_view_rig: %s", xr.hasViewRigExt ? "AVAILABLE" : "NOT FOUND");
+    if (xr.cursorDepthSpecVersion > 0) enabled.push_back(XR_DXR_CURSOR_DEPTH_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_cursor_depth: %s (spec v%u)", xr.cursorDepthSpecVersion ? "ENABLED" : "off",
+             xr.cursorDepthSpecVersion);
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtMacOS", sizeof(ci.applicationInfo.applicationName));
@@ -2723,6 +2734,9 @@ int main(int argc, char** argv) {
       uint32_t rh = xr.swapchain.height;
       if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue, queueFamilyIndex, rw, rh))
           LOG_WARN("3DGS renderer init failed");
+      // Depth-aware cursor: every load from here on also builds the splat ray
+      // cast (on a worker). Off when the extension is absent / opted out.
+      g_gsRenderer.setCursorRayCast(xr.cursorDepthSpecVersion > 0);
     }
 
     // Command pool for placeholder rendering
@@ -2782,6 +2796,14 @@ int main(int argc, char** argv) {
     LOG_INFO("Controls: WASDEQ=Move  LMB-drag=Rotate  Scroll=Zoom  DblClick=Focus");
     LOG_INFO("          -/= Depth  Space=Reset  M=Auto-Orbit  V=Mode");
     LOG_INFO("          L/Open=Load  Tab=HUD  ESC=Quit  (.ply/.spz also accept drag-and-drop)");
+
+    // Depth-aware cursor: the runtime draws it (default look) in front of the
+    // splats where they pop out of the glass; the app supplies the depth (the
+    // renderer's splat ray cast). Inert when the extension is off / opted out.
+    dxr::CursorDepth cursor;
+    gsdemo::CursorDepthAdoption cursorAdopt;
+    cursorAdopt.setup(cursor, g_gsRenderer.rayCaster(), xr.cursorDepthSpecVersion);
+    if (!cursorAdopt.scripted()) cursor.setWindowCocoa((__bridge void*)g_metalView);
 
     auto lastTime = std::chrono::high_resolution_clock::now();
 
@@ -3071,6 +3093,7 @@ int main(int argc, char** argv) {
                     XrView views[8] = {};
                     for (uint32_t v = 0; v < runtimeViewCount; v++) views[v].type = XR_TYPE_VIEW;
 
+                    cursor.chain(locateInfo, viewState);
                     XrResult locResult = xrLocateViews(xr.session, &locateInfo, &viewState,
                         runtimeViewCount, &runtimeViewCount, views);
                     if (XR_SUCCEEDED(locResult) &&
@@ -3125,6 +3148,32 @@ int main(int argc, char** argv) {
                                 eyeCount = capped;
                             }
                         }
+
+                        // Depth-aware cursor: the views just located (render-ready,
+                        // in the world the splats live in) are what the NEXT frame's
+                        // footprint rays are fired through, so describe this frame's
+                        // rig, near cull and model transform alongside them.
+                        cursor.afterLocate(views, (uint32_t)eyeCount);
+                        {
+                            gsdemo::CursorSceneState& cs = cursorAdopt.state();
+                            cs.valid = true;
+                            float fx, fy, fz;
+                            quat_rotate_vec3(cameraPose.orientation, 0.0f, 0.0f, -1.0f, &fx, &fy, &fz);
+                            cs.forward[0] = fx; cs.forward[1] = fy; cs.forward[2] = fz;
+                            cs.displayRig = !camRig;
+                            cs.displayCenter[0] = cameraPose.position.x;
+                            cs.displayCenter[1] = cameraPose.position.y;
+                            cs.displayCenter[2] = cameraPose.position.z;
+                            cs.vH = rigVH;
+                            cs.nearDepth = kGsCameraRigNearM;
+                            cs.hasModel = false;
+                            if (camRig && (g_input.yaw != 0.0f || g_input.pitch != 0.0f)) {
+                                float sceneM[16];
+                                g_camRig.SceneOrbitMatrix(g_input.yaw, g_input.pitch, sceneM);
+                                cs.hasModel = gsdemo::InvertAffine(sceneM, cs.cloudFromLocate);
+                            }
+                        }
+                        if (cursorAdopt.endFrame(cursor)) LOG_INFO("%s", cursorAdopt.summary());
 
                         // HUD eye readout. Under the rig, views[] carries render-ready
                         // WORLD eyes, so the display-space eyes come from the raw channel
