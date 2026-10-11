@@ -232,7 +232,12 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     // ONCE. N slots of per-frame buffers are created per scene to match.
     {
         dxr::VkFrameRing::Config rc;
-        rc.framesInFlight = knobs_.framesInFlight;  // 0 = default 3
+        // 2 by default here, not the ring's 3: each slot carries kViewSets
+        // full buffer sets (attr/sort/render target), so 2 x 2 sets is the
+        // old per-view ring's 3 sets plus one. Measured on Adreno: 1 vs 3
+        // frames in flight made no fps difference for this app (PR #141).
+        rc.framesInFlight = knobs_.framesInFlight ? knobs_.framesInFlight
+                                                  : kDefaultFramesInFlight;
         rc.perViewUboBytes = sizeof(GsUniformBuffer);
         rc.maxViewsPerFrame = kMaxViewsPerFrame;
         if (!ring_.init(device_, physDevice_, queue_, queueFamilyIndex, rc)) {
@@ -241,6 +246,26 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
         }
         ringN_ = ring_.framesInFlight();
         if (ringN_ > kMaxRing) ringN_ = kMaxRing;  // ring clamps to 8 already
+        numSets_ = ringN_ * kViewSets;
+
+        // One command buffer per (slot, view), allocated ONCE; reset per use.
+        VkCommandPoolCreateInfo pci = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = queueFamilyIndex;
+        if (vkCreateCommandPool(device_, &pci, nullptr, &viewCmdPool_) != VK_SUCCESS) {
+            GS_LOGE("GsAdreno: view command pool create failed");
+            return false;
+        }
+        for (uint32_t i = 0; i < ringN_; i++) {
+            VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+            ai.commandPool = viewCmdPool_;
+            ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            ai.commandBufferCount = kMaxViewsPerFrame;
+            if (vkAllocateCommandBuffers(device_, &ai, viewCmd_[i]) != VK_SUCCESS) {
+                GS_LOGE("GsAdreno: view command buffer alloc failed");
+                return false;
+            }
+        }
     }
 
     if (timestampPeriod_ > 0.0f && tsValidBits_ > 0) {
@@ -260,7 +285,7 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
 
     initialized_ = true;
     GS_LOGI("GsAdreno: initialized (%ux%u eye, renderScale=%.2f, subgroup=%u, "
-            "ts_period=%.2fns valid_bits=%u, framesInFlight=%u, one submit/frame)",
+            "ts_period=%.2fns valid_bits=%u, framesInFlight=%u, submit per view, unwaited)",
             width_, height_, renderScale_, subgroupSize_, timestampPeriod_, tsValidBits_,
             ringN_);
     // One line, once per session: which perf levers are live. Anything that
@@ -473,8 +498,9 @@ bool GsAdrenoRenderer::createSceneResources() {
     // ── Buffers ──
     // cov3dBuffer_ is written once (dispatchCov3d at load) then read-only → single.
     cov3dBuffer_   = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 24, ssbo, devLocal);
-    // Everything below is mutated every frame → one copy per ring slot.
-    for (uint32_t s = 0; s < ringN_; s++) {
+    // Everything below is mutated every frame → one copy per buffer set
+    // (ring slot x view, see the header).
+    for (uint32_t s = 0; s < numSets_; s++) {
         attrBuffer_[s]    = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 64, ssbo, devLocal);
         keysEvenBuffer_[s]= gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
         keysOddBuffer_[s] = gsCreateBuffer(device_, physDevice_, (VkDeviceSize)N * 4, ssbo, devLocal);
@@ -503,8 +529,8 @@ bool GsAdrenoRenderer::createSceneResources() {
     numSortWorkgroups_ = (N + numRadixBlocksPerWG_ * 256u - 1u) / (numRadixBlocksPerWG_ * 256u);
     if (numSortWorkgroups_ == 0) numSortWorkgroups_ = 1;
     // Internal scaled render target (full size; only the scaled sub-rect used)
-    // + radix histogram — both per slot (draw/blit and sort run per frame).
-    for (uint32_t s = 0; s < ringN_; s++) {
+    // + radix histogram — both per buffer set (draw/blit and sort run per view).
+    for (uint32_t s = 0; s < numSets_; s++) {
         histBuffer_[s] = gsCreateBuffer(device_, physDevice_,
             (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssbo, devLocal);
         renderImage_[s] = gsCreateImage2D(device_, physDevice_, width_, height_,
@@ -536,17 +562,17 @@ bool GsAdrenoRenderer::createSceneResources() {
 
     // ── Descriptor pool ──
     {
-        // Per slot: 7 sets (preprocSet1, keys, histEven, histOdd, sortE2O,
+        // Per buffer set: 7 sets (preprocSet1, keys, histEven, histOdd, sortE2O,
         // sortO2E, splat) using 21 storage + 1 dynamic-uniform descriptors (the
         // keys set gained the VkDrawIndirectCommand for the compacted draw). Plus
-        // 2 single sets (cov3d, preprocSet0) using 4 storage. Sized from ringN_.
+        // 2 single sets (cov3d, preprocSet0) using 4 storage. Sized from numSets_.
         // (+1 storage IMAGE per slot: the #112 coverage raster on preprocSet1.)
         VkDescriptorPoolSize sizes[3] = {
-            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21 * ringN_ + 4},
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 * ringN_},
-            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 * ringN_}};
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 21 * numSets_ + 4},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1 * numSets_},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1 * numSets_}};
         VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        ci.maxSets = 7 * ringN_ + 2; ci.poolSizeCount = 3; ci.pPoolSizes = sizes;
+        ci.maxSets = 7 * numSets_ + 2; ci.poolSizeCount = 3; ci.pPoolSizes = sizes;
         if (vkCreateDescriptorPool(device_, &ci, nullptr, &descriptorPool_) != VK_SUCCESS)
             return false;
     }
@@ -626,7 +652,7 @@ bool GsAdrenoRenderer::createSceneResources() {
         ci.dependencyCount = 2; ci.pDependencies = deps;
         if (vkCreateRenderPass(device_, &ci, nullptr, &renderPass_) != VK_SUCCESS) return false;
 
-        for (uint32_t s = 0; s < ringN_; s++) {
+        for (uint32_t s = 0; s < numSets_; s++) {
             VkFramebufferCreateInfo fb = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
             fb.renderPass = renderPass_; fb.attachmentCount = 1; fb.pAttachments = &renderImage_[s].view;
             fb.width = width_; fb.height = height_; fb.layers = 1;
@@ -695,9 +721,9 @@ bool GsAdrenoRenderer::createSceneResources() {
     dsPreprocessSet0_ = allocDS(device_, descriptorPool_, dslPreprocessSet0_);
     writeDS(device_, dsPreprocessSet0_, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, vertexBuffer_.buffer, vertexBuffer_.size);
     writeDS(device_, dsPreprocessSet0_, 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, cov3dBuffer_.buffer, cov3dBuffer_.size);
-    // Per-slot sets: bind that slot's private per-frame buffers, so slot S's
-    // pipeline never aliases slot S±1's in-flight buffers.
-    for (uint32_t s = 0; s < ringN_; s++) {
+    // Per-buffer-set descriptor sets: bind that set's private buffers, so set S's
+    // pipeline never aliases another in-flight view's buffers.
+    for (uint32_t s = 0; s < numSets_; s++) {
         dsPreprocessSet1_[s] = allocDS(device_, descriptorPool_, dslPreprocessSet1_);
         writeDS(device_, dsPreprocessSet1_[s], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                 ring_.uboBuffer(), ring_.uboSliceBytes());
@@ -926,11 +952,12 @@ bool GsAdrenoRenderer::beginFrame() {
                 return (double)((ts[b] & mask) - (ts[a] & mask)) * (double)timestampPeriod_ / 1.0e6; };
             // Survivor count from the same retired submission (host-visible
             // mirror of the VkDrawIndirectCommand; instanceCount is word 1).
-            if (knobs_.compactDraw && drawCmdHost_[slot].buffer != VK_NULL_HANDLE) {
+            const uint32_t set0 = slot * kViewSets;  // view 0's buffer set
+            if (knobs_.compactDraw && drawCmdHost_[set0].buffer != VK_NULL_HANDLE) {
                 void *m = nullptr;
-                if (vkMapMemory(device_, drawCmdHost_[slot].memory, 0, 16, 0, &m) == VK_SUCCESS) {
+                if (vkMapMemory(device_, drawCmdHost_[set0].memory, 0, 16, 0, &m) == VK_SUCCESS) {
                     lastDrawnInstances_ = ((const uint32_t *)m)[1];
-                    vkUnmapMemory(device_, drawCmdHost_[slot].memory);
+                    vkUnmapMemory(device_, drawCmdHost_[set0].memory);
                 }
             }
             GS_LOGI("GS_TS[adreno] N=%u drawn=%u render=%ux%u(scale=%.2f keep=%.2f fif=%u) | preproc=%.2f "
@@ -947,9 +974,10 @@ bool GsAdrenoRenderer::beginFrame() {
 
 void GsAdrenoRenderer::endFrame() {
     if (!ring_.frameOpen()) return;
-    // ONE vkQueueSubmit for every view of the frame, with the slot fence and
-    // NO wait. Must precede xrReleaseSwapchainImage (same VkQueue as the
-    // runtime's compose).
+    // The views are already on the queue (each submitted as recorded); this
+    // submits the ring's empty frame buffer carrying the slot fence, which
+    // signals after every earlier submission in queue order. NO wait. Must
+    // precede xrReleaseSwapchainImage (same VkQueue as the runtime's compose).
     const VkResult r = ring_.endFrame();
     if (r != VK_SUCCESS && !warnedSubmit_) {
         warnedSubmit_ = true;
@@ -998,12 +1026,11 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     // own and close it at the end — one submit per view, the old shape.
     const bool autoFrame = !ring_.frameOpen();
     if (autoFrame && !beginFrame()) return;
-    VkCommandBuffer cmd = ring_.current();
     const uint32_t slot = ring_.slotIndex();
     const uint32_t view = viewInFrame_;
     uint32_t uboOffset = 0;
     void* uboDst = ring_.viewUbo(view, &uboOffset);
-    if (uboDst == nullptr) {
+    if (uboDst == nullptr || view >= kMaxViewsPerFrame) {
         if (!warnedViewOverflow_) {
             warnedViewOverflow_ = true;
             GS_LOGE("GsAdreno: view %u exceeds the frame ring's %u views/frame — skipped",
@@ -1013,16 +1040,26 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
         return;
     }
     viewInFrame_++;
+    const uint32_t set = slot * kViewSets + (view % kViewSets);
 
-    // Consecutive views of one frame share this slot's sort buffers, attr[],
-    // indirect-draw command, render target and blit scratch: order view i's
-    // writes after view i-1's reads on the GPU, not with a CPU wait.
-    if (view > 0) dxr::VkFrameRing::tileBarrier(cmd);
+    // This view's own command buffer (allocated once; the slot's previous use
+    // retired when beginFrame waited the slot fence).
+    VkCommandBuffer cmd = viewCmd_[slot][view];
+    {
+        vkResetCommandBuffer(cmd, 0);
+        VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cmd, &bi);
+    }
+    // Views 0..kViewSets-1 use disjoint buffer sets and run concurrently on
+    // the GPU. A view past that shares a set with an earlier view of this
+    // frame: a barrier at the top of its buffer orders it after everything
+    // submitted before it (pipeline barriers span submissions on one queue).
+    if (view >= kViewSets) dxr::VkFrameRing::tileBarrier(cmd);
 
-    // The slot's scratch is idle (beginFrame waited its fence); only an sRGB
-    // swapchain needs one. Format and size are constant across a frame's
-    // views, so a view > 0 never reallocates it under the open command buffer.
-    gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_[slot], width_, height_, swapchainFormat);
+    // The set's scratch is idle (beginFrame waited its slot's fence); only an
+    // sRGB swapchain needs one. Format and size are constant across views.
+    gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_[set], width_, height_, swapchainFormat);
 
     // GPU timestamps for view 0 only (one GS_TS line describes one eye).
     const bool tsOn = (view == 0 && timestampPeriod_ > 0.0f && tsPool_[slot] != VK_NULL_HANDLE);
@@ -1067,7 +1104,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
 
     // ── 1. preprocess: project + conic + SH + depth → attr[] ──
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipePreprocess_);
-    VkDescriptorSet pp[] = {dsPreprocessSet0_, dsPreprocessSet1_[slot]};
+    VkDescriptorSet pp[] = {dsPreprocessSet0_, dsPreprocessSet1_[set]};
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutPreprocess_, 0, 2, pp, 1, &uboOffset);
     // #112: arm/disarm the pre-cull silhouette scatter. Session-level, not
     // clip-level — a coverage source that changed shape when the far clip
@@ -1093,7 +1130,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     const bool compactDraw = knobs_.compactDraw;
     if (compactDraw) {
         const uint32_t seed[4] = {4u, 0u, 0u, 0u};
-        vkCmdUpdateBuffer(cmd, drawCmdBuffer_[slot].buffer, 0, sizeof(seed), seed);
+        vkCmdUpdateBuffer(cmd, drawCmdBuffer_[set].buffer, 0, sizeof(seed), seed);
         VkMemoryBarrier tb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         tb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         tb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -1101,7 +1138,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &tb, 0, nullptr, 0, nullptr);
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeKeys_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutKeys_, 0, 1, &dsKeys_[slot], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutKeys_, 0, 1, &dsKeys_[set], 0, nullptr);
     struct { uint32_t count; float depthMin; float invRange; uint32_t compact; }
         kpc = {N, depthQMin, 65535.0f / (depthQMax - depthQMin), compactDraw ? 1u : 0u};
     vkCmdPushConstants(cmd, layoutKeys_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(kpc), &kpc);
@@ -1122,13 +1159,13 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
         RadixPC pc = {N, pass * 8, numSortWorkgroups_, numRadixBlocksPerWG_};
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeHist_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutHist_, 0, 1,
-            even ? &dsHistEven_[slot] : &dsHistOdd_[slot], 0, nullptr);
+            even ? &dsHistEven_[set] : &dsHistOdd_[set], 0, nullptr);
         vkCmdPushConstants(cmd, layoutHist_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(cmd, numSortWorkgroups_, 1, 1);
         computeBarrier();
         vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeSort_);
         vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, layoutSort_, 0, 1,
-            even ? &dsSortEvenToOdd_[slot] : &dsSortOddToEven_[slot], 0, nullptr);
+            even ? &dsSortEvenToOdd_[set] : &dsSortOddToEven_[set], 0, nullptr);
         vkCmdPushConstants(cmd, layoutSort_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
         vkCmdDispatch(cmd, numSortWorkgroups_, 1, 1);
         computeBarrier();
@@ -1150,7 +1187,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     const float clearAlpha = (honorTransparentBg_ && !transparentBg) ? 1.0f : 0.0f;
     VkClearValue clear = {}; clear.color = {{0.0f, 0.0f, 0.0f, clearAlpha}};
     VkRenderPassBeginInfo rp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rp.renderPass = renderPass_; rp.framebuffer = framebuffer_[slot];
+    rp.renderPass = renderPass_; rp.framebuffer = framebuffer_[set];
     rp.renderArea = {{0, 0}, {rw, rh}};
     rp.clearValueCount = 1; rp.pClearValues = &clear;
     vkCmdBeginRenderPass(cmd, &rp, VK_SUBPASS_CONTENTS_INLINE);
@@ -1159,14 +1196,14 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     vkCmdSetViewport(cmd, 0, 1, &vpt);
     vkCmdSetScissor(cmd, 0, 1, &sc);
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeSplat_);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutSplat_, 0, 1, &dsSplat_[slot], 0, nullptr);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutSplat_, 0, 1, &dsSplat_[set], 0, nullptr);
     uint32_t splatPC[2] = {rw, rh};
     vkCmdPushConstants(cmd, layoutSplat_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(splatPC), splatPC);
     if (compactDraw) {
         // Survivors are the prefix [0, instanceCount) of the sorted payload —
         // see the key-reservation argument in splat_keys.comp. A culled
         // gaussian now costs no vertex invocation at all.
-        vkCmdDrawIndirect(cmd, drawCmdBuffer_[slot].buffer, 0, 1, 0);
+        vkCmdDrawIndirect(cmd, drawCmdBuffer_[set].buffer, 0, 1, 0);
     } else {
         vkCmdDraw(cmd, 4, N, 0, 0);
     }
@@ -1174,11 +1211,12 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 4);
 
     // ── 5. blit (linear upscale) the scaled region to the swapchain viewport ──
-    // A later view writing ANOTHER tile of the same atlas image must keep the
-    // tiles already blitted this frame: transition from the layout the
-    // previous view left it in, not UNDEFINED (which may discard contents —
-    // and now that all views share one command buffer, a TBDR driver is free
-    // to act on that).
+    // A later view writing ANOTHER tile of the same atlas image (desktop legs;
+    // Android has a swapchain per view, so this never fires there) must keep
+    // the tiles already blitted this frame: transition from the layout the
+    // previous view left it in, not UNDEFINED, which may discard contents.
+    // Its source stage is the previous view's final transition, not
+    // ALL_COMMANDS.
     const bool sameImageAsPrevView = (view > 0 && swapchainImage == frameLastImage_);
     frameLastImage_ = swapchainImage;
     VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1191,15 +1229,15 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     sb.image = swapchainImage;
     sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdPipelineBarrier(cmd,
-        sameImageAsPrevView ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        sameImageAsPrevView ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
 
     VkFilter filter = (rw == viewportWidth && rh == viewportHeight) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
     // Byte-exact onto an sRGB swapchain too (no second encode) — see
     // gsCmdBlitToSwapchain in gs_vulkan_utils.h.
-    gsCmdBlitToSwapchain(cmd, renderImage_[slot].image, rw, rh, swapchainImage, swapchainFormat,
+    gsCmdBlitToSwapchain(cmd, renderImage_[set].image, rw, rh, swapchainImage, swapchainFormat,
         (int32_t)viewportX, (int32_t)viewportY, viewportWidth, viewportHeight, filter,
-        swapScratch_[slot]);
+        swapScratch_[set]);
 
     sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -1214,7 +1252,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     // nothing here synchronises.
     if (compactDraw && view == 0) {
         VkBufferCopy bc = {0, 0, 16};
-        vkCmdCopyBuffer(cmd, drawCmdBuffer_[slot].buffer, drawCmdHost_[slot].buffer, 1, &bc);
+        vkCmdCopyBuffer(cmd, drawCmdBuffer_[set].buffer, drawCmdHost_[set].buffer, 1, &bc);
     }
 
     // ── One-shot DXR_GS_DUMP: copy the (pre-blit, pre-upscale) render target
@@ -1239,7 +1277,7 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
             VkBufferImageCopy r = {};
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             r.imageExtent = {rw, rh, 1};
-            vkCmdCopyImageToBuffer(cmd, renderImage_[slot].image,
+            vkCmdCopyImageToBuffer(cmd, renderImage_[set].image,
                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    dumpHost_.buffer, 1, &r);
             dumpW_ = rw; dumpH_ = rh;
@@ -1248,6 +1286,20 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
 
 
     if (dumpNow && dumpHost_.buffer != VK_NULL_HANDLE) dumpPending_ = true;
+
+    // Submit this view NOW, unwaited and fenceless, so the GPU starts on it
+    // while the CPU records the next view (the slot fence submitted by
+    // endFrame() covers it by queue order). See the header for why this is
+    // N+1 submits per frame and not one.
+    vkEndCommandBuffer(cmd);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    const VkResult sr = vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    if (sr != VK_SUCCESS && !warnedSubmit_) {
+        warnedSubmit_ = true;
+        GS_LOGE("GsAdreno: view submit failed (VkResult %d)", (int)sr);
+    }
     frameCounter_++;
     if (autoFrame) endFrame();
 }
@@ -1351,7 +1403,7 @@ void GsAdrenoRenderer::cleanupScene() {
     auto ds = [&](VkDescriptorSetLayout& l){ if (l) { vkDestroyDescriptorSetLayout(device_, l, nullptr); l = VK_NULL_HANDLE; } };
 
     dp(pipeCov3d_); dp(pipePreprocess_); dp(pipeKeys_); dp(pipeHist_); dp(pipeSort_); dp(pipeSplat_);
-    for (uint32_t s = 0; s < kMaxRing; s++) {
+    for (uint32_t s = 0; s < kMaxSets; s++) {
         if (framebuffer_[s]) { vkDestroyFramebuffer(device_, framebuffer_[s], nullptr); framebuffer_[s] = VK_NULL_HANDLE; }
     }
     if (renderPass_) { vkDestroyRenderPass(device_, renderPass_, nullptr); renderPass_ = VK_NULL_HANDLE; }
@@ -1360,7 +1412,7 @@ void GsAdrenoRenderer::cleanupScene() {
     // Destroying the pool frees all sets it owns; just clear the handles.
     if (descriptorPool_) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     dsCov3d_ = dsPreprocessSet0_ = VK_NULL_HANDLE;
-    for (uint32_t s = 0; s < kMaxRing; s++) {
+    for (uint32_t s = 0; s < kMaxSets; s++) {
         dsPreprocessSet1_[s] = dsKeys_[s] = VK_NULL_HANDLE;
         dsHistEven_[s] = dsHistOdd_[s] = dsSortEvenToOdd_[s] = dsSortOddToEven_[s] = dsSplat_[s] = VK_NULL_HANDLE;
     }
@@ -1372,7 +1424,7 @@ void GsAdrenoRenderer::cleanupScene() {
     coverageW_ = coverageH_ = 0;
     gsDestroyBuffer(device_, dumpHost_);
     dumpW_ = dumpH_ = 0;
-    for (uint32_t s = 0; s < kMaxRing; s++) {
+    for (uint32_t s = 0; s < kMaxSets; s++) {
         gsDestroyImage(device_, renderImage_[s]);
         gsDestroyImage(device_, swapScratch_[s]);
         gsDestroyBuffer(device_, attrBuffer_[s]);
@@ -1394,7 +1446,10 @@ void GsAdrenoRenderer::cleanup() {
     if (device_ == VK_NULL_HANDLE) return;
     cleanupScene();          // ends + waits the ring
     ring_.destroy();         // waitAll + frees cmd buffers, fences, UBO
+    if (viewCmdPool_) { vkDestroyCommandPool(device_, viewCmdPool_, nullptr); viewCmdPool_ = VK_NULL_HANDLE; }
+    for (auto& row : viewCmd_) for (auto& c : row) c = VK_NULL_HANDLE;
     ringN_ = 0;
+    numSets_ = 0;
     for (uint32_t i = 0; i < kMaxRing; i++) {
         if (tsPool_[i]) { vkDestroyQueryPool(device_, tsPool_[i], nullptr); tsPool_[i] = VK_NULL_HANDLE; }
     }

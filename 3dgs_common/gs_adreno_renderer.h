@@ -121,23 +121,29 @@ struct GsAdrenoRenderer {
     void setCursorRayCast(bool on) { cursorRayCast_ = on; }
     const GsSplatRayCaster& rayCaster() const { return rayCaster_; }
 
-    // ── Per-FRAME submission (INV-4.10, runtime#1917) ──
+    // ── Frame bracket (INV-4.10, runtime#1917) ──
     //
-    // Bracket every view of one OpenXR frame with beginFrame()/endFrame():
-    // all of them are recorded into ONE command buffer of a 3-deep frame ring
-    // (dxr::VkFrameRing) and submitted with ONE vkQueueSubmit, never waited.
-    // The only CPU wait on the frame path is beginFrame() waiting the slot of
-    // the frame three frames ago — normally long retired. Call endFrame()
-    // BEFORE xrReleaseSwapchainImage: the runtime composes on the same
-    // VkQueue, so the app's work must be queued ahead of it.
+    // Bracket every view of one OpenXR frame with beginFrame()/endFrame().
+    // Nothing on this path ever blocks on recent GPU work: beginFrame() waits
+    // only the fence of the frame that used the same ring slot N frames ago
+    // (normally long signaled), command buffers are allocated once, and each
+    // view owns its own sort buffers / render target / blit scratch within
+    // the slot, so views never wait on each other.
     //
-    // Why it matters: on Adreno the GPU governor reads busy %; a loop that
-    // submits per view and waits a recent fence looks half-idle and gets
-    // parked at ~1/3 clock (displayxr-demo-modelviewer#170: 13 -> 30 fps).
+    // Each view is SUBMITTED AS SOON AS IT IS RECORDED (no fence, no wait),
+    // and endFrame() makes one more, empty submit carrying the slot fence —
+    // so this is N+1 unwaited submits per frame, a deliberate exemption from
+    // INV-4.10's "one submit per frame". Measured on Adreno (PR #141 review):
+    // batching both views into ONE frame-end submit with a full barrier
+    // between them cost 14 % (phone) / 47 % (tablet) fps — the GPU sat idle
+    // while the CPU recorded the whole frame, then ran view 1's sort strictly
+    // after view 0's draw, and the governor clocked down on the bubbles. The
+    // invariant's point is never blocking, which this keeps.
     //
+    // Call endFrame() BEFORE xrReleaseSwapchainImage: the runtime composes on
+    // the same VkQueue, so the app's work must be queued ahead of it.
     // renderEye() outside a bracket still works (it opens and closes a frame
-    // of its own — one submit per view, the pre-ring behaviour), so a caller
-    // that has not been converted keeps rendering correctly.
+    // of its own), so an unconverted caller keeps rendering correctly.
     bool beginFrame();
     void endFrame();
 
@@ -247,25 +253,31 @@ private:
     uint32_t dumpW_ = 0, dumpH_ = 0;
 
     // ── Frame ring (dxr::VkFrameRing, displayxr-common) ──
-    // One slot per FRAME in flight (default 3; DXR_VK_FRAMES_IN_FLIGHT /
-    // debug.dxr.gs.fif = 1..8 for A/B — 1 reproduces submit-then-wait). Each
-    // slot owns one command buffer + fence (allocated once), a private copy of
-    // every per-frame buffer below, and a UBO slice per view. Every view of a
-    // frame records into the slot's ONE command buffer, separated by a full
-    // tileBarrier() because consecutive views reuse the slot's sort buffers,
-    // render target and blit scratch. The previous design was a 3-slot ring
-    // per VIEW with one submit each: with 2 views per frame the slot it waited
-    // on was the previous frame's, so frames were effectively serialised.
+    // One slot per FRAME in flight (default 2 here; DXR_VK_FRAMES_IN_FLIGHT /
+    // debug.dxr.gs.fif = 1..8 for A/B). The ring owns the slot fence, the
+    // per-view UBO slices and the one-off submitImmediate() path. Per slot,
+    // the renderer adds one command buffer per view (allocated once) and
+    // kViewSets private buffer sets — the old per-view ring's shape (views
+    // independent on the GPU, submitted as recorded) without its CPU waits.
+    // Buffer set index = slot * kViewSets + (view % kViewSets); a view beyond
+    // kViewSets shares a set with an earlier view of the same frame and is
+    // ordered after it by a barrier at the top of its command buffer.
     static constexpr uint32_t kMaxRing = dxr::detail::kMaxFramesInFlight;
-    static constexpr uint32_t kMaxViewsPerFrame = 16;
+    static constexpr uint32_t kViewSets = 2;            // every Android panel; desktop SBS
+    static constexpr uint32_t kMaxSets = kMaxRing * kViewSets;
+    static constexpr uint32_t kMaxViewsPerFrame = 8;
+    static constexpr uint32_t kDefaultFramesInFlight = 2;  // 2 x 2 sets ~= the old 3
     dxr::VkFrameRing ring_;
     uint32_t ringN_ = 0;          // slots actually allocated (ring_.framesInFlight())
+    uint32_t numSets_ = 0;        // ringN_ * kViewSets buffer sets per scene
+    VkCommandPool viewCmdPool_ = VK_NULL_HANDLE;
+    VkCommandBuffer viewCmd_[kMaxRing][kMaxViewsPerFrame] = {};  // allocated once in init()
     uint32_t viewInFrame_ = 0;    // views recorded into the open frame
-    VkImage frameLastImage_ = VK_NULL_HANDLE;  // swapchain image the previous view wrote
     uint64_t frameIndex_ = 0;     // frames begun
-    bool dumpPending_ = false;    // DXR_GS_DUMP copy recorded into the open frame
+    bool dumpPending_ = false;    // DXR_GS_DUMP copy submitted in the open frame
     bool warnedViewOverflow_ = false;
     bool warnedSubmit_ = false;
+    VkImage frameLastImage_ = VK_NULL_HANDLE;  // swapchain image the previous view wrote
 
     // ── GPU timestamp profiling (per-stage, logged every kTsLogPeriod eyes) ──
     static constexpr uint32_t kNumTimestamps = 6;  // top,preproc,keygen,radix,draw,blit
@@ -285,19 +297,19 @@ private:
     // is safe; no frame ever writes them).
     GsBuffer vertexBuffer_;     // N × 240
     GsBuffer cov3dBuffer_;      // N × 24
-    // Per-frame mutated → one instance PER RING SLOT. Up to ringN_ frames are
-    // GPU-in-flight at once, so any buffer written each frame must be private
-    // to its slot — otherwise frame N+1's preprocess/keygen/sort clobbers data
-    // frame N is still reading for its draw (cross-frame WAR/RAW). Within a
-    // frame the views share the slot's copy, ordered by a tileBarrier().
+    // Per-frame mutated → one instance PER BUFFER SET (slot x view, above).
+    // Up to ringN_ frames are GPU-in-flight at once and a frame's views run
+    // concurrently, so any buffer written each frame must be private to its
+    // set — otherwise a later preprocess/keygen/sort clobbers data an earlier
+    // draw is still reading (WAR/RAW).
     // The per-view uniforms live in ring_'s UBO (slot x view slices, bound
     // with a dynamic offset).
-    GsBuffer attrBuffer_[kMaxRing];       // N × 64 (VertexAttribute)
-    GsBuffer keysEvenBuffer_[kMaxRing];   // N × 4
-    GsBuffer keysOddBuffer_[kMaxRing];    // N × 4
-    GsBuffer valsEvenBuffer_[kMaxRing];   // N × 4 (gaussian indices)
-    GsBuffer valsOddBuffer_[kMaxRing];    // N × 4
-    GsBuffer histBuffer_[kMaxRing];       // numSortWorkgroups_ × 256 × 4
+    GsBuffer attrBuffer_[kMaxSets];       // N × 64 (VertexAttribute)
+    GsBuffer keysEvenBuffer_[kMaxSets];   // N × 4
+    GsBuffer keysOddBuffer_[kMaxSets];    // N × 4
+    GsBuffer valsEvenBuffer_[kMaxSets];   // N × 4 (gaussian indices)
+    GsBuffer valsOddBuffer_[kMaxSets];    // N × 4
+    GsBuffer histBuffer_[kMaxSets];       // numSortWorkgroups_ × 256 × 4
 
     // ── Compacted indirect draw (DXR_GS_COMPACT) ──
     // splat_keys.comp atomically counts the gaussians that survived preprocess
@@ -306,13 +318,13 @@ private:
     // exactly the prefix [0, instanceCount) of the sorted payload — so a
     // culled gaussian costs no vertex shader at all, instead of a 64-byte
     // random gather into attr[] followed by a degenerate quad.
-    GsBuffer drawCmdBuffer_[kMaxRing];    // 16 B, STORAGE | INDIRECT
-    GsBuffer drawCmdHost_[kMaxRing];      // 16 B host-visible, for the GS_TS line
+    GsBuffer drawCmdBuffer_[kMaxSets];    // 16 B, STORAGE | INDIRECT
+    GsBuffer drawCmdHost_[kMaxSets];      // 16 B host-visible, for the GS_TS line
     uint32_t lastDrawnInstances_ = 0;
 
     // ── Internal scaled render target (per slot: draw target + blit source) ──
-    GsImage renderImage_[kMaxRing];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
-    GsImage swapScratch_[kMaxRing];       // UNORM sibling of an sRGB swapchain (gsCmdBlitToSwapchain); empty otherwise
+    GsImage renderImage_[kMaxSets];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
+    GsImage swapScratch_[kMaxSets];       // UNORM sibling of an sRGB swapchain (gsCmdBlitToSwapchain); empty otherwise
 
     // ── Pre-cull silhouette coverage (#112) ──
     // Single image, NOT per slot: the readback drains the queue before it
@@ -335,7 +347,7 @@ private:
     // ── Graphics pipeline (instanced splat quads) ──
     VkPipeline pipeSplat_ = VK_NULL_HANDLE;
     VkRenderPass renderPass_ = VK_NULL_HANDLE;            // format-compatible with every slot's framebuffer
-    VkFramebuffer framebuffer_[kMaxRing] = {};          // wraps renderImage_[slot].view
+    VkFramebuffer framebuffer_[kMaxSets] = {};          // wraps renderImage_[slot].view
 
     VkPipelineLayout layoutCov3d_ = VK_NULL_HANDLE;
     VkPipelineLayout layoutPreprocess_ = VK_NULL_HANDLE;
@@ -357,13 +369,13 @@ private:
     VkDescriptorSet dsCov3d_ = VK_NULL_HANDLE;
     VkDescriptorSet dsPreprocessSet0_ = VK_NULL_HANDLE;
     // Per-slot sets reference per-slot (uniform/attr/keys/vals/hist) buffers.
-    VkDescriptorSet dsPreprocessSet1_[kMaxRing] = {};
-    VkDescriptorSet dsKeys_[kMaxRing] = {};
-    VkDescriptorSet dsHistEven_[kMaxRing] = {};   // keysEven→hist
-    VkDescriptorSet dsHistOdd_[kMaxRing] = {};    // keysOdd→hist
-    VkDescriptorSet dsSortEvenToOdd_[kMaxRing] = {};
-    VkDescriptorSet dsSortOddToEven_[kMaxRing] = {};
-    VkDescriptorSet dsSplat_[kMaxRing] = {};
+    VkDescriptorSet dsPreprocessSet1_[kMaxSets] = {};
+    VkDescriptorSet dsKeys_[kMaxSets] = {};
+    VkDescriptorSet dsHistEven_[kMaxSets] = {};   // keysEven→hist
+    VkDescriptorSet dsHistOdd_[kMaxSets] = {};    // keysOdd→hist
+    VkDescriptorSet dsSortEvenToOdd_[kMaxSets] = {};
+    VkDescriptorSet dsSortOddToEven_[kMaxSets] = {};
+    VkDescriptorSet dsSplat_[kMaxSets] = {};
 
     // ── CPU-side scene data (auto-framing + depth-quant range) ──
     std::vector<float> posX_, posY_, posZ_;  // gaussian centers
