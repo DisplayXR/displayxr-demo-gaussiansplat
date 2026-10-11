@@ -315,7 +315,7 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, uint32_t queueFami
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);  // dxr-lint: allow-blocking-submit no-scene placeholder only
     vkQueueWaitIdle(queue);
     vkFreeCommandBuffers(device, g_placeholderPool, 1, &cmd);
 }
@@ -2384,6 +2384,13 @@ int main(int argc, char** argv) {
                     const bool hasContentMaskV3 = xr.hasDepthBudgetExt && xr.depthBudgetExtVersion >= 3;
                     g_gsRenderer.setSilhouetteCoverage(hasContentMaskV3 && g_transparentBg && xr.hasAppWindow);
 
+                    // INV-4.10: every view into ONE command buffer, ONE submit,
+                    // never waited (GsAdrenoRenderer's per-frame ring; a no-op
+                    // bracket on the COMPUTE renderer). endFrame() runs right
+                    // after the loop — before the click-through readback, the
+                    // silhouette readback and the swapchain release.
+                    const bool frameBracket = g_gsRenderer.hasScene();
+                    if (frameBracket) g_gsRenderer.beginFrame();
                     for (int eye = 0; eye < eyeCount; eye++) {
                         int srcView = eye < (int)runtimeViewCount ? eye : 0;
                         float viewMat[16], projMat[16];
@@ -2489,6 +2496,7 @@ int main(int argc, char** argv) {
                                               targetImage, swapFormat);
                         }
                     }
+                    if (frameBracket) g_gsRenderer.endFrame();
                     DxrAliasInactiveViews(projectionViews.data(), views, runtimeViewCount, (uint32_t)eyeCount);
 
                     // #833 click-through (windows/main.cpp's g_punch): while

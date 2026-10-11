@@ -1941,7 +1941,7 @@ static void RenderPlaceholder(VkDevice device, VkQueue queue, VkCommandPool cmdP
     VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);  // dxr-lint: allow-blocking-submit no-scene placeholder only
     vkQueueWaitIdle(queue);
 
     vkFreeCommandBuffers(device, cmdPool, 1, &cmd);
@@ -3047,6 +3047,12 @@ static void RenderThreadFunc(
                                 hasContentMaskV3 && g_transparentBg.load() && g_borderless.load());
 
                             if (hasGsScene) {
+                                // INV-4.10: every view into ONE command buffer,
+                                // ONE submit, never waited — GsAdrenoRenderer's
+                                // per-frame ring on Windows-on-ARM; a no-op
+                                // bracket on the x64 compute renderer.
+                                // endFrame() precedes the swapchain release.
+                                g_gsRenderer.beginFrame();
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Row-major eye placement in the atlas; for 2×1 SBS
                                     // this is (0, renderW) at row 0; for mono (cols=1)
@@ -3062,6 +3068,7 @@ static void RenderThreadFunc(
                                         viewMat[eye], projMat[eye],
                                         g_transparentBg.load(), clipNear[eye], clipFar[eye], clipFadeFrac);
                                 }
+                                g_gsRenderer.endFrame();
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, renderCmdPool,
                                     (*swapchainVkImages)[imageIndex], colorFormat,

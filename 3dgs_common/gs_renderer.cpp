@@ -763,7 +763,7 @@ void GsRenderer::dispatchPrecompCov3d()
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1;
     si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);
+    vkQueueSubmit(queue_, 1, &si, VK_NULL_HANDLE);  // dxr-lint: allow-blocking-submit scene load, once per loadScene()
     vkQueueWaitIdle(queue_);
     vkFreeCommandBuffers(device_, cmdPool_, 1, &cmd);
 

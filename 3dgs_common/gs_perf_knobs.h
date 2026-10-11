@@ -68,6 +68,10 @@ struct Knobs {
     float maxRadiusFrac = 0.0f;     //!< DXR_GS_MAX_RADIUS_FRAC (lossy, default off)
     char dumpPath[512] = {0};       //!< DXR_GS_DUMP=<file.png>, empty = no dump
     unsigned long long dumpFrame = 240;  //!< DXR_GS_DUMP_FRAME (eye counter)
+    //! DXR_VK_FRAMES_IN_FLIGHT / debug.dxr.gs.fif — frames in flight of the
+    //! graphics renderer's frame ring, 1..8; 0 = the ring's default (3). 1
+    //! reproduces submit-then-wait, for A/B on the Adreno governor (#1917).
+    unsigned framesInFlight = 0;
 };
 
 //! Resolve every knob. `defaultRenderScale`/`defaultKeepFrac` are the platform
