@@ -1654,11 +1654,18 @@ render_frame()
 			}
 			auto pf_r0 = pf_now();
 			pf_setup = pf_ms(pf_t1, pf_r0);  // xrBeginFrame + xrLocateViews (IPC for view_rig)
+			// INV-4.10 / runtime#1917: acquire every view's image first, then
+			// record ALL views into ONE command buffer of the renderer's frame
+			// ring (one vkQueueSubmit per frame, never waited), submit, and only
+			// then release. The old shape — acquire/render/submit/release per
+			// view, each submit waiting a ring slot from a view or two ago —
+			// serialised frames and let the Adreno governor park the GPU.
+			uint32_t img_idx[kViewCount] = {};
+			uint32_t acquired = 0;  // views whose image is acquired AND waited
 			for (uint32_t i = 0; i < kViewCount; ++i) {
 				XrSwapchainImageAcquireInfo acq = {};
 				acq.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
-				uint32_t img_idx = 0;
-				res = xrAcquireSwapchainImage(g_views[i].swapchain, &acq, &img_idx);
+				res = xrAcquireSwapchainImage(g_views[i].swapchain, &acq, &img_idx[i]);
 				if (res != XR_SUCCESS) {
 					log_xr_result("xrAcquireSwapchainImage", res);
 					break;
@@ -1671,71 +1678,81 @@ render_frame()
 					log_xr_result("xrWaitSwapchainImage", res);
 					break;
 				}
-
-				// W7 clip policy: near = ez - vH, far = ez + 1000·vH (opaque),
-				// where ez = rig-local eye Z. The splat shader culls
-				// geometrically on p_view.z (it ignores ndc.z), so these flow
-				// into renderEye's explicit view-space culls.
-				float near_z, far_z;
-				XrFovf fov = views[i].fov;
-				if (cam_rig) {
-					// Tangent-space window shift for the asset's own principal
-					// point, minus the cancelled rest frustum centre.
-					if (cam_shift_u != 0.0f) {
-						fov.angleLeft = std::atan(std::tan(fov.angleLeft) + cam_shift_u);
-						fov.angleRight = std::atan(std::tan(fov.angleRight) + cam_shift_u);
+				acquired++;
+			}
+			if (res == XR_SUCCESS) {
+				g_gs.beginFrame();
+				for (uint32_t i = 0; i < kViewCount; ++i) {
+					// W7 clip policy: near = ez - vH, far = ez + 1000·vH (opaque),
+					// where ez = rig-local eye Z. The splat shader culls
+					// geometrically on p_view.z (it ignores ndc.z), so these flow
+					// into renderEye's explicit view-space culls.
+					float near_z, far_z;
+					XrFovf fov = views[i].fov;
+					if (cam_rig) {
+						// Tangent-space window shift for the asset's own principal
+						// point, minus the cancelled rest frustum centre.
+						if (cam_shift_u != 0.0f) {
+							fov.angleLeft = std::atan(std::tan(fov.angleLeft) + cam_shift_u);
+							fov.angleRight = std::atan(std::tan(fov.angleRight) + cam_shift_u);
+						}
+						if (cam_shift_v != 0.0f) {
+							fov.angleUp = std::atan(std::tan(fov.angleUp) + cam_shift_v);
+							fov.angleDown = std::atan(std::tan(fov.angleDown) + cam_shift_v);
+						}
+						// Scene-absolute planes, not vH-relative: on this rig there
+						// is no virtual display to anchor them to. FAR is
+						// deliberately far past any content (a deconverged lift puts
+						// the sky at the depth worker's cap) and a splat rasteriser
+						// sorts rather than depth-tests, so the huge near:far ratio
+						// costs no precision. This arm never renders transparent, so
+						// there is no ZDP-clipped variant to choose.
+						near_z = kGsCameraRigNearM;
+						far_z = kGsCameraRigFarM;
+					} else {
+						const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
+						near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
+						far_z = ez + 1000.0f * rig_vh;
 					}
-					if (cam_shift_v != 0.0f) {
-						fov.angleUp = std::atan(std::tan(fov.angleUp) + cam_shift_v);
-						fov.angleDown = std::atan(std::tan(fov.angleDown) + cam_shift_v);
+					if (far_z < near_z + 1.0e-4f) {
+						far_z = near_z + 1.0e-4f;
 					}
-					// Scene-absolute planes, not vH-relative: on this rig there
-					// is no virtual display to anchor them to. FAR is
-					// deliberately far past any content (a deconverged lift puts
-					// the sky at the depth worker's cap) and a splat rasteriser
-					// sorts rather than depth-tests, so the huge near:far ratio
-					// costs no precision. This arm never renders transparent, so
-					// there is no ZDP-clipped variant to choose.
-					near_z = kGsCameraRigNearM;
-					far_z = kGsCameraRigFarM;
-				} else {
-					const float ez = rig_local_eye_z(rig_pose, views[i].pose.position);
-					near_z = (ez - rig_vh > 1.0e-4f) ? (ez - rig_vh) : 1.0e-4f;
-					far_z = ez + 1000.0f * rig_vh;
-				}
-				if (far_z < near_z + 1.0e-4f) {
-					far_z = near_z + 1.0e-4f;
-				}
-				Mat4 viewM = view_matrix_from_pose(views[i].pose);
-				Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
-				Mat4 projM = mat4_from_xr_fov(fov, near_z, far_z);
-				g_gs.renderEye(
-				    g_views[i].images[img_idx].image, g_swapchain_format,
-				    g_views[i].width, g_views[i].height,
-				    0, 0, g_views[i].width, g_views[i].height,
-				    evM.m, projM.m,
-				    /*transparentBg=*/false, near_z, far_z,
-				    /*clipFadeFrac=*/0.15f);
+					Mat4 viewM = view_matrix_from_pose(views[i].pose);
+					Mat4 evM = mat4_mul(viewM, splat_model);  // apply splat model
+					Mat4 projM = mat4_from_xr_fov(fov, near_z, far_z);
+					g_gs.renderEye(
+					    g_views[i].images[img_idx[i]].image, g_swapchain_format,
+					    g_views[i].width, g_views[i].height,
+					    0, 0, g_views[i].width, g_views[i].height,
+					    evM.m, projM.m,
+					    /*transparentBg=*/false, near_z, far_z,
+					    /*clipFadeFrac=*/0.15f);
 
+					projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+					projection_views[i].pose = views[i].pose;
+					// `fov` is the located one everywhere except the camera rig,
+					// where it also carries the principal-point shift — submit what
+					// was actually projected with.
+					projection_views[i].fov = fov;
+					projection_views[i].subImage.swapchain = g_views[i].swapchain;
+					projection_views[i].subImage.imageRect.offset = {0, 0};
+					projection_views[i].subImage.imageRect.extent = {
+					    (int32_t)g_views[i].width, (int32_t)g_views[i].height};
+					projection_views[i].subImage.imageArrayIndex = 0;
+				}
+				// ONE submit for every view — BEFORE any release: the runtime
+				// composes on the same VkQueue, so this work must be queued
+				// ahead of it.
+				g_gs.endFrame();
+			}
+			for (uint32_t i = 0; i < acquired; ++i) {
 				XrSwapchainImageReleaseInfo rel = {};
 				rel.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-				res = xrReleaseSwapchainImage(g_views[i].swapchain, &rel);
-				if (res != XR_SUCCESS) {
-					log_xr_result("xrReleaseSwapchainImage", res);
-					break;
+				const XrResult rr = xrReleaseSwapchainImage(g_views[i].swapchain, &rel);
+				if (rr != XR_SUCCESS) {
+					log_xr_result("xrReleaseSwapchainImage", rr);
+					if (res == XR_SUCCESS) res = rr;
 				}
-
-				projection_views[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
-				projection_views[i].pose = views[i].pose;
-				// `fov` is the located one everywhere except the camera rig,
-				// where it also carries the principal-point shift — submit what
-				// was actually projected with.
-				projection_views[i].fov = fov;
-				projection_views[i].subImage.swapchain = g_views[i].swapchain;
-				projection_views[i].subImage.imageRect.offset = {0, 0};
-				projection_views[i].subImage.imageRect.extent = {
-				    (int32_t)g_views[i].width, (int32_t)g_views[i].height};
-				projection_views[i].subImage.imageArrayIndex = 0;
 			}
 			rendered = (res == XR_SUCCESS);
 			pf_render = pf_ms(pf_r0, pf_now());

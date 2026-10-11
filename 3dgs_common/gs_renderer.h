@@ -159,6 +159,16 @@ struct GsRenderer {
     // [clipNearViewSpace, clipNearViewSpace*(1+frac)] instead of a hard discard,
     // removing the pop as a splat center crosses the near plane. 0=hard near cut.
     // The FAR cut is always hard (no fade) regardless of clipFadeFrac.
+    // Frame bracket, API-compatible with GsAdrenoRenderer's per-frame ring so
+    // the desktop legs can bracket their views the same way whichever renderer
+    // gs_renderer_select.h picked. No-ops here: this compute compositor reads
+    // the prefix-sum total back mid-eye to size its sort, so it cannot batch a
+    // frame into one submit without moving that sizing onto the GPU
+    // (indirect dispatch) — a separate change. It is the desktop-x64 default;
+    // Adreno / Apple Silicon / Windows-on-ARM / Linux use GsAdrenoRenderer.
+    bool beginFrame() { return true; }
+    void endFrame() {}
+
     void renderEye(VkImage swapchainImage,
                    VkFormat swapchainFormat,
                    uint32_t imageWidth,

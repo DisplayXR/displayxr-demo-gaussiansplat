@@ -575,6 +575,7 @@ change the image are off until you ask for them.
 | `DXR_GS_COMPACT` | `0` (off) | no | Draw only the gaussians that survived preprocess, via `vkCmdDrawIndirect` (graphics path only; the compute path already compacts through its prefix sum). Lossless, but measured *slower* on macOS/MoltenVK and it removes almost nothing at a rest pose. |
 | `DXR_GS_DUMP` | unset | no | Write the internal render target (pre-blit, pre-upscale) to this path as a PNG, once, then stop. For diffing two runs. |
 | `DXR_GS_DUMP_FRAME` | `240` | no | Which eye `DXR_GS_DUMP` fires on. |
+| `DXR_VK_FRAMES_IN_FLIGHT` | `2` | no | Frames in flight of the graphics renderer's frame ring (`dxr::VkFrameRing`, `1`..`8`; Android property `debug.dxr.gs.fif`). Each slot holds one private buffer set per view; every view is submitted as soon as it is recorded and nothing on the frame path waits on recent GPU work. `1` waits each frame's fence before the next frame starts. A/B only. |
 
 **Which lever actually moves a big scene.** Measured on a 1.18 M-gaussian
 photo-lifted capture (macOS/MoltenVK, pinned pose, one eye): the splat draw is

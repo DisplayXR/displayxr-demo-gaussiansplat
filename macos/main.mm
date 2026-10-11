@@ -2140,7 +2140,7 @@ static void RenderPlaceholder(VkDevice dev, VkQueue queue, VkCommandPool pool,
     vkEndCommandBuffer(cmd);
     VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount = 1; si.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+    vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);  // dxr-lint: allow-blocking-submit no-scene placeholder only
     vkQueueWaitIdle(queue);
     vkFreeCommandBuffers(dev, pool, 1, &cmd);
 }
@@ -3597,6 +3597,11 @@ int main(int argc, char** argv) {
                             VkFormat swapFormat = (VkFormat)xr.swapchain.format;
 
                             if (g_gsRenderer.hasScene()) {
+                                // INV-4.10: every view into ONE command buffer,
+                                // ONE submit, never waited (GsAdrenoRenderer's
+                                // per-frame ring) — endFrame() before the
+                                // swapchain release below.
+                                g_gsRenderer.beginFrame();
                                 for (int eye = 0; eye < eyeCount; eye++) {
                                     // Geometric near/far culls come from the resolved
                                     // per-eye view-space planes (this splat rasterizer
@@ -3616,6 +3621,7 @@ int main(int argc, char** argv) {
                                         /*transparentBg=*/g_transparentBg,
                                         clipNear, clipFar, /*clipFadeFrac=*/0.15f);
                                 }
+                                g_gsRenderer.endFrame();
                             } else {
                                 RenderPlaceholder(vkDevice, graphicsQueue, cmdPool,
                                     targetImage, swapFormat,

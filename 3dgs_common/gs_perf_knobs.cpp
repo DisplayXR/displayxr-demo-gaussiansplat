@@ -130,6 +130,10 @@ Knobs load(float defaultRenderScale, float defaultKeepFrac)
     lookup("DXR_GS_DUMP", "debug.dxr.gs.dump", k.dumpPath, sizeof(k.dumpPath));
     const float df = getFloat("DXR_GS_DUMP_FRAME", "debug.dxr.gs.dumpframe", 240.0f);
     k.dumpFrame = (df >= 0.0f) ? (unsigned long long)df : 240ull;
+    // Same variable dxr::VkFrameRing reads itself on desktop; the property is
+    // what reaches it on Android, which has no usable process environment.
+    const float fif = getFloat("DXR_VK_FRAMES_IN_FLIGHT", "debug.dxr.gs.fif", 0.0f);
+    k.framesInFlight = (fif >= 1.0f && fif <= 8.0f) ? (unsigned)fif : 0u;
     return k;
 }
 
