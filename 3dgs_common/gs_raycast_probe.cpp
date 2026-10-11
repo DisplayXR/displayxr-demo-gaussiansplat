@@ -35,12 +35,18 @@
 namespace {
 
 //! This thread's CPU time, us: the cost of the ray cast itself, immune to the
-//! preemption a loaded build box adds to wall time.
+//! preemption a loaded build box adds to wall time. (Windows: wall time; the
+//! MSVC CRT has no per-thread CPU clock.)
 double ThreadCpuUs()
 {
+#if defined(_WIN32)
+    return std::chrono::duration<double, std::micro>(
+               std::chrono::steady_clock::now().time_since_epoch()).count();
+#else
     timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return (double)ts.tv_sec * 1e6 + (double)ts.tv_nsec * 1e-3;
+#endif
 }
 
 bool LoadScene(const std::string& path, std::vector<GsVertex>& verts, std::string& err)
