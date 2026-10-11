@@ -936,8 +936,13 @@ create_swapchains()
 
 		XrSwapchainCreateInfo ci = {};
 		ci.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+		// MUTABLE_FORMAT: the renderer writes the _SRGB image through an UNORM
+		// view (its present pass) instead of a scratch + vkCmdCopyImage, which
+		// on Adreno allocated and zeroed GPU memory inside the driver every
+		// frame (#143). Paired with g_gs.setSwapchainMutableFormat(true).
 		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+		                XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
 		ci.format = g_swapchain_format;
 		ci.sampleCount = view_configs[i].recommendedSwapchainSampleCount;
 		ci.width = g_views[i].width;
@@ -998,6 +1003,8 @@ gs_init()
 		LOGE("GsAdrenoRenderer::init failed");
 		return false;
 	}
+	// create_swapchains() asked for XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT (#143).
+	g_gs.setSwapchainMutableFormat(true);
 	// The Adreno/TBDR-native renderer self-tunes: it reads debug.dxr.gs.scale /
 	// .keep / .minalpha internally in init() (PR #44), so the old compute-era
 	// setRenderScale / setKeepFraction / setCullMinOpacity calls are gone — those

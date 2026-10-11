@@ -1985,7 +1985,10 @@ static bool CreateSwapchains(AppXrSession& xr) {
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    // MUTABLE_FORMAT: lets the graphics renderer write the _SRGB image through
+    // an UNORM view (its present pass, #143) rather than a scratch + copy.
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                     XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
     sci.format = selectedFmt;
     sci.sampleCount = 1;
     sci.width = w; sci.height = h;
@@ -2737,6 +2740,8 @@ int main(int argc, char** argv) {
       // Depth-aware cursor: every load from here on also builds the splat ray
       // cast (on a worker). Off when the extension is absent / opted out.
       g_gsRenderer.setCursorRayCast(xr.cursorDepthSpecVersion > 0);
+      // The swapchain was created with XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT (#143).
+      g_gsRenderer.setSwapchainMutableFormat(true);
     }
 
     // Command pool for placeholder rendering

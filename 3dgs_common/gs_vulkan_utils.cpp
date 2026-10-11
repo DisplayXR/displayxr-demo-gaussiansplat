@@ -202,7 +202,7 @@ int64_t gsChooseSwapchainFormat(const int64_t* formats, uint32_t count)
     return formats[0];
 }
 
-static VkFormat gsUnormSiblingOf(VkFormat format)
+VkFormat gsUnormSiblingOf(VkFormat format)
 {
     switch (format) {
     case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;

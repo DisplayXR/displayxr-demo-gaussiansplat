@@ -72,6 +72,13 @@ struct Knobs {
     //! graphics renderer's frame ring, 1..8; 0 = the renderer's default (2).
     //! For A/B on the Adreno governor (#1917).
     unsigned framesInFlight = 0;
+    //! DXR_GS_PRESENT_PASS / debug.dxr.gs.present_pass — graphics renderer
+    //! only. true (default): move the splat render target onto the swapchain
+    //! with one fullscreen draw into an UNORM view of the swapchain image.
+    //! false: the historical blit + UNORM scratch + vkCmdCopyImage, which on
+    //! Adreno allocates and zeroes GPU memory inside the driver every frame
+    //! (#143). Lossless either way (bit-identical at render scale 1).
+    bool presentPass = true;
 };
 
 //! Resolve every knob. `defaultRenderScale`/`defaultKeepFrac` are the platform

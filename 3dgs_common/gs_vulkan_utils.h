@@ -70,6 +70,10 @@ GsImage gsCreateImage2D(VkDevice device,
 // Is `format` an 8-bit *_SRGB colour format?
 bool gsIsSrgbFormat(VkFormat format);
 
+// The 8-bit UNORM format with the same layout as an *_SRGB one; `format`
+// itself for anything else.
+VkFormat gsUnormSiblingOf(VkFormat format);
+
 // Pick the colour swapchain format from the runtime's xrEnumerateSwapchainFormats
 // list — the ONE choice every leg (macOS, Linux, Android) makes, so no leg can
 // drift from the rule again (INV-4.6).

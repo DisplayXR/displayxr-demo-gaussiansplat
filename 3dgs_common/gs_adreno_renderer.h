@@ -191,6 +191,16 @@ struct GsAdrenoRenderer {
     //! Linux leg turns it on because its session is transparent-capable and
     //! a PRE_MULTIPLIED surface shows alpha < 1 even in opaque mode.
     void setHonorTransparentBg(bool on) { honorTransparentBg_ = on; }
+
+    //! The caller created its swapchain with XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT,
+    //! so renderEye may write an *_SRGB swapchain image through an UNORM view
+    //! (the present pass, #143). Without it an sRGB swapchain falls back to the
+    //! blit + UNORM scratch + vkCmdCopyImage transfer, which is byte-exact but
+    //! on Adreno makes the driver allocate and zero GPU memory every frame —
+    //! that was most of the render thread's CPU time. A non-sRGB swapchain
+    //! needs no reinterpretation and always takes the present pass. Call it
+    //! before the first renderEye; DXR_GS_PRESENT_PASS=0 overrides it.
+    void setSwapchainMutableFormat(bool on) { swapchainMutable_ = on; }
     uint32_t silhouetteCoverageWidth() const { return coverageW_; }
     uint32_t silhouetteCoverageHeight() const { return coverageH_; }
 
@@ -324,7 +334,34 @@ private:
 
     // ── Internal scaled render target (per slot: draw target + blit source) ──
     GsImage renderImage_[kMaxSets];       // R8G8B8A8_UNORM, width_ × height_ (full; scaled region used)
-    GsImage swapScratch_[kMaxSets];       // UNORM sibling of an sRGB swapchain (gsCmdBlitToSwapchain); empty otherwise
+    GsImage swapScratch_[kMaxSets];       // UNORM sibling of an sRGB swapchain (legacy gsCmdBlitToSwapchain path only)
+
+    // ── Present pass (#143): renderImage_ -> UNORM view of the swapchain image ──
+    // One fullscreen-triangle draw per view instead of vkCmdBlitImage into a
+    // scratch + vkCmdCopyImage into the swapchain. The format-dependent objects
+    // (render passes, pipeline) are built on first use for the swapchain's
+    // UNORM sibling; the per-image views/framebuffers are cached by VkImage.
+    struct PresentTarget {
+        VkImage image = VK_NULL_HANDLE;
+        VkImageView view = VK_NULL_HANDLE;
+        VkFramebuffer fb = VK_NULL_HANDLE;
+        uint32_t w = 0, h = 0;
+        VkFormat format = VK_FORMAT_UNDEFINED;
+    };
+    static constexpr uint32_t kMaxPresentTargets = 24;  // swapchain images seen; 2 views x 3 images on Android
+    PresentTarget presentTargets_[kMaxPresentTargets];
+    uint32_t presentTargetCount_ = 0;
+    bool swapchainMutable_ = false;       // see setSwapchainMutableFormat
+    bool loggedPresentMode_ = false;
+    VkFormat presentFormat_ = VK_FORMAT_UNDEFINED;          // attachment format the objects below were built for
+    VkRenderPass presentRpDiscard_ = VK_NULL_HANDLE;        // first write to an image this frame: UNDEFINED + DONT_CARE
+    VkRenderPass presentRpLoad_ = VK_NULL_HANDLE;           // another tile of an image already written: LOAD
+    VkPipeline pipePresent_ = VK_NULL_HANDLE;
+    VkPipelineLayout layoutPresent_ = VK_NULL_HANDLE;
+    VkDescriptorSetLayout dslPresent_ = VK_NULL_HANDLE;     // binding 0: combined image sampler (renderImage_)
+    VkSampler presentSampler_ = VK_NULL_HANDLE;              // linear, clamp-to-edge
+    VkDescriptorPool presentPool_ = VK_NULL_HANDLE;          // per scene (renderImage_ is per scene)
+    VkDescriptorSet dsPresent_[kMaxSets] = {};
 
     // ── Pre-cull silhouette coverage (#112) ──
     // Single image, NOT per slot: the readback drains the queue before it
@@ -396,4 +433,10 @@ private:
                         uint32_t vpWidth, uint32_t vpHeight,
                         float clipNear, float clipFar, float clipFadeFrac);
     void cleanupScene();
+    // Present pass (#143).
+    bool usePresentPass(VkFormat swapchainFormat);
+    bool ensurePresentPipeline(VkFormat attachmentFormat);
+    const PresentTarget* presentTarget(VkImage image, uint32_t w, uint32_t h, VkFormat format);
+    void destroyPresentTargets();
+    void destroyPresentPipeline();
 };

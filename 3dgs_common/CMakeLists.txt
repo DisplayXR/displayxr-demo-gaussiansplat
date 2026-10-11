@@ -179,6 +179,10 @@ set(SHADER_SOURCES
     shaders/splat_keys.comp
     shaders/splat.vert
     shaders/splat.frag
+    # Present pass: splat render target -> UNORM view of the swapchain image
+    # (replaces blit + scratch + vkCmdCopyImage, gauss #143).
+    shaders/present.vert
+    shaders/present.frag
 )
 
 set(SHADER_HEADERS "")

@@ -576,6 +576,7 @@ change the image are off until you ask for them.
 | `DXR_GS_DUMP` | unset | no | Write the internal render target (pre-blit, pre-upscale) to this path as a PNG, once, then stop. For diffing two runs. |
 | `DXR_GS_DUMP_FRAME` | `240` | no | Which eye `DXR_GS_DUMP` fires on. |
 | `DXR_VK_FRAMES_IN_FLIGHT` | `2` | no | Frames in flight of the graphics renderer's frame ring (`dxr::VkFrameRing`, `1`..`8`; Android property `debug.dxr.gs.fif`). Each slot holds one private buffer set per view; every view is submitted as soon as it is recorded and nothing on the frame path waits on recent GPU work. `1` waits each frame's fence before the next frame starts. A/B only. |
+| `DXR_GS_PRESENT_PASS` | `1` | no | Graphics renderer only (Android property `debug.dxr.gs.present_pass`). `1`: move the splat render target onto the swapchain with one fullscreen draw into an UNORM view of the `_SRGB` swapchain image (the legs create it with `XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT`). `0`: the historical blit into an UNORM scratch + `vkCmdCopyImage`. Bit-identical at scale 1. On Adreno the copy made the driver allocate and zero GPU memory every frame, ~20 ms of render-thread CPU per frame on the NP02J (#143). A/B only. |
 
 **Which lever actually moves a big scene.** Measured on a 1.18 M-gaussian
 photo-lifted capture (macOS/MoltenVK, pinned pose, one eye): the splat draw is

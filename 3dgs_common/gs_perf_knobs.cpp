@@ -134,6 +134,9 @@ Knobs load(float defaultRenderScale, float defaultKeepFrac)
     // what reaches it on Android, which has no usable process environment.
     const float fif = getFloat("DXR_VK_FRAMES_IN_FLIGHT", "debug.dxr.gs.fif", 0.0f);
     k.framesInFlight = (fif >= 1.0f && fif <= 8.0f) ? (unsigned)fif : 0u;
+    // Kill switch for the graphics renderer's present pass (#143): 0 restores
+    // the blit + UNORM scratch + vkCmdCopyImage transfer onto the swapchain.
+    k.presentPass = getBool("DXR_GS_PRESENT_PASS", "debug.dxr.gs.present_pass", true);
     return k;
 }
 
