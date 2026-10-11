@@ -262,6 +262,9 @@ target_include_directories(gs_renderer PUBLIC
 target_link_libraries(gs_renderer PUBLIC
     Vulkan::Vulkan
     spz_lib
+    # Header-only displayxr-common rules: vk_frame_ring.h (dxr::VkFrameRing),
+    # which gs_adreno_renderer.h includes. Defined by common/ (added first).
+    displayxr::rules
 )
 
 # gs_spz_loader.cpp peels the gzip wrapper itself before handing the payload to

@@ -139,14 +139,16 @@ target_include_directories(native_app_glue PUBLIC
 
 find_package(OpenXR REQUIRED CONFIG)
 
-# displayxr-common's header-only view-configuration helper
-# (common/dxr_view_config.h: DxrSelectViewConfigType) — the SAME header the
-# desktop legs reach through displayxr::rules, so there is one implementation
-# (runtime#1612). Fetch sources only; don't run its CMake, which carries
-# desktop platform deps. Keep the pin identical to common/CMakeLists.txt.
+# displayxr-common's header-only rules — the view-configuration helper
+# (common/dxr_view_config.h: DxrSelectViewConfigType, runtime#1612) and the
+# Vulkan frame ring (common/vk_frame_ring.h: dxr::VkFrameRing, runtime#1917,
+# used by gs_adreno_renderer.cpp) — the SAME headers the desktop legs reach
+# through displayxr::rules, so there is one implementation. Fetch sources
+# only; don't run its CMake, which carries desktop platform deps. Keep the pin
+# identical to common/CMakeLists.txt.
 FetchContent_Declare(displayxr_common_rules
     GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v2.16.0
+    GIT_TAG v2.29.0
     GIT_SHALLOW TRUE)
 FetchContent_GetProperties(displayxr_common_rules)
 if(NOT displayxr_common_rules_POPULATED)
@@ -183,7 +185,7 @@ target_include_directories(gausssplat_vk_android PRIVATE
     ${GS_COMMON}                                # gs_renderer.h, ...
     ${libwebp_SOURCE_DIR}/src                   # webp/decode.h for gs_sog_loader
     ${REPO_ROOT}/openxr_includes                # DisplayXR XR_EXT_* headers
-    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h (displayxr-common, runtime#1612)
+    ${displayxr_common_rules_SOURCE_DIR}/common) # dxr_view_config.h + vk_frame_ring.h (displayxr-common)
 
 set_target_properties(gausssplat_vk_android PROPERTIES
     LINK_FLAGS "-u ANativeActivity_onCreate")
