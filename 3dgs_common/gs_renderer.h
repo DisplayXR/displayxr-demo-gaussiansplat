@@ -209,6 +209,9 @@ struct GsRenderer {
     //! always honours `transparentBg` (render.comp writes alpha 1 when opaque),
     //! so it is a no-op here.
     void setHonorTransparentBg(bool) {}
+    //! API parity with GsAdrenoRenderer::setSwapchainMutableFormat (#143).
+    //! This renderer keeps its blit transfer, so it is a no-op here.
+    void setSwapchainMutableFormat(bool) {}
     uint32_t silhouetteCoverageWidth() const { return coverageW_; }
     uint32_t silhouetteCoverageHeight() const { return coverageH_; }
 

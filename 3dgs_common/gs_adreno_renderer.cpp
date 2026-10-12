@@ -6,7 +6,8 @@
  *
  * Per-eye pipeline (no GPU→CPU readback):
  *   updateUniforms → preprocess(N) → keygen(N) → radix sort(N) →
- *   instanced alpha-blended quad draw → blit (linear upscale) to swapchain.
+ *   instanced alpha-blended quad draw → present pass (fullscreen draw into
+ *   an UNORM view of the swapchain image; legacy: blit + scratch + copy).
  * Every eye of a frame is recorded into ONE command buffer of a per-frame
  * ring (dxr::VkFrameRing) and submitted once, unwaited (INV-4.10).
  * See gs_adreno_renderer.h for the design rationale.
@@ -45,6 +46,8 @@
 #include "splat_keys.comp.h"
 #include "splat.vert.h"
 #include "splat.frag.h"
+#include "present.vert.h"
+#include "present.frag.h"
 
 // ── Uniform layout (std140, matches adreno_preprocess.comp Params) ──
 struct alignas(16) GsUniformBuffer {
@@ -70,6 +73,16 @@ struct GsPreprocPush {
     float max_radius_px;   // 0 = uncapped (the historical behaviour)
 };
 static_assert(sizeof(GsPreprocPush) == 12, "GsPreprocPush must match the shader block");
+
+// ── Present-pass push constants (mirror of PresentPush in present.frag) ──
+struct GsPresentPush {
+    float dst_origin[2];
+    float dst_size[2];
+    float src_size[2];
+    float src_inv_tex[2];
+    uint32_t nearest;
+};
+static_assert(sizeof(GsPresentPush) == 36, "GsPresentPush must match the shader block");
 
 // ═══════════════════════════ small Vulkan helpers ═══════════════════════════
 
@@ -283,6 +296,29 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
         timestampPeriod_ = 0.0f;
     }
 
+    // Present pass (#143): the scene- and format-independent objects. The
+    // render passes + pipeline depend on the swapchain format and are built on
+    // first use (ensurePresentPipeline); the descriptor sets per scene.
+    {
+        VkSamplerCreateInfo sci = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter = VK_FILTER_LINEAR; sci.minFilter = VK_FILTER_LINEAR;
+        sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = sci.addressModeV = sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.maxLod = 0.0f;
+        if (vkCreateSampler(device_, &sci, nullptr, &presentSampler_) != VK_SUCCESS) {
+            GS_LOGE("GsAdreno: present sampler create failed");
+            return false;
+        }
+        dslPresent_ = makeDSL(device_, {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                              VK_SHADER_STAGE_FRAGMENT_BIT);
+        layoutPresent_ = makePipeLayout(device_, {dslPresent_}, sizeof(GsPresentPush),
+                                        VK_SHADER_STAGE_FRAGMENT_BIT);
+        if (dslPresent_ == VK_NULL_HANDLE || layoutPresent_ == VK_NULL_HANDLE) {
+            GS_LOGE("GsAdreno: present layout create failed");
+            return false;
+        }
+    }
+
     initialized_ = true;
     GS_LOGI("GsAdreno: initialized (%ux%u eye, renderScale=%.2f, subgroup=%u, "
             "ts_period=%.2fns valid_bits=%u, framesInFlight=%u, submit per view, unwaited)",
@@ -292,11 +328,12 @@ bool GsAdrenoRenderer::init(VkInstance instance, VkPhysicalDevice physicalDevice
     // reports a non-default here changes the pixels or the timings, so a
     // benchmark log that does not carry it cannot be reproduced.
     GS_LOGI("GsAdreno: knobs scale=%.2f keep=%.2f cullAlpha=%.3f extent=%s "
-            "invCull=%s compact=%s maxRadiusFrac=%.3f",
+            "invCull=%s compact=%s maxRadiusFrac=%.3f presentPass=%s",
             renderScale_, keepFrac_, knobs_.cullAlpha,
             knobs_.opacityExtent ? "opacity" : "3sigma",
             knobs_.invisibleCull ? "on" : "off",
-            knobs_.compactDraw ? "on" : "off", knobs_.maxRadiusFrac);
+            knobs_.compactDraw ? "on" : "off", knobs_.maxRadiusFrac,
+            knobs_.presentPass ? "on" : "off");
     return true;
 }
 
@@ -535,7 +572,8 @@ bool GsAdrenoRenderer::createSceneResources() {
             (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssbo, devLocal);
         renderImage_[s] = gsCreateImage2D(device_, physDevice_, width_, height_,
             VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT);  // SAMPLED: read by the present pass (#143)
     }
 
     // Pre-cull silhouette coverage (#112) — ~1 texel per 16x16 render pixels,
@@ -762,6 +800,23 @@ bool GsAdrenoRenderer::createSceneResources() {
         writeDS(device_, dsSplat_[s], 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, valsEvenBuffer_[s].buffer, valsEvenBuffer_[s].size);
     }
 
+    // ── Present pass (#143): one sampler descriptor per buffer set's render target ──
+    {
+        VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, numSets_};
+        VkDescriptorPoolCreateInfo ci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        ci.maxSets = numSets_; ci.poolSizeCount = 1; ci.pPoolSizes = &ps;
+        if (vkCreateDescriptorPool(device_, &ci, nullptr, &presentPool_) != VK_SUCCESS) return false;
+        for (uint32_t s = 0; s < numSets_; s++) {
+            dsPresent_[s] = allocDS(device_, presentPool_, dslPresent_);
+            VkDescriptorImageInfo ii = {presentSampler_, renderImage_[s].view,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+            VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            w.dstSet = dsPresent_[s]; w.dstBinding = 0; w.descriptorCount = 1;
+            w.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER; w.pImageInfo = &ii;
+            vkUpdateDescriptorSets(device_, 1, &w, 0, nullptr);
+        }
+    }
+
     return true;
 }
 
@@ -931,6 +986,204 @@ void GsAdrenoRenderer::updateUniforms(void* dst,
     memcpy(dst, &ub, sizeof(GsUniformBuffer));
 }
 
+// ═══════════════════════════ present pass (#143) ════════════════════════════
+//
+// Why this exists. The swapchain is *_SRGB (gsChooseSwapchainFormat) and the
+// splat render target holds display-referred bytes, so the transfer must not
+// encode. vkCmdBlitImage reads/writes in the IMAGE's format and would, so the
+// old path blitted into an UNORM scratch and vkCmdCopyImage'd that into the
+// swapchain. Byte-exact — but on Adreno the driver allocates and zeroes GPU
+// memory inside vkCmdCopyImage at RECORD time (kgsl_sharedmem_alloc ->
+// clear_page + dcache clean) and frees it at vkResetCommandBuffer. simpleperf
+// on the phone's render thread: ~72 % of its CPU under gsCmdBlitToSwapchain and
+// ~17 % under vkResetCommandBuffer, against ~0.3 % in this library's own code.
+// On the tablet, with the governor at ~1.06 GHz, that is the ~17 ms "render"
+// phase #143 blamed on CPU culling (there is none — culling, keys and sort all
+// run on the GPU). It is the trap the runtime hit in its own compose path
+// (displayxr-runtime#1935) and fixed the same way: read/write the sRGB image
+// through an UNORM view instead of copying it.
+
+bool GsAdrenoRenderer::usePresentPass(VkFormat swapchainFormat) {
+    bool use = knobs_.presentPass;
+    const char* why = use ? "" : "DXR_GS_PRESENT_PASS=0";
+    // An sRGB image may only be viewed as UNORM if it was created
+    // MUTABLE_FORMAT, which the caller promises via setSwapchainMutableFormat.
+    if (use && gsIsSrgbFormat(swapchainFormat) && !swapchainMutable_) {
+        use = false;
+        why = "sRGB swapchain not created with XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT";
+    }
+    if (use && !ensurePresentPipeline(gsUnormSiblingOf(swapchainFormat))) {
+        use = false;
+        why = "present pipeline creation failed";
+    }
+    if (!loggedPresentMode_) {
+        loggedPresentMode_ = true;
+        if (use) {
+            GS_LOGI("GsAdreno: swapchain transfer = present pass (fullscreen draw into an "
+                    "0x%x view of the 0x%x swapchain image)",
+                    (unsigned)gsUnormSiblingOf(swapchainFormat), (unsigned)swapchainFormat);
+        } else {
+            GS_LOGI("GsAdreno: swapchain transfer = legacy blit+scratch+copy (%s)", why);
+        }
+    }
+    return use;
+}
+
+bool GsAdrenoRenderer::ensurePresentPipeline(VkFormat fmt) {
+    if (pipePresent_ != VK_NULL_HANDLE && presentFormat_ == fmt) return true;
+    if (pipePresent_ != VK_NULL_HANDLE) {
+        // The swapchain format changed under us: everything built for the old
+        // one may still be referenced by in-flight frames.
+        if (ring_.frameOpen()) {
+            GS_LOGE("GsAdreno: swapchain format changed inside an open frame; keeping 0x%x",
+                    (unsigned)presentFormat_);
+            return false;
+        }
+        ring_.waitAll();
+        destroyPresentTargets();
+        destroyPresentPipeline();
+    }
+
+    // Two render passes, compatible with each other (same attachment format and
+    // sample count), so one pipeline + one framebuffer per image serves both.
+    // Both end in COLOR_ATTACHMENT_OPTIMAL, the layout OpenXR expects at
+    // release and the one the legacy path left the image in.
+    auto makeRp = [&](bool load, VkRenderPass* out) -> bool {
+        VkAttachmentDescription a = {};
+        a.format = fmt;
+        a.samples = VK_SAMPLE_COUNT_1_BIT;
+        a.loadOp = load ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        a.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        a.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        a.initialLayout = load ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        a.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference ref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription sub = {};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1; sub.pColorAttachments = &ref;
+        VkSubpassDependency deps[2] = {};
+        // In: an earlier view's write to the same image (LOAD case) or whatever
+        // last touched it; reads of the source are ordered by the barrier
+        // recorded before the pass.
+        deps[0] = {VK_SUBPASS_EXTERNAL, 0,
+                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                   VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0};
+        // Out: the runtime samples / copies the image on the same queue.
+        deps[1] = {0, VK_SUBPASS_EXTERNAL,
+                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                   VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0};
+        VkRenderPassCreateInfo ci = {VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
+        ci.attachmentCount = 1; ci.pAttachments = &a;
+        ci.subpassCount = 1; ci.pSubpasses = &sub;
+        ci.dependencyCount = 2; ci.pDependencies = deps;
+        return vkCreateRenderPass(device_, &ci, nullptr, out) == VK_SUCCESS;
+    };
+    if (!makeRp(false, &presentRpDiscard_) || !makeRp(true, &presentRpLoad_)) {
+        destroyPresentPipeline();
+        return false;
+    }
+
+    VkShaderModule vs = makeModule(device_, present_vert_data, sizeof(present_vert_data));
+    VkShaderModule fs = makeModule(device_, present_frag_data, sizeof(present_frag_data));
+    VkPipelineShaderStageCreateInfo st[2] = {};
+    st[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[0].stage = VK_SHADER_STAGE_VERTEX_BIT;   st[0].module = vs; st[0].pName = "main";
+    st[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    st[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT; st[1].module = fs; st[1].pName = "main";
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1; vp.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL; rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE; rs.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+    VkPipelineDepthStencilStateCreateInfo dss = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba = {};  // no blend: a straight overwrite, like the copy
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                         VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1; cb.pAttachments = &cba;
+    VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynci = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynci.dynamicStateCount = 2; dynci.pDynamicStates = dyn;
+    VkGraphicsPipelineCreateInfo gci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gci.stageCount = 2; gci.pStages = st;
+    gci.pVertexInputState = &vi; gci.pInputAssemblyState = &ia;
+    gci.pViewportState = &vp; gci.pRasterizationState = &rs;
+    gci.pMultisampleState = &ms; gci.pDepthStencilState = &dss;
+    gci.pColorBlendState = &cb; gci.pDynamicState = &dynci;
+    gci.layout = layoutPresent_; gci.renderPass = presentRpDiscard_; gci.subpass = 0;
+    const VkResult pr = vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &gci, nullptr, &pipePresent_);
+    vkDestroyShaderModule(device_, vs, nullptr);
+    vkDestroyShaderModule(device_, fs, nullptr);
+    if (pr != VK_SUCCESS) {
+        pipePresent_ = VK_NULL_HANDLE;
+        destroyPresentPipeline();
+        return false;
+    }
+    presentFormat_ = fmt;
+    return true;
+}
+
+const GsAdrenoRenderer::PresentTarget*
+GsAdrenoRenderer::presentTarget(VkImage image, uint32_t w, uint32_t h, VkFormat fmt) {
+    for (uint32_t i = 0; i < presentTargetCount_; i++) {
+        const PresentTarget& t = presentTargets_[i];
+        if (t.image == image && t.w == w && t.h == h && t.format == fmt) return &t;
+    }
+    if (presentTargetCount_ == kMaxPresentTargets) {
+        // More distinct images than any swapchain set this app makes — the
+        // swapchains were recreated. Drop the cache (load-time-rare, waits).
+        if (ring_.frameOpen()) return nullptr;
+        ring_.waitAll();
+        destroyPresentTargets();
+    }
+    PresentTarget t;
+    t.image = image; t.w = w; t.h = h; t.format = fmt;
+    VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    vci.image = image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = fmt;  // the UNORM sibling: legal on a MUTABLE_FORMAT image
+    vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &vci, nullptr, &t.view) != VK_SUCCESS) return nullptr;
+    VkFramebufferCreateInfo fb = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+    fb.renderPass = presentRpDiscard_; fb.attachmentCount = 1; fb.pAttachments = &t.view;
+    fb.width = w; fb.height = h; fb.layers = 1;
+    if (vkCreateFramebuffer(device_, &fb, nullptr, &t.fb) != VK_SUCCESS) {
+        vkDestroyImageView(device_, t.view, nullptr);
+        return nullptr;
+    }
+    presentTargets_[presentTargetCount_] = t;
+    return &presentTargets_[presentTargetCount_++];
+}
+
+void GsAdrenoRenderer::destroyPresentTargets() {
+    for (uint32_t i = 0; i < presentTargetCount_; i++) {
+        PresentTarget& t = presentTargets_[i];
+        if (t.fb) vkDestroyFramebuffer(device_, t.fb, nullptr);
+        if (t.view) vkDestroyImageView(device_, t.view, nullptr);
+        t = PresentTarget{};
+    }
+    presentTargetCount_ = 0;
+}
+
+void GsAdrenoRenderer::destroyPresentPipeline() {
+    if (pipePresent_) { vkDestroyPipeline(device_, pipePresent_, nullptr); pipePresent_ = VK_NULL_HANDLE; }
+    if (presentRpDiscard_) { vkDestroyRenderPass(device_, presentRpDiscard_, nullptr); presentRpDiscard_ = VK_NULL_HANDLE; }
+    if (presentRpLoad_) { vkDestroyRenderPass(device_, presentRpLoad_, nullptr); presentRpLoad_ = VK_NULL_HANDLE; }
+    presentFormat_ = VK_FORMAT_UNDEFINED;
+}
+
 // ═══════════════════════════ beginFrame / endFrame ══════════════════════════
 
 bool GsAdrenoRenderer::beginFrame() {
@@ -1007,7 +1260,7 @@ void GsAdrenoRenderer::endFrame() {
 // ═══════════════════════════════ renderEye ══════════════════════════════════
 
 void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainFormat,
-                                 uint32_t /*imageWidth*/, uint32_t /*imageHeight*/,
+                                 uint32_t imageWidth, uint32_t imageHeight,
                                  uint32_t viewportX, uint32_t viewportY,
                                  uint32_t viewportWidth, uint32_t viewportHeight,
                                  const float viewMatrix[16], const float projMatrix[16],
@@ -1056,10 +1309,6 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     // frame: a barrier at the top of its buffer orders it after everything
     // submitted before it (pipeline barriers span submissions on one queue).
     if (view >= kViewSets) dxr::VkFrameRing::tileBarrier(cmd);
-
-    // The set's scratch is idle (beginFrame waited its slot's fence); only an
-    // sRGB swapchain needs one. Format and size are constant across views.
-    gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_[set], width_, height_, swapchainFormat);
 
     // GPU timestamps for view 0 only (one GS_TS line describes one eye).
     const bool tsOn = (view == 0 && timestampPeriod_ > 0.0f && tsPool_[slot] != VK_NULL_HANDLE);
@@ -1210,56 +1459,12 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
     vkCmdEndRenderPass(cmd);  // renderImage_ now in TRANSFER_SRC_OPTIMAL
     if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 4);
 
-    // ── 5. blit (linear upscale) the scaled region to the swapchain viewport ──
-    // A later view writing ANOTHER tile of the same atlas image (desktop legs;
-    // Android has a swapchain per view, so this never fires there) must keep
-    // the tiles already blitted this frame: transition from the layout the
-    // previous view left it in, not UNDEFINED, which may discard contents.
-    // Its source stage is the previous view's final transition, not
-    // ALL_COMMANDS.
-    const bool sameImageAsPrevView = (view > 0 && swapchainImage == frameLastImage_);
-    frameLastImage_ = swapchainImage;
-    VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    sb.srcAccessMask = sameImageAsPrevView ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0;
-    sb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    sb.oldLayout = sameImageAsPrevView ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-                                       : VK_IMAGE_LAYOUT_UNDEFINED;
-    sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    sb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    sb.image = swapchainImage;
-    sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-    vkCmdPipelineBarrier(cmd,
-        sameImageAsPrevView ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
-
-    VkFilter filter = (rw == viewportWidth && rh == viewportHeight) ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
-    // Byte-exact onto an sRGB swapchain too (no second encode) — see
-    // gsCmdBlitToSwapchain in gs_vulkan_utils.h.
-    gsCmdBlitToSwapchain(cmd, renderImage_[set].image, rw, rh, swapchainImage, swapchainFormat,
-        (int32_t)viewportX, (int32_t)viewportY, viewportWidth, viewportHeight, filter,
-        swapScratch_[set]);
-
-    sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    sb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
-    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 5);
-
-    // Mirror the survivor count for the next throttled GS_TS line (view 0,
-    // like the timestamps). Read when this slot's fence next signals, so
-    // nothing here synchronises.
-    if (compactDraw && view == 0) {
-        VkBufferCopy bc = {0, 0, 16};
-        vkCmdCopyBuffer(cmd, drawCmdBuffer_[set].buffer, drawCmdHost_[set].buffer, 1, &bc);
-    }
-
-    // ── One-shot DXR_GS_DUMP: copy the (pre-blit, pre-upscale) render target
-    //    into a host buffer in this same frame's submission. Fires on exactly
-    //    one eye, so nothing about steady-state timing is affected — and the
-    //    file is the artefact the bit-exactness claims are diffed on. Written
-    //    out by endFrame().
+    // ── One-shot DXR_GS_DUMP: copy the (pre-transfer, pre-upscale) render
+    //    target into a host buffer in this same frame's submission. Fires on
+    //    exactly one eye, so nothing about steady-state timing is affected —
+    //    and the file is the artefact the bit-exactness claims are diffed on.
+    //    Written out by endFrame(). renderImage_ is in TRANSFER_SRC_OPTIMAL
+    //    here (the render pass's final layout).
     const bool dumpNow = (!dumpDone_ && knobs_.dumpPath[0] != '\0' &&
                           frameCounter_ == knobs_.dumpFrame);
     if (dumpNow) {
@@ -1272,8 +1477,6 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
                                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
         }
         if (dumpHost_.buffer != VK_NULL_HANDLE) {
-            // renderImage_ is left in TRANSFER_SRC_OPTIMAL by the render pass's
-            // final layout, and the blit above already read it from there.
             VkBufferImageCopy r = {};
             r.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             r.imageExtent = {rw, rh, 1};
@@ -1284,6 +1487,96 @@ void GsAdrenoRenderer::renderEye(VkImage swapchainImage, VkFormat swapchainForma
         }
     }
 
+    // ── 5. move the scaled region onto the swapchain viewport ──
+    // A later view writing ANOTHER tile of the same atlas image (desktop legs;
+    // Android has a swapchain per view, so this never fires there) must keep
+    // the tiles already written this frame: it loads the image in the layout
+    // the previous view left it in instead of discarding it from UNDEFINED.
+    const bool sameImageAsPrevView = (view > 0 && swapchainImage == frameLastImage_);
+    frameLastImage_ = swapchainImage;
+    const bool nearest = (rw == viewportWidth && rh == viewportHeight);
+    const PresentTarget* pt =
+        usePresentPass(swapchainFormat)
+            ? presentTarget(swapchainImage, imageWidth, imageHeight, gsUnormSiblingOf(swapchainFormat))
+            : nullptr;
+    if (pt != nullptr) {
+        // Present pass (#143): one fullscreen draw into an UNORM view of the
+        // swapchain image. No transfer command touches the swapchain, so the
+        // driver has nothing to allocate.
+        VkImageMemoryBarrier rb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        rb.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        rb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        rb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        rb.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        rb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; rb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        rb.image = renderImage_[set].image;
+        rb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        // TRANSFER in the source scope covers the DXR_GS_DUMP read above.
+        vkCmdPipelineBarrier(cmd,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &rb);
+
+        const VkRect2D area = {{(int32_t)viewportX, (int32_t)viewportY}, {viewportWidth, viewportHeight}};
+        VkRenderPassBeginInfo prp = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        prp.renderPass = sameImageAsPrevView ? presentRpLoad_ : presentRpDiscard_;
+        prp.framebuffer = pt->fb;
+        prp.renderArea = area;
+        vkCmdBeginRenderPass(cmd, &prp, VK_SUBPASS_CONTENTS_INLINE);
+        VkViewport pv = {(float)viewportX, (float)viewportY, (float)viewportWidth, (float)viewportHeight, 0.0f, 1.0f};
+        vkCmdSetViewport(cmd, 0, 1, &pv);
+        vkCmdSetScissor(cmd, 0, 1, &area);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipePresent_);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, layoutPresent_, 0, 1,
+                                &dsPresent_[set], 0, nullptr);
+        GsPresentPush pp = {};
+        pp.dst_origin[0] = (float)viewportX;      pp.dst_origin[1] = (float)viewportY;
+        pp.dst_size[0] = (float)viewportWidth;    pp.dst_size[1] = (float)viewportHeight;
+        pp.src_size[0] = (float)rw;               pp.src_size[1] = (float)rh;
+        pp.src_inv_tex[0] = 1.0f / (float)width_; pp.src_inv_tex[1] = 1.0f / (float)height_;
+        pp.nearest = nearest ? 1u : 0u;
+        vkCmdPushConstants(cmd, layoutPresent_, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pp), &pp);
+        vkCmdDraw(cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(cmd);  // swapchain image now in COLOR_ATTACHMENT_OPTIMAL
+    } else {
+        // Legacy (DXR_GS_PRESENT_PASS=0, or an sRGB swapchain the caller did
+        // not create MUTABLE_FORMAT): blit (+ UNORM scratch + copy on sRGB).
+        // The set's scratch is idle (beginFrame waited its slot's fence).
+        gsEnsureSwapchainScratch(device_, physDevice_, swapScratch_[set], width_, height_, swapchainFormat);
+        VkImageMemoryBarrier sb = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        sb.srcAccessMask = sameImageAsPrevView ? VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0;
+        sb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        sb.oldLayout = sameImageAsPrevView ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                           : VK_IMAGE_LAYOUT_UNDEFINED;
+        sb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        sb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; sb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sb.image = swapchainImage;
+        sb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(cmd,
+            sameImageAsPrevView ? VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
+
+        // Byte-exact onto an sRGB swapchain too (no second encode) — see
+        // gsCmdBlitToSwapchain in gs_vulkan_utils.h.
+        gsCmdBlitToSwapchain(cmd, renderImage_[set].image, rw, rh, swapchainImage, swapchainFormat,
+            (int32_t)viewportX, (int32_t)viewportY, viewportWidth, viewportHeight,
+            nearest ? VK_FILTER_NEAREST : VK_FILTER_LINEAR, swapScratch_[set]);
+
+        sb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        sb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        sb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        sb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &sb);
+    }
+    if (tsOn) vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsq, 5);
+
+    // Mirror the survivor count for the next throttled GS_TS line (view 0,
+    // like the timestamps). Read when this slot's fence next signals, so
+    // nothing here synchronises.
+    if (compactDraw && view == 0) {
+        VkBufferCopy bc = {0, 0, 16};
+        vkCmdCopyBuffer(cmd, drawCmdBuffer_[set].buffer, drawCmdHost_[set].buffer, 1, &bc);
+    }
 
     if (dumpNow && dumpHost_.buffer != VK_NULL_HANDLE) dumpPending_ = true;
 
@@ -1412,6 +1705,8 @@ void GsAdrenoRenderer::cleanupScene() {
     // Destroying the pool frees all sets it owns; just clear the handles.
     if (descriptorPool_) { vkDestroyDescriptorPool(device_, descriptorPool_, nullptr); descriptorPool_ = VK_NULL_HANDLE; }
     dsCov3d_ = dsPreprocessSet0_ = VK_NULL_HANDLE;
+    if (presentPool_) { vkDestroyDescriptorPool(device_, presentPool_, nullptr); presentPool_ = VK_NULL_HANDLE; }
+    for (auto& d : dsPresent_) d = VK_NULL_HANDLE;
     for (uint32_t s = 0; s < kMaxSets; s++) {
         dsPreprocessSet1_[s] = dsKeys_[s] = VK_NULL_HANDLE;
         dsHistEven_[s] = dsHistOdd_[s] = dsSortEvenToOdd_[s] = dsSortOddToEven_[s] = dsSplat_[s] = VK_NULL_HANDLE;
@@ -1446,6 +1741,11 @@ void GsAdrenoRenderer::cleanup() {
     if (device_ == VK_NULL_HANDLE) return;
     cleanupScene();          // ends + waits the ring
     ring_.destroy();         // waitAll + frees cmd buffers, fences, UBO
+    destroyPresentTargets();
+    destroyPresentPipeline();
+    if (layoutPresent_) { vkDestroyPipelineLayout(device_, layoutPresent_, nullptr); layoutPresent_ = VK_NULL_HANDLE; }
+    if (dslPresent_) { vkDestroyDescriptorSetLayout(device_, dslPresent_, nullptr); dslPresent_ = VK_NULL_HANDLE; }
+    if (presentSampler_) { vkDestroySampler(device_, presentSampler_, nullptr); presentSampler_ = VK_NULL_HANDLE; }
     if (viewCmdPool_) { vkDestroyCommandPool(device_, viewCmdPool_, nullptr); viewCmdPool_ = VK_NULL_HANDLE; }
     for (auto& row : viewCmd_) for (auto& c : row) c = VK_NULL_HANDLE;
     ringN_ = 0;

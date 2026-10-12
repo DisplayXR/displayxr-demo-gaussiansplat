@@ -116,7 +116,7 @@ set(SHADER_DIR "${GS_COMMON}/shaders")
 # glslangValidator infers the stage from the extension, so splat.vert/.frag
 # compile the same way (header splat.vert.h, var splat_vert_data, etc.).
 set(GS_SHADERS precomp_cov3d.comp adreno_preprocess.comp hist.comp sort.comp
-    splat_keys.comp splat.vert splat.frag)
+    splat_keys.comp splat.vert splat.frag present.vert present.frag)
 set(SHADER_HEADERS "")
 foreach(S ${GS_SHADERS})
     string(MAKE_C_IDENTIFIER ${S} VN)          # preprocess_sort.comp -> preprocess_sort_comp

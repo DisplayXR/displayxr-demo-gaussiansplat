@@ -1058,7 +1058,10 @@ static bool CreateSwapchains(AppXrSession& xr) {
     }
 
     XrSwapchainCreateInfo sci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
-    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+    // MUTABLE_FORMAT: lets the graphics renderer (when selected) write the
+    // _SRGB image through an UNORM view — its present pass, #143.
+    sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                     XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
     sci.format = selectedFmt;
     sci.sampleCount = 1;
     sci.width = w; sci.height = h;
@@ -1889,6 +1892,8 @@ int main(int argc, char** argv) {
     // The session is transparent-capable, so opaque frames must write alpha 1
     // everywhere (the graphics renderer otherwise emits coverage alpha).
     g_gsRenderer.setHonorTransparentBg(true);
+    // The swapchain was created with XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT (#143).
+    g_gsRenderer.setSwapchainMutableFormat(true);
 
     // Tile basis: the app window when we own one (window × scaleXY, #729-style);
     // else the full panel (hosted-NULL renders display-sized).
