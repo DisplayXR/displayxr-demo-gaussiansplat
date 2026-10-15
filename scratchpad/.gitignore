@@ -1,0 +1,10 @@
+# Bench inputs and outputs. The scripts are tracked; the megabytes are not.
+assets/
+android_bench*/
+*.sog
+*.spz
+*.ply
+*.apk
+web_bench*/
+websyn/
+__pycache__/
