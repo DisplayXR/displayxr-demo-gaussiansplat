@@ -300,16 +300,25 @@ typedef void (*PFN_sim_display_set_output_mode)(int mode);
 static PFN_sim_display_set_output_mode g_pfnSetOutputMode = nullptr;
 
 static bool g_fullscreen = false;
-static NSRect g_savedWindowFrame = {};
-static NSUInteger g_savedWindowStyle = 0;
+// Windowed content rect (screen points) saved on fullscreen entry. A content
+// rect, not a frame: the windowed style (titled vs borderless) depends on
+// g_transparentBg at exit time, and Ctrl+T may flip while fullscreen.
+static NSRect g_savedContentRect = {};
+static const NSUInteger kTitledWindowStyle = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                             NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
 
 // Transparent-background toggle (Ctrl+T). Flips the renderer between opaque
 // clear (alpha=1) and premultiplied alpha = 1 - T (desktop see-through), and
 // in transparent mode clamps the far plane to the ZDP (foreground-only).
-// Render-side only: the session-level transparentBackgroundEnabled flag is set
-// permanently at session create and cannot be toggled at runtime. A plain bool
-// is fine — macOS pumps events and renders on the same main thread.
+// The session-level transparentBackgroundEnabled flag is set permanently at
+// session create and cannot be toggled at runtime; the window side (borderless,
+// keep-above, chrome hidden) is ApplyTransparentWindowState. A plain bool is
+// fine — macOS pumps events and renders on the same main thread.
 static bool g_transparentBg = false;
+// Right-button window move — the app-side FALLBACK only (see MetalView).
+static bool    g_rmbDragging = false;
+static NSPoint g_rmbMouseStart = {};
+static NSPoint g_rmbFrameStart = {};
 // --opaque / DXR_GS_OPAQUE=1: an opaque window + layer and NO transparent-bg
 // session flag, so the scene sits on black instead of compositing the desktop
 // through it. For eyeballing framing and for screenshots; default off.
@@ -737,10 +746,82 @@ static void OpenLoadDialog() {
 - (void)windowWillClose:(NSNotification *)n { (void)n; g_running = false; }
 @end
 
+// Borderless NSWindows refuse key/main status by default, which would kill
+// keyboard input (Ctrl+T could not turn transparency back off). This window
+// stays eligible in every style.
+@interface GaussWindow : NSWindow
+@end
+
+@implementation GaussWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+@end
+
+// Right-button drag moves the borderless (transparent-mode) window — the
+// Windows leg's runtime#1928 gesture, which has no title bar to grab.
+//
+// This is a FALLBACK and must never fight the runtime. When the runtime owns
+// window placement (ADR-050 comp_metal_placement — active whenever the session
+// lands on comp_metal, including this Vulkan app routed VK -> comp_vk_client ->
+// comp_metal for a Metal-only weaving DP), it makes the window movable = NO and
+// takes a borderless window's right-button drag itself (phase-snapped, atomic
+// with the present); its local event monitor swallows those events, so they
+// never reach this view. If one does get here anyway (an older runtime that
+// owns placement but not the RMB drag), !isMovable still says the runtime owns
+// placement, and an app setFrameOrigin would move the window behind its back
+// (stale woven frame, no snap) — so the fallback only runs while the window is
+// movable, i.e. no runtime placement (an in-process vk_native session, where
+// the present reads the window position every frame). The app never flips
+// movable back.
+static void ApplyTransparentWindowState();
+
+static bool AppOwnsRmbWindowMove(NSWindow *w) {
+    return w != nil && w.isMovable && g_transparentBg && !g_fullscreen;
+}
+
 @interface MetalView : NSView
 @end
 
 @implementation MetalView
+// Never let AppKit start a window drag from a click in the content view
+// (mouseDownCanMoveWindow defaults to YES for a non-opaque view, which this
+// layer-backed transparent view is) — window moves belong to the runtime's
+// placement or to the RMB fallback above.
+- (BOOL)mouseDownCanMoveWindow { return NO; }
+
+- (void)rightMouseDown:(NSEvent *)event {
+    if (AppOwnsRmbWindowMove(self.window)) {
+        MarkUserInput(g_input);
+        g_rmbDragging = true;
+        g_rmbMouseStart = [NSEvent mouseLocation];
+        g_rmbFrameStart = self.window.frame.origin;
+        return;
+    }
+    [super rightMouseDown:event];
+}
+
+- (void)rightMouseDragged:(NSEvent *)event {
+    if (g_rmbDragging && self.window != nil && self.window.isMovable) {
+        MarkUserInput(g_input);
+        // The live cursor, not the event deltas: deltas are lost when events
+        // coalesce, and the window moving under the cursor skews them.
+        const NSPoint m = [NSEvent mouseLocation];
+        const NSPoint o = NSMakePoint(round(g_rmbFrameStart.x + (m.x - g_rmbMouseStart.x)),
+                                      round(g_rmbFrameStart.y + (m.y - g_rmbMouseStart.y)));
+        if (!NSEqualPoints(o, self.window.frame.origin)) [self.window setFrameOrigin:o];
+        return;
+    }
+    [super rightMouseDragged:event];
+}
+
+- (void)rightMouseUp:(NSEvent *)event {
+    if (g_rmbDragging) {
+        g_rmbDragging = false;
+        return;
+    }
+    [super rightMouseUp:event];
+}
+
 - (CALayer*)makeBackingLayer {
     CAMetalLayer *layer = [CAMetalLayer layer];
     layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -844,8 +925,15 @@ static void OpenLoadDialog() {
             // Ctrl+T: transparent-background toggle (mirrors the Windows
             // demo). Plain T stays the eye-tracking-mode toggle.
             if ([event modifierFlags] & NSEventModifierFlagControl) {
+                if (g_forceOpaque) {
+                    // --opaque: the session has no transparent-bg flag and the
+                    // window/layer are opaque, so there is nothing to show through.
+                    LOG_INFO("Transparent background unavailable (--opaque)");
+                    break;
+                }
                 g_transparentBg = !g_transparentBg;
                 LOG_INFO("Transparent background: %s (Ctrl+T)", g_transparentBg ? "ON" : "OFF");
+                ApplyTransparentWindowState();
             } else {
                 g_input.eyeTrackingModeToggleRequested = true;
             }
@@ -973,10 +1061,10 @@ static bool CreateMacOSWindow(uint32_t width, uint32_t height, int32_t screenLef
         CGFloat topY = primary.frame.size.height - (CGFloat)screenTop;
         frame = NSMakeRect((CGFloat)screenLeft, topY - (CGFloat)height, width, height);
     }
-    NSUInteger style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                       NSWindowStyleMaskResizable | NSWindowStyleMaskMiniaturizable;
-    g_window = [[NSWindow alloc] initWithContentRect:frame
-        styleMask:style backing:NSBackingStoreBuffered defer:NO];
+    // Always created titled; ApplyTransparentWindowState swaps to borderless
+    // when the session starts transparent (--transparent) or on Ctrl+T.
+    g_window = [[GaussWindow alloc] initWithContentRect:frame
+        styleMask:kTitledWindowStyle backing:NSBackingStoreBuffered defer:NO];
     [g_window setTitle:@"DisplayXR Gaussian Splat Viewer Demo"];
     [g_window setDelegate:delegate];
     // Non-opaque window + clear background brush are required for the
@@ -1119,23 +1207,66 @@ static void PumpMacOSEvents() {
     }
 }
 
+// Swap the window's style to/from borderless while keeping its CONTENT rect
+// (screen points, position + size) identical, the window key and the content
+// view first responder. setStyleMask alone keeps the FRAME, so the content
+// rect would grow/shrink by the title bar; the frame is recomputed from the
+// saved content rect right after. Never setFrame:display:YES (the view's
+// CAMetalLayer is the runtime's present target; it presents on its own).
+static void SetWindowStylePreservingContent(NSUInteger style, NSRect content) {
+    if (g_window == nil) return;
+    const bool wasKey = g_window.isKeyWindow;
+    if (g_window.styleMask != style) [g_window setStyleMask:style];
+    const NSRect want = [g_window frameRectForContentRect:content];
+    if (!NSEqualRects(want, g_window.frame)) [g_window setFrame:want display:NO animate:NO];
+    // A style change can drop key status / the first responder.
+    if (wasKey && !g_window.isKeyWindow) [g_window makeKeyWindow];
+    if (g_window.firstResponder != g_metalView) [g_window makeFirstResponder:g_metalView];
+}
+
+static NSUInteger WindowedStyle() {
+    return g_transparentBg ? NSWindowStyleMaskBorderless : kTitledWindowStyle;
+}
+
 static void ToggleBorderlessFullscreen() {
     if (g_fullscreen) {
-        [g_window setStyleMask:g_savedWindowStyle];
-        [g_window setFrame:g_savedWindowFrame display:YES animate:NO];
-        [g_window setLevel:NSNormalWindowLevel];
+        // Back to the windowed style the CURRENT background wants (Ctrl+T may
+        // have flipped while fullscreen) and the windowed z-band.
         g_fullscreen = false;
+        SetWindowStylePreservingContent(WindowedStyle(), g_savedContentRect);
+        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
         LOG_INFO("Exited fullscreen");
     } else {
-        g_savedWindowStyle = [g_window styleMask];
-        g_savedWindowFrame = [g_window frame];
+        g_savedContentRect = [g_window contentRectForFrameRect:[g_window frame]];
         NSScreen *screen = [g_window screen] ?: [NSScreen mainScreen];
-        [g_window setStyleMask:NSWindowStyleMaskBorderless];
-        [g_window setFrame:[screen frame] display:YES animate:NO];
+        SetWindowStylePreservingContent(NSWindowStyleMaskBorderless, [screen frame]);
         [g_window setLevel:NSStatusWindowLevel];
         g_fullscreen = true;
         LOG_INFO("Entered fullscreen");
     }
+}
+
+// Window side of Ctrl+T, mirroring the Windows leg (#833: "chrome is HIDDEN in
+// transparent/punch-through mode by design — the splats float clean over the
+// live desktop"). Transparent = borderless (no title bar; right-drag moves it),
+// keep-above (the Windows leg's HWND_TOPMOST), no window shadow (AppKit would
+// derive a grey halo from the non-opaque content), and no on-window chrome:
+// the top bar (Open / Mode), the centre reticle and the HUD panel (the HUD is
+// gated per frame in the render loop). Opaque restores all of it.
+// Fullscreen is borderless already and picks the windowed style on exit.
+static void ApplyTransparentWindowState() {
+    if (g_window == nil) return;
+    if (!g_fullscreen) {
+        SetWindowStylePreservingContent(WindowedStyle(),
+                                        [g_window contentRectForFrameRect:[g_window frame]]);
+        [g_window setLevel:g_transparentBg ? NSFloatingWindowLevel : NSNormalWindowLevel];
+    }
+    if (!g_transparentBg) g_rmbDragging = false;
+    if (g_topBar != nil) [g_topBar setHidden:g_transparentBg ? YES : NO];
+    if (g_reticleView != nil) [g_reticleView setHidden:g_transparentBg ? YES : NO];
+    if (g_transparentBg && g_hudBackdrop != nil) [g_hudBackdrop setHidden:YES];
+    [g_window setHasShadow:g_transparentBg ? NO : YES];
+    [g_window invalidateShadow];
 }
 
 // ============================================================================
@@ -2675,6 +2806,13 @@ int main(int argc, char** argv) {
         CleanupOpenXR(xr);
         return 1;
     }
+    // --transparent: start transparent (borderless, chrome hidden), as the
+    // Windows leg does. Ignored under --opaque, which has nothing to show through.
+    if (g_launch.transparent && !g_forceOpaque) {
+        g_transparentBg = true;
+        LOG_INFO("Transparent background: ON (startup)");
+    }
+    ApplyTransparentWindowState();
 
     { NSSize cs = [[g_window contentView] bounds].size;
       CGFloat bs = [g_window backingScaleFactor];
@@ -3753,7 +3891,9 @@ int main(int argc, char** argv) {
         if (g_hudUpdateTimer >= 0.5f) {
             g_hudUpdateTimer = 0.0f;
             @autoreleasepool {
-                if (g_input.hudVisible && g_hudView != nil) {
+                // Transparent mode hides the HUD with the rest of the chrome
+                // (Windows #833); ApplyTransparentWindowState hid the backdrop.
+                if (g_input.hudVisible && g_hudView != nil && !g_transparentBg) {
                     double fps = (g_avgFrameTime > 0) ? 1.0 / g_avgFrameTime : 0;
                     NSString *sceneInfo = g_gsRenderer.hasScene()
                         ? [NSString stringWithFormat:@"Scene: %s", g_loadedFileName.c_str()]

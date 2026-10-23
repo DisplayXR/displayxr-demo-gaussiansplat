@@ -257,6 +257,8 @@ The DisplayXR runtime since **v1.3.0** (the [v1.3.0 release](https://github.com/
 3. Scene clears to `RGBA(0,0,0,0)` in regions that should be transparent.
 4. Projection layer in `xrEndFrame` sets `layerFlags |= XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT`.
 
+**macOS window side (`macos/main.mm`, `ApplyTransparentWindowState`).** Ctrl+T (or `--transparent` at launch; refused under `--opaque`) makes the window borderless, keep-above (`NSFloatingWindowLevel`) and shadowless, and hides all on-window chrome — top bar (Open / Mode), reticle, HUD — mirroring Windows #833. Opaque restores the titled window. The style swap keeps the **content** rect (`SetWindowStylePreservingContent`). A borderless window has no title bar, so right-button drag moves it: on a weaving display the runtime owns that drag (ADR-050 `comp_metal_placement`, sets `movable = NO`); the app's RMB move is a fallback that runs only while the window is still movable, and the app never sets `movable` itself. On a weaving panel the desktop behind the window comes from the runtime's live capture (runtime v2.52.0+); sim_display is alpha-native.
+
 Reference Vulkan app with these patches: `cube_handle_vk_win` in the runtime repo (`test_apps/cube_handle_vk_win/{main.cpp, xr_session.cpp, vk_renderer.cpp}` under `displayxr-runtime`).
 
 Anti-aliased edges become hard-mask alpha on Leia hardware (fundamental SR-weaver limitation — alpha is 0 or 1, no in-between).
