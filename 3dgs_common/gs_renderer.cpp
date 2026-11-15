@@ -1812,19 +1812,30 @@ void GsRenderer::renderEye(VkImage swapchainImage,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb);
 
         // Barrier: swapchain image → TRANSFER_DST
-        // First eye (vpX==0): UNDEFINED is fine (fresh acquire, ok to discard).
-        // Second eye in SBS: must use COLOR_ATTACHMENT_OPTIMAL to preserve first eye.
+        // First view in the image (tile at 0,0): UNDEFINED is fine (fresh
+        // acquire, ok to discard). Every later tile must enter from
+        // COLOR_ATTACHMENT_OPTIMAL to preserve the tiles already written.
+        // (vpX alone misfires on row-tiled layouts, where the first tile of
+        // every later row is also at vpX==0 and would discard earlier rows.)
+        const bool firstViewInImage = (viewportX == 0 && viewportY == 0);
         VkImageMemoryBarrier imb2 = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-        imb2.srcAccessMask = (viewportX == 0) ? (VkAccessFlags)0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        imb2.srcAccessMask = firstViewInImage ? (VkAccessFlags)0 : VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         imb2.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        imb2.oldLayout = (viewportX == 0) ? VK_IMAGE_LAYOUT_UNDEFINED
+        imb2.oldLayout = firstViewInImage ? VK_IMAGE_LAYOUT_UNDEFINED
                                           : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         imb2.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
         imb2.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         imb2.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         imb2.image = swapchainImage;
         imb2.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+        // A preserving entry must WAIT on the prior writer: TOP_OF_PIPE as the
+        // source stage orders nothing, so the COLOR_ATTACHMENT_WRITE srcAccess
+        // was never made available (VUID-vkCmdPipelineBarrier-02819, #127).
+        // COLOR_ATTACHMENT_OUTPUT chains from the previous tile's exit barrier
+        // below, which hands the image over in COLOR_ATTACHMENT_OPTIMAL.
+        vkCmdPipelineBarrier(cmd,
+            firstViewInImage ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT
+                             : VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &imb2);
 
         // Blit the scaled render region (rw x rh) up to the full viewport
