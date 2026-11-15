@@ -346,7 +346,9 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
 
     std::vector<GsVertex> verts;
     std::string path(scenePath);
-    std::string ext = path.substr(path.find_last_of('.'));
+    // No dot (an extensionless path) reads as no extension, i.e. a PLY.
+    const size_t dot = path.find_last_of('.');
+    std::string ext = (dot == std::string::npos) ? std::string() : path.substr(dot);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
     bool ok;
     // Cleared on EVERY load, before the dispatch — see the note in
@@ -361,8 +363,9 @@ bool GsAdrenoRenderer::loadScene(const char* scenePath) {
         ok = ParseSogFile(path, verts, &info, &sceneCamera_);
         if (!ok) lastLoadError_ = info.error;
     } else {
-        ok = ParsePlyFile(path, verts);
-        if (!ok) lastLoadError_ = "not a readable PLY scene (corrupt or unsupported)";
+        std::string plyError;
+        ok = ParsePlyFile(path, verts, &plyError);
+        if (!ok) lastLoadError_ = "not a readable PLY scene: " + plyError;
     }
     if (!ok || verts.empty()) {
         if (lastLoadError_.empty()) lastLoadError_ = "scene file contains no gaussians";

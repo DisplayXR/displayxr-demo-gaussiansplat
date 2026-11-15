@@ -788,7 +788,9 @@ bool GsRenderer::loadScene(const char* plyPath)
     // Auto-detect format by extension and parse scene file
     std::vector<GsVertex> vertices;
     std::string scenePath(plyPath);
-    std::string ext = scenePath.substr(scenePath.find_last_of('.'));
+    // No dot (an extensionless path) reads as no extension, i.e. a PLY.
+    const size_t dot = scenePath.find_last_of('.');
+    std::string ext = (dot == std::string::npos) ? std::string() : scenePath.substr(dot);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
 
     // A parse failure is a RETURN, never an exception and never a crash: an
@@ -808,8 +810,9 @@ bool GsRenderer::loadScene(const char* plyPath)
         parseOk = ParseSogFile(scenePath, vertices, &info, &sceneCamera_);
         if (!parseOk) lastLoadError_ = info.error;
     } else {
-        parseOk = ParsePlyFile(scenePath, vertices);
-        if (!parseOk) lastLoadError_ = "not a readable PLY scene (corrupt or unsupported)";
+        std::string plyError;
+        parseOk = ParsePlyFile(scenePath, vertices, &plyError);
+        if (!parseOk) lastLoadError_ = "not a readable PLY scene: " + plyError;
     }
 
     if (!parseOk || vertices.empty()) {
