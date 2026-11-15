@@ -10,17 +10,30 @@
 #include <cstdlib>
 #include <cstring>
 
-uint32_t gsFindMemoryType(VkPhysicalDevice physDevice,
-                          uint32_t typeFilter,
-                          VkMemoryPropertyFlags properties)
+bool gsTryFindMemoryType(VkPhysicalDevice physDevice,
+                         uint32_t typeFilter,
+                         VkMemoryPropertyFlags properties,
+                         uint32_t* outIndex)
 {
     VkPhysicalDeviceMemoryProperties memProps;
     vkGetPhysicalDeviceMemoryProperties(physDevice, &memProps);
     for (uint32_t i = 0; i < memProps.memoryTypeCount; i++) {
-        if ((typeFilter & (1 << i)) &&
+        if ((typeFilter & (1u << i)) &&
             (memProps.memoryTypes[i].propertyFlags & properties) == properties) {
-            return i;
+            *outIndex = i;
+            return true;
         }
+    }
+    return false;
+}
+
+uint32_t gsFindMemoryType(VkPhysicalDevice physDevice,
+                          uint32_t typeFilter,
+                          VkMemoryPropertyFlags properties)
+{
+    uint32_t index = 0;
+    if (gsTryFindMemoryType(physDevice, typeFilter, properties, &index)) {
+        return index;
     }
     fprintf(stderr, "gs_vulkan_utils: failed to find suitable memory type\n");
     return 0;
@@ -32,36 +45,59 @@ GsBuffer gsCreateBuffer(VkDevice device,
                         VkBufferUsageFlags usage,
                         VkMemoryPropertyFlags memProps)
 {
+    // On ANY failure the result is a clean empty GsBuffer (null handles,
+    // size 0) and everything created on the way has been destroyed, so a
+    // caller can test `buffer == VK_NULL_HANDLE` and never holds half a
+    // buffer. `size` is set only once the buffer is bound.
     GsBuffer buf;
-    buf.size = size;
 
     VkBufferCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     ci.size = size;
     ci.usage = usage;
     ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-    if (vkCreateBuffer(device, &ci, nullptr, &buf.buffer) != VK_SUCCESS) {
-        fprintf(stderr, "gs_vulkan_utils: failed to create buffer (%llu bytes)\n",
-                (unsigned long long)size);
+    VkResult res = vkCreateBuffer(device, &ci, nullptr, &buf.buffer);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "gs_vulkan_utils: failed to create buffer (%llu bytes, VkResult %d)\n",
+                (unsigned long long)size, (int)res);
+        buf.buffer = VK_NULL_HANDLE;
         return buf;
     }
 
     VkMemoryRequirements memReq;
     vkGetBufferMemoryRequirements(device, buf.buffer, &memReq);
 
-    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    ai.allocationSize = memReq.size;
-    ai.memoryTypeIndex = gsFindMemoryType(physDevice, memReq.memoryTypeBits, memProps);
-
-    if (vkAllocateMemory(device, &ai, nullptr, &buf.memory) != VK_SUCCESS) {
-        fprintf(stderr, "gs_vulkan_utils: failed to allocate buffer memory (%llu bytes)\n",
-                (unsigned long long)memReq.size);
-        vkDestroyBuffer(device, buf.buffer, nullptr);
-        buf.buffer = VK_NULL_HANDLE;
+    uint32_t memoryTypeIndex = 0;
+    if (!gsTryFindMemoryType(physDevice, memReq.memoryTypeBits, memProps, &memoryTypeIndex)) {
+        fprintf(stderr, "gs_vulkan_utils: no memory type matches buffer (%llu bytes, "
+                        "typeBits 0x%x, props 0x%x)\n",
+                (unsigned long long)size, memReq.memoryTypeBits, (unsigned)memProps);
+        gsDestroyBuffer(device, buf);
         return buf;
     }
 
-    vkBindBufferMemory(device, buf.buffer, buf.memory, 0);
+    VkMemoryAllocateInfo ai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = memReq.size;
+    ai.memoryTypeIndex = memoryTypeIndex;
+
+    res = vkAllocateMemory(device, &ai, nullptr, &buf.memory);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "gs_vulkan_utils: failed to allocate buffer memory (%llu bytes, VkResult %d)\n",
+                (unsigned long long)memReq.size, (int)res);
+        buf.memory = VK_NULL_HANDLE;
+        gsDestroyBuffer(device, buf);
+        return buf;
+    }
+
+    res = vkBindBufferMemory(device, buf.buffer, buf.memory, 0);
+    if (res != VK_SUCCESS) {
+        fprintf(stderr, "gs_vulkan_utils: failed to bind buffer memory (%llu bytes, VkResult %d)\n",
+                (unsigned long long)memReq.size, (int)res);
+        gsDestroyBuffer(device, buf);
+        return buf;
+    }
+
+    buf.size = size;
     return buf;
 }
 

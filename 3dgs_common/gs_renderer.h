@@ -317,6 +317,10 @@ private:
     uint32_t tileX_ = 0;     // ceil(width/16)
     uint32_t tileY_ = 0;     // ceil(height/16)
     uint32_t maxSortInstances_ = 0;  // grows on overflow via growSortBuffers()
+    // Smallest grow capacity that failed to allocate this scene (0 = none).
+    // A grow to this size or more is not retried (or re-logged) every frame;
+    // reset on each createBuffers().
+    uint64_t sortGrowFailedCap_ = 0;
     uint32_t numPrefixSumIter_ = 0;  // ceil(log2(numGaussians))
 
     // ── GPU Buffers (14 total) ───────────────────────────────────────────
@@ -421,8 +425,18 @@ private:
     bool createDescriptorSets();
     // Reallocate sort buffers + sort histogram to hold at least requiredCapacity
     // tile fragments, and re-write the descriptor sets that bind them. Caller
-    // must have wait-idled the queue. No-op if requiredCapacity fits.
-    void growSortBuffers(uint32_t requiredCapacity);
+    // must have wait-idled the queue. No-op (true) if requiredCapacity fits.
+    // The new set is allocated beside the old one and swapped in only when
+    // every buffer succeeded; on failure the old buffers, maxSortInstances_
+    // and numSortWorkgroups_ are kept and it returns false, so the caller
+    // must clamp the frame's fragment count to maxSortInstances_. Capacity
+    // may also come back below requiredCapacity when it hits
+    // maxSortCapacity().
+    bool growSortBuffers(uint32_t requiredCapacity);
+    // Largest sort capacity (elements) one sort buffer may hold: its byte
+    // size must fit the device's maxStorageBufferRange, and the count must
+    // fit the shaders' uint.
+    uint64_t maxSortCapacity() const;
     void dispatchPrecompCov3d();
     // Record UNDEFINED -> clear-to-zero -> GENERAL for coverageImage_ into an
     // already-begun command buffer (the one-time post-load transition).
