@@ -67,8 +67,9 @@ bool LoadScene(const std::string& path, std::vector<GsVertex>& verts, std::strin
         err = info.error;
         return false;
     }
-    if (ParsePlyFile(path, verts)) return true;
-    err = "not a readable PLY scene";
+    std::string plyError;
+    if (ParsePlyFile(path, verts, &plyError)) return true;
+    err = "not a readable PLY scene: " + plyError;
     return false;
 }
 

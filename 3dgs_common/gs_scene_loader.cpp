@@ -9,10 +9,16 @@
 
 #include <filesystem>
 #include <fstream>
+#include <sstream>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <limits>
+#include <new>
+#include <stdexcept>
 
 // On-disk PLY vertex: 62 floats = 248 bytes
 struct PlyVertexStorage {
@@ -29,60 +35,278 @@ static float sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
 }
 
-bool ParsePlyFile(const std::string& path, std::vector<GsVertex>& vertices)
-{
-    vertices.clear();
+namespace {
 
+//! Refuse absurd inputs before allocating. The gaussian ceiling is the same
+//! one the SOG loader applies (gs_sog_loader.cpp kMaxGaussians): a count past
+//! it is a corrupt header, not a scene.
+constexpr uint64_t kMaxPlyGaussians   = 100u * 1000 * 1000;
+//! One header line. The longest legitimate line is a `comment`; 4 KB is far
+//! past anything an exporter writes.
+constexpr size_t   kMaxPlyHeaderLine  = 4096;
+//! The whole header. The 62-property layout is ~1.5 KB; comments add a little.
+constexpr size_t   kMaxPlyHeaderBytes = 64u * 1024;
+
+//! The one vertex layout this loader reads: 62 little-endian float32
+//! properties in exactly this order (the PlyVertexStorage struct above).
+std::vector<std::string> ExpectedPlyVertexProperties()
+{
+    std::vector<std::string> names = {"x", "y", "z", "nx", "ny", "nz",
+                                      "f_dc_0", "f_dc_1", "f_dc_2"};
+    for (int i = 0; i < 45; i++) names.push_back("f_rest_" + std::to_string(i));
+    names.push_back("opacity");
+    for (int i = 0; i < 3; i++) names.push_back("scale_" + std::to_string(i));
+    for (int i = 0; i < 4; i++) names.push_back("rot_" + std::to_string(i));
+    return names;
+}
+
+//! Read one header line (up to '\n', '\r' stripped) without letting a file
+//! with no newline pull an unbounded string into memory. False on EOF, on a
+//! line longer than kMaxPlyHeaderLine, or once the header passes
+//! kMaxPlyHeaderBytes in total; `error` says which.
+bool ReadPlyHeaderLine(std::istream& in, std::string& line, size_t& headerBytes,
+                       std::string& error)
+{
+    line.clear();
+    for (;;) {
+        const int c = in.get();
+        if (c == std::char_traits<char>::eof()) {
+            error = "header ended before end_header";
+            return false;
+        }
+        if (++headerBytes > kMaxPlyHeaderBytes) {
+            error = "header is longer than " + std::to_string(kMaxPlyHeaderBytes) +
+                    " bytes without an end_header";
+            return false;
+        }
+        if (c == '\n') break;
+        if (line.size() >= kMaxPlyHeaderLine) {
+            error = "header line longer than " + std::to_string(kMaxPlyHeaderLine) + " bytes";
+            return false;
+        }
+        line.push_back((char)c);
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return true;
+}
+
+//! Parse a decimal element count. Rejects signs, junk and anything that does
+//! not fit in 64 bits.
+bool ParsePlyCount(const std::string& token, uint64_t& out)
+{
+    if (token.empty() || token.size() > 20) return false;
+    for (char ch : token) {
+        if (ch < '0' || ch > '9') return false;
+    }
+    errno = 0;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(token.c_str(), &end, 10);
+    if (errno != 0 || end == nullptr || *end != '\0') return false;
+    out = (uint64_t)v;
+    return true;
+}
+
+bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
+                      std::string& error)
+{
     std::ifstream file(path, std::ios::binary);
     if (!file.is_open()) {
-        fprintf(stderr, "ParsePlyFile: cannot open %s\n", path.c_str());
+        error = "cannot open file";
         return false;
     }
 
-    // Parse PLY header
+    // ── Header ──────────────────────────────────────────────────────────
+    // Every line is read, not just the vertex count: the format, the element
+    // order and the vertex property list all decide whether the fixed
+    // 248-byte layout below is what the file actually holds.
     std::string line;
-    uint32_t numVertices = 0;
-    bool foundHeader = false;
+    size_t headerBytes = 0;
+    if (!ReadPlyHeaderLine(file, line, headerBytes, error)) return false;
+    if (line != "ply") {
+        error = "not a PLY file (first line is not 'ply')";
+        return false;
+    }
 
-    while (std::getline(file, line)) {
-        // Strip carriage return if present
-        if (!line.empty() && line.back() == '\r')
-            line.pop_back();
+    bool haveFormat = false;
+    bool haveVertex = false;
+    bool inVertex = false;
+    bool foundEnd = false;
+    uint64_t numVertices = 0;
+    // "<type> <name>" per vertex property, in file order.
+    std::vector<std::pair<std::string, std::string>> vertexProps;
 
-        if (line.find("element vertex") != std::string::npos) {
-            if (sscanf(line.c_str(), "element vertex %u", &numVertices) != 1) {
-                fprintf(stderr, "ParsePlyFile: failed to parse vertex count\n");
-                return false;
-            }
+    while (ReadPlyHeaderLine(file, line, headerBytes, error)) {
+        std::istringstream ls(line);
+        std::string keyword;
+        ls >> keyword;
+
+        if (keyword.empty() || keyword == "comment" || keyword == "obj_info") {
+            continue;
         }
-        if (line == "end_header") {
-            foundHeader = true;
+        if (keyword == "end_header") {
+            foundEnd = true;
             break;
         }
+        if (keyword == "format") {
+            std::string fmt, ver, extra;
+            ls >> fmt >> ver >> extra;
+            if (haveFormat) {
+                error = "header has more than one format line";
+                return false;
+            }
+            if (fmt != "binary_little_endian" || ver != "1.0" || !extra.empty()) {
+                error = "unsupported PLY format '" + line +
+                        "' (only 'format binary_little_endian 1.0' is supported)";
+                return false;
+            }
+            haveFormat = true;
+            continue;
+        }
+        if (keyword == "element") {
+            std::string name, countTok, extra;
+            ls >> name >> countTok >> extra;
+            uint64_t count = 0;
+            if (name.empty() || !extra.empty() || !ParsePlyCount(countTok, count)) {
+                error = "malformed element line '" + line + "'";
+                return false;
+            }
+            if (name == "vertex") {
+                if (haveVertex) {
+                    error = "header declares more than one vertex element";
+                    return false;
+                }
+                haveVertex = true;
+                inVertex = true;
+                numVertices = count;
+            } else {
+                // Elements AFTER the vertex block sit past the bytes read
+                // here and are ignored. One BEFORE it would put its data
+                // where the vertices are expected.
+                if (!haveVertex) {
+                    error = "element '" + name +
+                            "' precedes the vertex element (vertex must be first)";
+                    return false;
+                }
+                inVertex = false;
+            }
+            continue;
+        }
+        if (keyword == "property") {
+            if (!haveVertex) {
+                error = "property line before any element: '" + line + "'";
+                return false;
+            }
+            if (!inVertex) continue;  // a later element's property; not read
+            std::string type, name, extra;
+            ls >> type >> name >> extra;
+            if (type == "list") {
+                error = "vertex element has a list property ('" + line +
+                        "'); only scalar float properties are supported";
+                return false;
+            }
+            if (type.empty() || name.empty() || !extra.empty()) {
+                error = "malformed property line '" + line + "'";
+                return false;
+            }
+            vertexProps.emplace_back(type, name);
+            continue;
+        }
+        error = "unrecognised header line '" + line + "'";
+        return false;
     }
+    if (!foundEnd) return false;  // `error` set by ReadPlyHeaderLine
 
-    if (!foundHeader || numVertices == 0) {
-        fprintf(stderr, "ParsePlyFile: invalid PLY header (vertices=%u)\n", numVertices);
+    if (!haveFormat) {
+        error = "header has no format line";
+        return false;
+    }
+    if (!haveVertex) {
+        error = "header has no vertex element";
         return false;
     }
 
-    printf("ParsePlyFile: loading %u gaussians from %s\n", numVertices, path.c_str());
+    // ── Vertex layout: exactly the 62-float layout, or refuse ──────────
+    const std::vector<std::string> expected = ExpectedPlyVertexProperties();
+    static_assert(sizeof(PlyVertexStorage) == 62 * sizeof(float),
+                  "PlyVertexStorage must be the 62-float layout");
+    {
+        size_t mismatch = 0;
+        while (mismatch < vertexProps.size() && mismatch < expected.size()) {
+            const auto& p = vertexProps[mismatch];
+            const bool isFloat = (p.first == "float" || p.first == "float32");
+            if (!isFloat || p.second != expected[mismatch]) break;
+            mismatch++;
+        }
+        if (mismatch != expected.size() || vertexProps.size() != expected.size()) {
+            error = "unsupported PLY vertex layout: expected the 62-float 3DGS layout "
+                    "(x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2 rot_0..3, "
+                    "all float), found " + std::to_string(vertexProps.size()) +
+                    " properties";
+            if (mismatch < vertexProps.size()) {
+                const auto& p = vertexProps[mismatch];
+                error += "; property " + std::to_string(mismatch) + " is '" + p.first +
+                         " " + p.second + "'";
+                if (mismatch < expected.size()) {
+                    error += ", expected 'float " + expected[mismatch] + "'";
+                }
+            } else {
+                error += "; properties from 'float " + expected[mismatch] + "' on are missing";
+            }
+            return false;
+        }
+    }
+
+    // ── Count vs ceiling vs the bytes actually in the file ─────────────
+    if (numVertices == 0) {
+        error = "vertex element declares 0 gaussians";
+        return false;
+    }
+    if (numVertices > kMaxPlyGaussians) {
+        error = "vertex count " + std::to_string(numVertices) + " exceeds the " +
+                std::to_string(kMaxPlyGaussians) + " gaussian ceiling";
+        return false;
+    }
+
+    const std::streamoff dataStart = (std::streamoff)file.tellg();
+    file.seekg(0, std::ios::end);
+    const std::streamoff fileEnd = (std::streamoff)file.tellg();
+    if (!file || dataStart < 0 || fileEnd < dataStart) {
+        error = "cannot determine file size";
+        return false;
+    }
+    file.seekg(dataStart, std::ios::beg);
+    const uint64_t remaining = (uint64_t)(fileEnd - dataStart);
+    const uint64_t needed = numVertices * (uint64_t)sizeof(PlyVertexStorage);
+    if (needed > remaining) {
+        error = "header declares " + std::to_string(numVertices) + " gaussians (" +
+                std::to_string(needed) + " bytes) but only " + std::to_string(remaining) +
+                " bytes follow the header";
+        return false;
+    }
+    // A 32-bit ABI cannot address the block even when the file holds it.
+    if (needed > (uint64_t)(std::numeric_limits<size_t>::max)() ||
+        needed > (uint64_t)(std::numeric_limits<std::streamsize>::max)()) {
+        error = "vertex data (" + std::to_string(needed) +
+                " bytes) is too large for this build";
+        return false;
+    }
+
+    const size_t count = (size_t)numVertices;
+    printf("ParsePlyFile: loading %zu gaussians from %s\n", count, path.c_str());
 
     // Read binary vertex data
-    std::vector<PlyVertexStorage> storage(numVertices);
-    file.read(reinterpret_cast<char*>(storage.data()),
-              (std::streamsize)(numVertices * sizeof(PlyVertexStorage)));
+    std::vector<PlyVertexStorage> storage(count);
+    file.read(reinterpret_cast<char*>(storage.data()), (std::streamsize)needed);
 
     if (!file) {
-        fprintf(stderr, "ParsePlyFile: failed to read vertex data (expected %zu bytes)\n",
-                (size_t)numVertices * sizeof(PlyVertexStorage));
+        error = "failed to read vertex data (expected " + std::to_string(needed) + " bytes)";
         return false;
     }
 
     // Transform to GPU format
-    vertices.resize(numVertices);
+    vertices.resize(count);
 
-    for (uint32_t i = 0; i < numVertices; i++) {
+    for (size_t i = 0; i < count; i++) {
         const PlyVertexStorage& s = storage[i];
         GsVertex& v = vertices[i];
 
@@ -136,9 +360,39 @@ bool ParsePlyFile(const std::string& path, std::vector<GsVertex>& vertices)
         }
     }
 
-    printf("ParsePlyFile: loaded %u gaussians (%.1f MB GPU data)\n",
-           numVertices, (double)(numVertices * sizeof(GsVertex)) / (1024.0 * 1024.0));
+    printf("ParsePlyFile: loaded %zu gaussians (%.1f MB GPU data)\n",
+           count, (double)count * (double)sizeof(GsVertex) / (1024.0 * 1024.0));
     return true;
+}
+
+} // namespace
+
+bool ParsePlyFile(const std::string& path, std::vector<GsVertex>& vertices,
+                  std::string* error)
+{
+    vertices.clear();
+    std::string err;
+    bool ok = false;
+    // A parse failure is a RETURN, never an exception: the header is checked
+    // against the file size before anything is allocated, but an allocation
+    // can still fail on a large valid scene.
+    try {
+        ok = ParsePlyFileImpl(path, vertices, err);
+    } catch (const std::bad_alloc&) {
+        err = "out of memory while loading the scene";
+        ok = false;
+    } catch (const std::length_error&) {
+        err = "scene is too large to hold in memory";
+        ok = false;
+    }
+    if (!ok) {
+        vertices.clear();
+        vertices.shrink_to_fit();
+        if (err.empty()) err = "unknown error";
+        fprintf(stderr, "ParsePlyFile: %s - %s\n", path.c_str(), err.c_str());
+        if (error) *error = err;
+    }
+    return ok;
 }
 
 bool ValidatePlyFile(const std::string& path)

@@ -113,9 +113,19 @@ struct GsSceneCamera {
 
 // Parse a binary PLY file and return GPU-ready vertices.
 // Applies: sigmoid(opacity), exp(scale), normalize(rotation), SH de-interleave.
-// Returns true on success. On failure, vertices is empty.
+//
+// Accepts exactly one layout: `format binary_little_endian 1.0` with the vertex
+// element first and holding the 62 float properties of the standard 3DGS
+// export, in order (x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2
+// rot_0..3). Anything else is refused with a message naming what was found.
+// The vertex count must be <= 100M and fit in the bytes after the header
+// before anything is allocated. Never throws.
+//
+// Returns true on success. On failure, vertices is empty and `error` (when
+// non-null) receives a one-line reason.
 bool ParsePlyFile(const std::string& path,
-                  std::vector<GsVertex>& vertices);
+                  std::vector<GsVertex>& vertices,
+                  std::string* error = nullptr);
 
 // Validate that a file path points to a valid .ply Gaussian splatting scene.
 // Returns true if the file exists and has a .ply extension.
