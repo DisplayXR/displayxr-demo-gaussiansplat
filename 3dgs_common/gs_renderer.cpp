@@ -490,12 +490,16 @@ bool GsRenderer::createBuffers()
 {
     uint32_t N = numGaussians_;
     uint32_t totalTiles = tileX_ * tileY_;
+    sortGrowFailedCap_ = 0;
     // Initial multiplier sized for mono full-resolution viewport. SBS/3D modes
     // generate ~4× fewer fragments per gaussian (smaller pixel-space radius),
     // so this is generous for stereo. growSortBuffers() handles overflow.
-    maxSortInstances_ = N * 8;
-    if (maxSortInstances_ < totalTiles)
-        maxSortInstances_ = totalTiles;
+    // 64-bit so N * 8 cannot wrap; capped to what one sort buffer can hold.
+    uint64_t initialCap = (uint64_t)N * 8u;
+    if (initialCap < totalTiles) initialCap = totalTiles;
+    const uint64_t capLimit = maxSortCapacity();
+    if (initialCap > capLimit) initialCap = capLimit;
+    maxSortInstances_ = (uint32_t)initialCap;
 
     auto devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     auto hostVis = (VkMemoryPropertyFlags)(VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
@@ -504,67 +508,87 @@ bool GsRenderer::createBuffers()
                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 
+    // Every allocation is checked. The first one that fails stops the rest,
+    // and everything already made is destroyed below, so a failed load holds
+    // no half-built scene and lastLoadError_ says what could not be had.
+    const char* failedWhat = nullptr;
+    VkDeviceSize failedBytes = 0;
+    auto makeBuffer = [&](GsBuffer& dst, const char* what, VkDeviceSize bytes,
+                          VkBufferUsageFlags usage, VkMemoryPropertyFlags props) {
+        if (failedWhat) return;
+        dst = gsCreateBuffer(device_, physDevice_, bytes, usage, props);
+        if (dst.buffer == VK_NULL_HANDLE) {
+            failedWhat = what;
+            failedBytes = bytes;
+        }
+    };
+
     // Vertex data (uploaded via staging)
-    vertexBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(vertexBuffer_, "vertex buffer",
         (VkDeviceSize)N * 240, ssboUsage, devLocal);
 
     // Cov3D (written by precomp_cov3d)
-    cov3DBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(cov3DBuffer_, "cov3D buffer",
         (VkDeviceSize)N * 24, ssboUsage, devLocal);
 
     // Uniform buffer (host-visible, mapped each frame)
-    uniformBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(uniformBuffer_, "uniform buffer",
         sizeof(GsUniformBuffer),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
         hostVis);
 
     // Vertex attributes (written by preprocess, read by preprocess_sort + render)
-    vertexAttrBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(vertexAttrBuffer_, "vertex attribute buffer",
         (VkDeviceSize)N * 64, ssboUsage, devLocal);
 
     // Tile overlap counts (written by preprocess, copied to prefix ping)
-    tileOverlapBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(tileOverlapBuffer_, "tile overlap buffer",
         (VkDeviceSize)N * 4, ssboUsage, devLocal);
 
     // Prefix sum ping/pong buffers
-    prefixSumPingBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(prefixSumPingBuffer_, "prefix sum buffer",
         (VkDeviceSize)N * 4, ssboUsage, devLocal);
-    prefixSumPongBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(prefixSumPongBuffer_, "prefix sum buffer",
         (VkDeviceSize)N * 4, ssboUsage, devLocal);
 
     // Total sum readback (host-visible)
-    totalSumHostBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(totalSumHostBuffer_, "readback buffer",
         sizeof(uint32_t),
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         hostVis);
 
     // Sort key/value buffers (32-bit packed keys — see preprocess_sort.comp)
-    sortKeysEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(sortKeysEvenBuffer_, "sort buffer",
         (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
-    sortKeysOddBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(sortKeysOddBuffer_, "sort buffer",
         (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
-    sortValsEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(sortValsEvenBuffer_, "sort buffer",
         (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
-    sortValsOddBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(sortValsOddBuffer_, "sort buffer",
         (VkDeviceSize)maxSortInstances_ * 4, ssboUsage, devLocal);
 
     // Sort histogram
-    // numWorkgroups for radix sort:
-    uint32_t globalInv = (maxSortInstances_ + numRadixSortBlocksPerWG_ * 256 - 1) /
-                         (numRadixSortBlocksPerWG_ * 256);
-    numSortWorkgroups_ = globalInv;
-    if (numSortWorkgroups_ == 0) numSortWorkgroups_ = 1;
-    sortHistBuffer_ = gsCreateBuffer(device_, physDevice_,
+    // numWorkgroups for radix sort (64-bit: the sum below wraps near 2^32):
+    const uint64_t blockElems = (uint64_t)numRadixSortBlocksPerWG_ * 256u;
+    uint64_t globalInv = ((uint64_t)maxSortInstances_ + blockElems - 1) / blockElems;
+    numSortWorkgroups_ = globalInv ? (uint32_t)globalInv : 1u;
+    makeBuffer(sortHistBuffer_, "sort histogram buffer",
         (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssboUsage, devLocal);
 
     // Tile boundary
-    tileBoundaryBuffer_ = gsCreateBuffer(device_, physDevice_,
+    makeBuffer(tileBoundaryBuffer_, "tile boundary buffer",
         (VkDeviceSize)tileX_ * tileY_ * 2 * 4, ssboUsage, devLocal);
 
     // Internal render image
-    renderImage_ = gsCreateImage2D(device_, physDevice_, width_, height_,
-        VK_FORMAT_R8G8B8A8_UNORM,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    if (!failedWhat) {
+        renderImage_ = gsCreateImage2D(device_, physDevice_, width_, height_,
+            VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+        if (renderImage_.image == VK_NULL_HANDLE || renderImage_.view == VK_NULL_HANDLE) {
+            failedWhat = "render image";
+            failedBytes = (VkDeviceSize)width_ * height_ * 4;
+        }
+    }
 
     // Pre-cull silhouette coverage (#112) — ~1 texel per 16x16 render pixels,
     // 16..128 per side. Sized from the render target, not the window: the
@@ -580,14 +604,45 @@ bool GsRenderer::createBuffers()
     };
     coverageW_ = covDim(width_);
     coverageH_ = covDim(height_);
-    coverageImage_ = gsCreateImage2D(device_, physDevice_, coverageW_, coverageH_,
-        VK_FORMAT_R8_UINT,
-        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-    coverageHost_ = gsCreateBuffer(device_, physDevice_,
+    if (!failedWhat) {
+        coverageImage_ = gsCreateImage2D(device_, physDevice_, coverageW_, coverageH_,
+            VK_FORMAT_R8_UINT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        if (coverageImage_.image == VK_NULL_HANDLE || coverageImage_.view == VK_NULL_HANDLE) {
+            failedWhat = "coverage image";
+            failedBytes = (VkDeviceSize)coverageW_ * coverageH_;
+        }
+    }
+    makeBuffer(coverageHost_, "coverage readback buffer",
         (VkDeviceSize)coverageW_ * coverageH_,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+    if (failedWhat) {
+        GsBuffer* const made[] = {
+            &vertexBuffer_, &cov3DBuffer_, &uniformBuffer_, &vertexAttrBuffer_,
+            &tileOverlapBuffer_, &prefixSumPingBuffer_, &prefixSumPongBuffer_,
+            &totalSumHostBuffer_, &sortKeysEvenBuffer_, &sortKeysOddBuffer_,
+            &sortValsEvenBuffer_, &sortValsOddBuffer_, &sortHistBuffer_,
+            &tileBoundaryBuffer_, &coverageHost_,
+        };
+        for (GsBuffer* b : made) gsDestroyBuffer(device_, *b);
+        gsDestroyImage(device_, renderImage_);
+        gsDestroyImage(device_, coverageImage_);
+        coverageW_ = 0;
+        coverageH_ = 0;
+        maxSortInstances_ = 0;
+
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "not enough GPU memory for this scene: could not allocate the %s "
+                 "(%.1f MB) for %u gaussians",
+                 failedWhat, (double)failedBytes / (1024.0 * 1024.0), N);
+        lastLoadError_ = msg;
+        fprintf(stderr, "GsRenderer: %s\n", msg);
+        return false;
+    }
 
     printf("GsRenderer: buffers allocated (N=%u, sortCap=%u, hist_wg=%u)\n",
            N, maxSortInstances_, numSortWorkgroups_);
@@ -1530,6 +1585,10 @@ void GsRenderer::renderEye(VkImage swapchainImage,
     if (numInstances > maxSortInstances_) {
         vkQueueWaitIdle(queue_);  // CMD1 already wait-idled, but be explicit
         growSortBuffers(numInstances);
+        // A failed (or capped) grow keeps the old buffers. preprocess_sort
+        // already stops writing at the buffer's length, so clamp the count
+        // the radix sort and tile_boundary walk to what is actually there.
+        if (numInstances > maxSortInstances_) numInstances = maxSortInstances_;
     }
 
     if (numInstances == 0 && !transparentBg) {
@@ -2104,41 +2163,96 @@ float GsRenderer::findBestYaw(const float displayCenter[3],
 // have wait-idled the queue before invoking.
 // ═════════════════════════════════════════════════════════════════════════
 
-void GsRenderer::growSortBuffers(uint32_t requiredCapacity)
+uint64_t GsRenderer::maxSortCapacity() const
 {
-    if (requiredCapacity <= maxSortInstances_) return;
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physDevice_, &props);
+    // Each sort buffer is bound whole as one storage-buffer descriptor of
+    // 4-byte elements, so its range is the binding limit; the element count
+    // is a shader uint.
+    const uint64_t byRange = (uint64_t)props.limits.maxStorageBufferRange / 4u;
+    const uint64_t byIndex = 0xFFFFFFFFull;
+    return byRange < byIndex ? byRange : byIndex;
+}
 
-    uint32_t oldCap = maxSortInstances_;
-    // 2× headroom so we don't grow next frame on small jitter.
-    uint32_t newCap = requiredCapacity * 2;
-    uint32_t totalTiles = tileX_ * tileY_;
-    if (newCap < totalTiles) newCap = totalTiles;
+bool GsRenderer::growSortBuffers(uint32_t requiredCapacity)
+{
+    if (requiredCapacity <= maxSortInstances_) return true;
+
+    const uint32_t oldCap = maxSortInstances_;
+    // 2× headroom so we don't grow next frame on small jitter. 64-bit: the
+    // doubling wraps a uint32_t past 2^31 fragments.
+    uint64_t newCap64 = (uint64_t)requiredCapacity * 2u;
+    const uint64_t totalTiles = (uint64_t)tileX_ * tileY_;
+    if (newCap64 < totalTiles) newCap64 = totalTiles;
+    const uint64_t capLimit = maxSortCapacity();
+    if (newCap64 > capLimit) newCap64 = capLimit;
+
+    // A size that already failed this scene (or anything larger) is not
+    // retried every frame: the caller clamps to the old capacity instead.
+    if (sortGrowFailedCap_ != 0 && newCap64 >= sortGrowFailedCap_) return false;
+
+    if (newCap64 <= oldCap) {
+        // Already at the device limit; nothing larger can be bound.
+        fprintf(stderr,
+                "GsRenderer: %u tile fragments exceed the sort capacity limit (%u); "
+                "fragments past it are dropped\n",
+                requiredCapacity, oldCap);
+        sortGrowFailedCap_ = newCap64;
+        return false;
+    }
+    const uint32_t newCap = (uint32_t)newCap64;
 
     auto devLocal = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     auto ssboUsage = (VkBufferUsageFlags)(VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                                           VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 
+    // Build the new set beside the old one; swap only if all of it exists.
+    const uint64_t blockElems = (uint64_t)numRadixSortBlocksPerWG_ * 256u;
+    const uint64_t globalInv = (newCap64 + blockElems - 1) / blockElems;
+    const uint32_t newWorkgroups = globalInv ? (uint32_t)globalInv : 1u;
+
+    GsBuffer newKeysEven = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+    GsBuffer newKeysOdd = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+    GsBuffer newValsEven = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+    GsBuffer newValsOdd = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
+    GsBuffer newHist = gsCreateBuffer(device_, physDevice_,
+        (VkDeviceSize)newWorkgroups * 256 * 4, ssboUsage, devLocal);
+
+    if (newKeysEven.buffer == VK_NULL_HANDLE || newKeysOdd.buffer == VK_NULL_HANDLE ||
+        newValsEven.buffer == VK_NULL_HANDLE || newValsOdd.buffer == VK_NULL_HANDLE ||
+        newHist.buffer == VK_NULL_HANDLE) {
+        gsDestroyBuffer(device_, newKeysEven);
+        gsDestroyBuffer(device_, newKeysOdd);
+        gsDestroyBuffer(device_, newValsEven);
+        gsDestroyBuffer(device_, newValsOdd);
+        gsDestroyBuffer(device_, newHist);
+        // Logged once per failed size: sortGrowFailedCap_ only ever shrinks,
+        // and a size at or above it is not retried.
+        fprintf(stderr,
+                "GsRenderer: could not grow sort buffers %u -> %u instances (%.1f MB); "
+                "keeping %u, fragments past it are dropped\n",
+                oldCap, newCap, (double)newCap64 * 16.0 / (1024.0 * 1024.0), oldCap);
+        sortGrowFailedCap_ = newCap64;
+        return false;
+    }
+
     gsDestroyBuffer(device_, sortKeysEvenBuffer_);
     gsDestroyBuffer(device_, sortKeysOddBuffer_);
     gsDestroyBuffer(device_, sortValsEvenBuffer_);
     gsDestroyBuffer(device_, sortValsOddBuffer_);
     gsDestroyBuffer(device_, sortHistBuffer_);
-
-    sortKeysEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
-    sortKeysOddBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
-    sortValsEvenBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
-    sortValsOddBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)newCap * 4, ssboUsage, devLocal);
-
-    uint32_t globalInv = (newCap + numRadixSortBlocksPerWG_ * 256 - 1) /
-                         (numRadixSortBlocksPerWG_ * 256);
-    numSortWorkgroups_ = globalInv ? globalInv : 1;
-    sortHistBuffer_ = gsCreateBuffer(device_, physDevice_,
-        (VkDeviceSize)numSortWorkgroups_ * 256 * 4, ssboUsage, devLocal);
+    sortKeysEvenBuffer_ = newKeysEven;
+    sortKeysOddBuffer_ = newKeysOdd;
+    sortValsEvenBuffer_ = newValsEven;
+    sortValsOddBuffer_ = newValsOdd;
+    sortHistBuffer_ = newHist;
+    numSortWorkgroups_ = newWorkgroups;
 
     maxSortInstances_ = newCap;
 
@@ -2189,6 +2303,7 @@ void GsRenderer::growSortBuffers(uint32_t requiredCapacity)
                  (double)numSortWorkgroups_ * 256 * 4) / (1024.0 * 1024.0);
     printf("GsRenderer: grew sort buffers %u -> %u instances (%.1f MB total)\n",
            oldCap, newCap, mb);
+    return true;
 }
 
 // ═════════════════════════════════════════════════════════════════════════

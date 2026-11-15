@@ -11,7 +11,15 @@
 #include <cstdint>
 #include <cstddef>
 
-// Find a memory type index matching the required properties.
+// Find a memory type index matching the required properties. Returns false
+// (and leaves *outIndex alone) when none matches.
+bool gsTryFindMemoryType(VkPhysicalDevice physDevice,
+                         uint32_t typeFilter,
+                         VkMemoryPropertyFlags properties,
+                         uint32_t* outIndex);
+
+// Find a memory type index matching the required properties. Logs and
+// returns 0 when none matches; prefer gsTryFindMemoryType for new code.
 uint32_t gsFindMemoryType(VkPhysicalDevice physDevice,
                           uint32_t typeFilter,
                           VkMemoryPropertyFlags properties);
@@ -23,6 +31,8 @@ struct GsBuffer {
 };
 
 // Create a GPU buffer with the specified usage and memory properties.
+// On any failure (create, no matching memory type, allocate, bind) returns an
+// empty GsBuffer (null handles, size 0) with everything it made destroyed.
 GsBuffer gsCreateBuffer(VkDevice device,
                         VkPhysicalDevice physDevice,
                         VkDeviceSize size,
