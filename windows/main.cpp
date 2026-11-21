@@ -25,7 +25,7 @@
 #include "logging.h"
 #include "input_handler.h"
 #include "xr_session.h"
-#include "gs_renderer_select.h"   // GsActiveRenderer = compute (x64) or graphics (_M_ARM64)
+#include "gs_renderer_select.h"   // GsActiveRenderer = GsAutoRenderer: compute or graphics, chosen from the GPU at init
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"
 #include "gs_scene_fit.h"  // GsCameraRig / GsRigFlags — the photo-lifted rig
@@ -3040,8 +3040,9 @@ static void RenderThreadFunc(
                             if (hasGsScene) {
                                 // INV-4.10: every view into ONE command buffer,
                                 // ONE submit, never waited — GsAdrenoRenderer's
-                                // per-frame ring on Windows-on-ARM; a no-op
-                                // bracket on the x64 compute renderer.
+                                // per-frame ring when the graphics renderer was
+                                // chosen (tile-based GPU, e.g. Windows-on-ARM); a
+                                // no-op bracket on the compute renderer.
                                 // endFrame() precedes the swapchain release.
                                 g_gsRenderer.beginFrame();
                                 for (int eye = 0; eye < eyeCount; eye++) {
@@ -4071,8 +4072,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     {
         uint32_t renderW = xr.swapchain.width;   // Full width — mono uses entire swapchain
         uint32_t renderH = xr.swapchain.height;
-        if (!g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
-                               queueFamilyIndex, renderW, renderH)) {
+        const bool gsInitOk = g_gsRenderer.init(vkInstance, physDevice, vkDevice, graphicsQueue,
+                                                queueFamilyIndex, renderW, renderH);
+#if defined(GS_RENDERER_RUNTIME)
+        // Which of the two splat renderers this GPU got, and why (run-time
+        // selection, gs_auto_renderer.h). One line per session.
+        LOG_INFO("%s", g_gsRenderer.selectionSummary().c_str());
+#elif defined(GS_RENDERER_GRAPHICS)
+        LOG_INFO("Splat renderer: graphics (compile-time pin, GS_RENDERER=GRAPHICS)");
+#else
+        LOG_INFO("Splat renderer: compute (compile-time pin, GS_RENDERER=COMPUTE)");
+#endif
+        if (!gsInitOk) {
             LOG_WARN("3DGS renderer init failed - scene rendering will not be available");
         } else {
             // Depth-aware cursor: every load from here on (the startup one

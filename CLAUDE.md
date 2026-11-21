@@ -90,6 +90,37 @@ matrix runs in a pristine `ubuntu:<release>` container; `DebRelease` only
 attaches the asset once all three pass. Never build a release `.deb` on a newer
 host.
 
+## Splat renderer selection (Windows: run time, from the GPU)
+
+Two renderers live in `3dgs_common`: `GsRenderer` (compute compositor, for
+immediate-mode GPUs) and `GsAdrenoRenderer` (graphics pipeline, for tile-based
+GPUs). `gs_renderer_select.h` names the one a leg uses as `GsActiveRenderer`:
+
+| Leg | `GS_RENDERER` default | `GsActiveRenderer` |
+|---|---|---|
+| Windows | `AUTO` | `GsAutoRenderer` (`gs_auto_renderer.h`): picks at `init()` from `VkPhysicalDeviceProperties::vendorID`. Graphics for Qualcomm `0x5143`, Apple `0x106B`, ARM Mali `0x13B5`, Imagination `0x1010`; compute otherwise. `DXR_GS_RENDERER=compute\|graphics` overrides. |
+| macOS | `AUTO` | `GsAdrenoRenderer` (compile time) |
+| Linux | `GRAPHICS` | `GsAdrenoRenderer` (compile time) |
+| Android | n/a | `GsAdrenoRenderer`, included directly |
+
+`-DGS_RENDERER=COMPUTE|GRAPHICS` is a hard compile-time pin on every desktop leg
+and ignores `DXR_GS_RENDERER`. **Never key the Windows choice on `_M_ARM64`
+again:** the shipped exe is x64 (the x64 runtime loads in-process, so a native
+ARM64 exe is not an option) and runs emulated on Windows-on-ARM, where the GPU
+is an Adreno. With the compute renderer there the dispatches hold the GPU, the
+runtime's 60 Hz re-weave queues behind them, and head tracking plus the
+transparent-window silhouette lag the content. The app log carries one
+`Splat renderer: ... (...)` line per session; check it before reading any
+performance number.
+
+Through `GsAutoRenderer`, `renderEye`'s `transparentBg` decides the output alpha
+on both renderers (the wrapper turns on `setHonorTransparentBg` for the graphics
+one). What still differs behind the wrapper: `fitBoundsLegacy()` (percentile box
+on graphics, equal to `fitBounds()` on compute), `loadDebugScene` (compute
+only), `readSilhouetteCoverage` (on graphics it waits for every in-flight frame),
+and the Windows swapchain is not created `MUTABLE_FORMAT`, so the graphics
+renderer takes the blit + scratch + copy transfer there, not the present pass.
+
 ## Input handling
 
 Existing keyboard shortcuts are dispatched in `windows/main.cpp::WindowProc` under `WM_KEYDOWN` (around line 355). New shortcuts go there. The README documents the full list (WASD, M, F, V, L, Space, Tab, Esc, etc.).

@@ -1,9 +1,10 @@
 @echo off
 setlocal
 :: Usage: scripts\build-with-deps.bat [x64|arm64]
-:: arm64 cross-compiles the gauss-splat Windows app from an x64 host. On ARM64
-:: the renderer auto-selects the graphics pipeline (gs_renderer_select.h sees
-:: _M_ARM64 — Snapdragon-X/Windows-on-ARM is tile-based deferred). Builds into a
+:: arm64 cross-compiles the gauss-splat Windows app from an x64 host. The splat
+:: renderer is chosen at run time from the GPU on either architecture
+:: (gs_auto_renderer.h: graphics on a tile-based GPU such as the Adreno of a
+:: Snapdragon-X / Windows-on-ARM machine, compute otherwise). Builds into a
 :: separate build_arm64\ tree. NOTE: builds but will not RUN until the DisplayXR
 :: runtime + a vendor display-processor plug-in exist for ARM64 (LeiaSR is
 :: x64-only today).
