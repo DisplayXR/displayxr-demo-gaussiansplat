@@ -65,7 +65,13 @@ void main() {
     uint tiles_width = ((width + TILE_WIDTH - 1) / TILE_WIDTH);
     uint start = boundaries[(tileX + tileY * tiles_width) * 2];
     uint end   = boundaries[(tileX + tileY * tiles_width) * 2 + 1];
-    uint num_frags = end - start;
+    // Guard the subtraction: if the sort ever hands tile_boundary a
+    // mis-ordered key array, a tile can get end < start, and the unsigned
+    // difference is ~2^32 fragments. That loop (with a barrier per batch)
+    // hangs the GPU long enough to lose the device, which also takes down
+    // every other submit on the shared VkDevice (the runtime's compositor).
+    // A wrong-looking tile is recoverable; a lost device is not.
+    uint num_frags = (end > start) ? (end - start) : 0u;
     uint num_batches = (num_frags + WG_SIZE - 1) / WG_SIZE;
 
     // Out-of-bounds pixels still participate in cooperative loads + barriers
