@@ -103,11 +103,15 @@ target_link_libraries(gaussian_splatting_handle_vk_win PRIVATE
     comdlg32
 )
 
-# Splat-renderer selection (see gs_renderer_select.h). AUTO = compute on x64,
-# graphics on ARM64 (Snapdragon-X / Windows-on-ARM is tile-based deferred, so
-# the graphics path wins there). Force GRAPHICS to benchmark the TBDR path on an
-# immediate-mode desktop GPU — the gate the desktop-eval plan requires before
-# flipping any default on Windows — or COMPUTE to pin the legacy path.
+# Splat-renderer selection (see gs_renderer_select.h). AUTO = chosen at RUN
+# time from the GPU the session actually runs on (gs_auto_renderer.h): graphics
+# on a tile-based GPU (Qualcomm Adreno, i.e. Snapdragon-X / Windows-on-ARM, where
+# this x64 exe runs emulated and a compile-time _M_ARM64 test never fires),
+# compute otherwise; DXR_GS_RENDERER=compute|graphics overrides it per launch.
+# GRAPHICS / COMPUTE are hard compile-time pins that ignore the env var — force
+# GRAPHICS to benchmark the TBDR path on an immediate-mode desktop GPU (the gate
+# the desktop-eval plan requires before flipping any default on Windows), or
+# COMPUTE to pin the legacy path.
 set(GS_RENDERER "AUTO" CACHE STRING "Splat renderer: AUTO | COMPUTE | GRAPHICS")
 set_property(CACHE GS_RENDERER PROPERTY STRINGS AUTO COMPUTE GRAPHICS)
 if(GS_RENDERER STREQUAL "GRAPHICS")
@@ -125,8 +129,17 @@ if(MSVC)
     # labels rendered by sr_common's HUD.
     target_compile_options(gaussian_splatting_handle_vk_win PRIVATE /utf-8)
 
+    # /MANIFESTINPUT is resolved against the linker's working directory: the
+    # top of the build tree under Ninja, but this target's own binary dir under
+    # the Visual Studio generators (there the link used to fail unless the
+    # manifest was copied into <build>/windows by hand).
+    if(CMAKE_GENERATOR MATCHES "Visual Studio")
+        set(_manifest_base "${CMAKE_CURRENT_BINARY_DIR}")
+    else()
+        set(_manifest_base "${CMAKE_BINARY_DIR}")
+    endif()
     file(RELATIVE_PATH _manifest_rel
-        "${CMAKE_BINARY_DIR}"
+        "${_manifest_base}"
         "${CMAKE_CURRENT_SOURCE_DIR}/sr_3dgs_openxr_ext_vk.manifest")
     set_target_properties(gaussian_splatting_handle_vk_win PROPERTIES
         LINK_FLAGS "/MANIFEST:EMBED /MANIFESTINPUT:${_manifest_rel}"

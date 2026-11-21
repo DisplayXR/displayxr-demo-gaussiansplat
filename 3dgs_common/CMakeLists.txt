@@ -171,7 +171,8 @@ set(SHADER_SOURCES
     shaders/tile_boundary.comp
     shaders/render.comp
     # Graphics pipeline (GsAdrenoRenderer) — TBDR path, also built on desktop so
-    # the renderer is selectable at compile time (gs_renderer_select.h). The
+    # the renderer is selectable at compile time (gs_renderer_select.h) or at
+    # run time from the GPU vendor (gs_auto_renderer.h, the Windows default). The
     # glslangValidator loop infers stage from extension, so .vert/.frag here
     # compile the same way (header splat.vert.h, var splat_vert_data, etc.).
     # precomp_cov3d/hist/sort are shared with the compute path above.
@@ -239,6 +240,8 @@ add_library(gs_renderer STATIC
     gs_adreno_renderer.h
     gs_adreno_renderer.cpp
     gs_renderer_select.h
+    gs_auto_renderer.h
+    gs_auto_renderer.cpp
     gs_perf_knobs.h
     gs_perf_knobs.cpp
     gs_scene_loader.h

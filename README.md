@@ -539,11 +539,24 @@ file path, the Open dialog, drag-and-drop) loads normally.
 
 Every renderer-side performance lever is an **environment variable**, read once
 when the renderer initialises, on all four platforms and on both splat
-renderers (`GsRenderer`, the compute compositor used on x86 Windows, and
-`GsAdrenoRenderer`, the graphics/TBDR path used on Linux, Android, Apple
-Silicon and Windows-on-ARM). They are environment variables and not
-command-line flags so they can never collide with the viewer's scene/URL
-argument parsing.
+renderers (`GsRenderer`, the compute compositor used on Windows with an
+immediate-mode GPU, and `GsAdrenoRenderer`, the graphics/TBDR path used on
+Linux, Android, Apple Silicon and Windows-on-ARM). They are environment
+variables and not command-line flags so they can never collide with the
+viewer's scene/URL argument parsing.
+
+> **Which renderer on Windows.** Chosen at **run time from the GPU**, not from
+> the CPU architecture the exe was built for: the graphics renderer on a
+> tile-based GPU (Vulkan `vendorID` Qualcomm `0x5143`, Apple `0x106B`, ARM Mali
+> `0x13B5`, Imagination `0x1010`), the compute renderer otherwise. The shipped
+> exe is x64 and runs emulated on a Snapdragon (Windows-on-ARM) machine, where a
+> compile-time choice gave the Adreno the compute path: its dispatches held the
+> GPU, the runtime's 60 Hz re-weave queued behind them, and head tracking and
+> the transparent-window silhouette lagged the content. Override per launch with
+> `DXR_GS_RENDERER=compute|graphics`; pin at configure time with
+> `-DGS_RENDERER=COMPUTE|GRAPHICS` (a pinned build ignores the variable). The
+> app log has one `Splat renderer: graphics|compute (...)` line per session
+> naming the GPU and the reason.
 
 > **Which renderer on Linux.** The Linux leg defaults to **GRAPHICS**
 > (`GsAdrenoRenderer`), set by `GS_RENDERER` in `linux/CMakeLists.txt` — not
