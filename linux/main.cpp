@@ -729,6 +729,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     xrEnumerateInstanceExtensionProperties(nullptr, extCount, &extCount, exts.data());
 
     bool hasVulkan = false;
+    bool hasWorkspaceInput = false;
     for (const auto& ext : exts) {
         if (strcmp(ext.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0) hasVulkan = true;
         if (strcmp(ext.extensionName, XR_DXR_DISPLAY_INFO_EXTENSION_NAME) == 0) xr.hasDisplayInfoExt = true;
@@ -739,6 +740,7 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
         if (strcmp(ext.extensionName, XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME) == 0) xr.hasXlibBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0) xr.hasWaylandBindingExt = true;
         if (strcmp(ext.extensionName, XR_DXR_WEAVE_EXTENSION_NAME) == 0) xr.hasWeaveExt = true;
+        if (strcmp(ext.extensionName, XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME) == 0) hasWorkspaceInput = true;
         if (strcmp(ext.extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
             xr.hasDepthBudgetExt = true;
             xr.depthBudgetExtVersion = ext.extensionVersion;
@@ -783,6 +785,14 @@ static bool InitializeOpenXR(AppXrSession& xr, DxrWindowBackend requestedBackend
     } else {
         LOG_INFO("XR_DXR_weave: NOT FOUND — window drags will not be phase-snapped");
     }
+    // XR_DXR_workspace_client_input: inside the DisplayXR workspace the window
+    // is hidden and the service owns the pointer and keyboard; this lets the
+    // window helper drain the app's routed share and deliver it as ordinary
+    // window events (displayxr-common's DxrLinuxWindow, armed by
+    // attach_session). A no-op outside a workspace, so enable it whenever the
+    // runtime advertises it.
+    if (hasWorkspaceInput) enabled.push_back(XR_DXR_WORKSPACE_CLIENT_INPUT_EXTENSION_NAME);
+    LOG_INFO("XR_DXR_workspace_client_input: %s", hasWorkspaceInput ? "ENABLED" : "NOT FOUND");
 
     XrInstanceCreateInfo ci = {XR_TYPE_INSTANCE_CREATE_INFO};
     strncpy(ci.applicationInfo.applicationName, "SR3DGSOpenXRExtLinux",
