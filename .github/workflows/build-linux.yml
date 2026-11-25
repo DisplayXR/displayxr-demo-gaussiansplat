@@ -169,6 +169,12 @@ jobs:
           test -x build/linux/gaussian_splatting_handle_vk_linux || {
             echo "::error::gaussian_splatting_handle_vk_linux was not produced"; exit 1; }
 
+      # PLY loader unit test (3dgs_common/gs_ply_loader_test.cpp): synthetic
+      # PLYs in every accepted layout + the refusals. CPU-only, no display.
+      - name: PLY loader unit test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/3dgs_common/gs_ply_loader_test
+
   # Aggregate context. The main-protection ruleset requires the check "Build
   # Linux"; the matrix legs report as "Build (Ubuntu <lts>)", so this job keeps
   # the required context reporting and green only when EVERY leg passed. (The
