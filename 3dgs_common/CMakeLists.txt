@@ -299,6 +299,20 @@ if(NOT ANDROID)
         )
     endif()
 
+    # gs_ply_loader_test: unit test for ParsePlyFile (gs_scene_loader.cpp).
+    # Writes tiny synthetic PLYs (standard 62-float, degree-0 14-float, degree
+    # 1/2, unknown extra properties, refusals) to the temp dir and checks the
+    # decode. Compiles the loader directly — no Vulkan, no GPU. CI runs it on
+    # Linux (build-linux.yml); exit code 0 = pass.
+    add_executable(gs_ply_loader_test gs_ply_loader_test.cpp gs_scene_loader.cpp)
+    target_include_directories(gs_ply_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(gs_ply_loader_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    if(MSVC)
+        set_target_properties(gs_ply_loader_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+
     # gs_raycast_probe: build + per-frame cost of the cursor ray cast
     # (gs_raycast.h) on real assets, checked against a brute-force composite.
     add_executable(gs_raycast_probe gs_raycast_probe.cpp)

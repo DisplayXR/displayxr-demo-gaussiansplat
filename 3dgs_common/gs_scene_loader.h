@@ -114,10 +114,17 @@ struct GsSceneCamera {
 // Parse a binary PLY file and return GPU-ready vertices.
 // Applies: sigmoid(opacity), exp(scale), normalize(rotation), SH de-interleave.
 //
-// Accepts exactly one layout: `format binary_little_endian 1.0` with the vertex
-// element first and holding the 62 float properties of the standard 3DGS
-// export, in order (x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity scale_0..2
-// rot_0..3). Anything else is refused with a message naming what was found.
+// Accepts `format binary_little_endian 1.0` with the vertex element first. The
+// vertex properties are matched BY NAME, in any order:
+//   required (float): x y z f_dc_0..2 opacity scale_0..2 rot_0..3
+//   optional (float): f_rest_0..N-1 with N = 9 / 24 / 45 (SH degree 1 / 2 / 3);
+//                     absent = degree 0, the higher-order SH are zero
+//   ignored:          nx ny nz and any other scalar property (stepped over)
+// The standard 62-float export (x y z nx ny nz f_dc_0..2 f_rest_0..44 opacity
+// scale_0..2 rot_0..3) is bulk-read; e.g. the 14-float degree-0 layout the
+// DisplayXR conversion provider writes is decoded per record. A missing
+// required property, a list property, or an f_rest count that is not a whole
+// SH degree is refused with a message naming the property.
 // The vertex count must be <= 100M and fit in the bytes after the header
 // before anything is allocated. Never throws.
 //
