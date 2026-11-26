@@ -28,6 +28,7 @@
 #include "gs_renderer_select.h"   // GsActiveRenderer = GsAutoRenderer: compute or graphics, chosen from the GPU at init
 #include "gs_scene_loader.h"
 #include "gs_camera_rig.h"
+#include "gs_rest_anchor.h"  // the rig's rest anchor, relative to the canvas (#162)
 #include "gs_scene_fit.h"  // GsCameraRig / GsRigFlags — the photo-lifted rig
 #include "display3d_view.h"
 #include "view_rig_math.h"
@@ -2359,10 +2360,11 @@ static void RenderThreadFunc(
                             // camera's own frame, so the rest eye lands back on the capture
                             // camera. See g_camRigRestEyeXY.
                             if (g_camRigRestOffValid) {
+                                float pose[2], tanUnused[2];
+                                GsRestCancellation(g_camRigRestOffC[0], g_camRigRestOffC[1], true,
+                                                   g_camRigRestPoseGain, 0.0f, 0.0f, pose, tanUnused);
                                 float ox, oy, oz;
-                                quat_rotate_vec3(cameraPose.orientation,
-                                                 -g_camRigRestPoseGain * g_camRigRestOffC[0],
-                                                 -g_camRigRestPoseGain * g_camRigRestOffC[1], 0.0f,
+                                quat_rotate_vec3(cameraPose.orientation, pose[0], pose[1], 0.0f,
                                                  &ox, &oy, &oz);
                                 rigPos[0] += ox; rigPos[1] += oy; rigPos[2] += oz;
                             }
@@ -2663,18 +2665,16 @@ static void RenderThreadFunc(
                                     const float restEyeX = g_camRigRestEyeKnown ? g_camRigRestEyeXY[0] : xr->nominalViewerX;
                                     const float restEyeY = g_camRigRestEyeKnown ? g_camRigRestEyeXY[1] : xr->nominalViewerY;
                                     const XrRect2Di& cr = viewRigRaw.canvasRectPx;
-                                    if (cr.extent.width > 0 && cr.extent.height > 0 &&
-                                        xr->displayPixelWidth > 0 && xr->displayPixelHeight > 0) {
-                                        // Canvas centre in display space: metres, origin at the panel centre,
-                                        // +x right, +y up (pixels run down).
-                                        const float cxPx = (float)cr.offset.x + 0.5f * (float)cr.extent.width;
-                                        const float cyPx = (float)cr.offset.y + 0.5f * (float)cr.extent.height;
-                                        const float canvasCx = (cxPx / (float)xr->displayPixelWidth - 0.5f) * xr->displayWidthM;
-                                        const float canvasCy = (0.5f - cyPx / (float)xr->displayPixelHeight) * xr->displayHeightM;
-                                        const float offX = restEyeX - canvasCx;
-                                        const float offY = restEyeY - canvasCy;
-                                        const float off2 = offX * offX + offY * offY;
-                                        if (untracked && eyeCount > 0 && off2 > 1.0e-4f) {
+                                    // Canvas centre in display space (metres, origin at the panel centre,
+                                    // +x right, +y up) and the rest eye's offset from it: one shared
+                                    // definition for all three platforms, 3dgs_common/gs_rest_anchor.h.
+                                    float offX = 0.0f, offY = 0.0f, canvasCx = 0.0f, canvasCy = 0.0f;
+                                    if (GsRestOffsetFromCanvas(restEyeX, restEyeY, cr.offset.x, cr.offset.y,
+                                                               cr.extent.width, cr.extent.height,
+                                                               xr->displayPixelWidth, xr->displayPixelHeight,
+                                                               xr->displayWidthM, xr->displayHeightM,
+                                                               &offX, &offY, &canvasCx, &canvasCy)) {
+                                        if (untracked && eyeCount > 0) {
                                             // Mean frustum centre and mean eye displacement over the views (the
                                             // per-eye stereo terms cancel in the mean), the latter in the
                                             // camera's own frame.
@@ -2694,32 +2694,36 @@ static void RenderThreadFunc(
                                             float lx, ly, lz;
                                             quat_rotate_vec3(conj, px, py, pz, &lx, &ly, &lz);
                                             (void)lz;
-                                            const float poseGain = (lx * offX + ly * offY) / off2;
-                                            const float tanGain  = (tu * offX + tv * offY) / off2;
-                                            if (!g_camRigRestSampled ||
-                                                fabsf(poseGain - g_camRigRestPoseGain) > 0.02f ||
-                                                fabsf(tanGain - g_camRigRestTanGain) > 0.005f) {
-                                                LOG_INFO("Camera rig rest anchor: rest eye=(%.4f, %.4f) m, canvas centre="
-                                                         "(%.4f, %.4f) m [%dx%d px at %d,%d] -> offset (%.4f, %.4f) m; "
-                                                         "rig moves the eye %.4f m/m and shears the frustum %.5f tan/m; "
-                                                         "both cancelled so the rest view is the capture camera",
-                                                         restEyeX, restEyeY, canvasCx, canvasCy,
-                                                         cr.extent.width, cr.extent.height, cr.offset.x, cr.offset.y,
-                                                         offX, offY, poseGain, tanGain);
+                                            float poseGain = 0.0f, tanGain = 0.0f;
+                                            if (GsRestGainsFromLocate(offX, offY, lx, ly, tu, tv,
+                                                                      &poseGain, &tanGain)) {
+                                                if (!g_camRigRestSampled ||
+                                                    fabsf(poseGain - g_camRigRestPoseGain) > 0.02f ||
+                                                    fabsf(tanGain - g_camRigRestTanGain) > 0.005f) {
+                                                    LOG_INFO("Camera rig rest anchor: rest eye=(%.4f, %.4f) m, canvas centre="
+                                                             "(%.4f, %.4f) m [%dx%d px at %d,%d] -> offset (%.4f, %.4f) m; "
+                                                             "rig moves the eye %.4f m/m and shears the frustum %.5f tan/m; "
+                                                             "both cancelled so the rest view is the capture camera",
+                                                             restEyeX, restEyeY, canvasCx, canvasCy,
+                                                             cr.extent.width, cr.extent.height, cr.offset.x, cr.offset.y,
+                                                             offX, offY, poseGain, tanGain);
+                                                }
+                                                g_camRigRestPoseGain = poseGain;
+                                                g_camRigRestTanGain = tanGain;
+                                                g_camRigRestSampled = true;
                                             }
-                                            g_camRigRestPoseGain = poseGain;
-                                            g_camRigRestTanGain = tanGain;
-                                            g_camRigRestSampled = true;
                                         }
                                         g_camRigRestOffC[0] = offX;
                                         g_camRigRestOffC[1] = offY;
                                         g_camRigRestOffValid = true;
                                         // Until a gain was measured: the rig shears by the offset over the
                                         // convergence distance (what an off-axis window at that distance does).
-                                        const float tanGainNow = g_camRigRestSampled ? g_camRigRestTanGain
-                                                                                     : -g_camRig.ConvergenceDiopters();
-                                        camShiftU -= tanGainNow * offX;
-                                        camShiftV -= tanGainNow * offY;
+                                        float poseUnused[2], tanD[2];
+                                        GsRestCancellation(offX, offY, g_camRigRestSampled, g_camRigRestPoseGain,
+                                                           g_camRigRestTanGain, g_camRig.ConvergenceDiopters(),
+                                                           poseUnused, tanD);
+                                        camShiftU += tanD[0];
+                                        camShiftV += tanD[1];
                                     }
                                 }
 
