@@ -175,6 +175,12 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: ./build/3dgs_common/gs_ply_loader_test
 
+      # Camera-rig rest anchor math (3dgs_common/gs_rest_anchor_test.cpp, #162):
+      # the rest eye's offset from the CURRENT canvas centre. CPU-only.
+      - name: Rest anchor unit test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ./build/3dgs_common/gs_rest_anchor_test
+
   # Aggregate context. The main-protection ruleset requires the check "Build
   # Linux"; the matrix legs report as "Build (Ubuntu <lts>)", so this job keeps
   # the required context reporting and green only when EVERY leg passed. (The
