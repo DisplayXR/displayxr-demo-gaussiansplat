@@ -370,6 +370,42 @@ static bool  g_camRigRestOffValid = false;          //!< the canvas rect is know
 static float g_camRigRestPoseGain = 1.0f;           //!< rig eye displacement per metre of that offset
 static float g_camRigRestTanGain  = 0.0f;           //!< rig frustum-centre tangent per metre of that offset
 
+// ── Camera-rig zoom and window shape ────────────────────────────────────────
+// Same behaviour as the gallery's Spatial View (@displayxr/inline3d, `zoom:
+// { min: 1, max: 2, relax: true }`): the wheel SCALES THE SCENE ABOUT THE FOCUS,
+// never the lens, between 1x and 2x, and it eases back to 1x once the wheel has
+// been idle. "A peek, not a navigation": below 1x a photo-lifted cloud shows its
+// edges, and it has no support far from the capture camera.
+//
+// Scaling the scene by z about the pivot is the same picture as shrinking the
+// RIG by 1/z about it: the camera moves to pivot/z, the eye separation and the
+// head-motion gain divide by z, the convergence distance divides by z, and the
+// field of view does not change. That is what is declared to the runtime, so
+// the splats themselves are never rescaled.
+constexpr float  kGsCameraRigZoomMin = 1.0f;
+constexpr float  kGsCameraRigZoomMax = 2.0f;
+constexpr double kGsCameraRigZoomIdleSec = 0.150;    //!< no wheel for this long = gesture over
+constexpr float  kGsCameraRigZoomTauDragSec = 0.2f;  //!< easing toward the wheel's target
+constexpr float  kGsCameraRigZoomTauRestSec = 0.6f;  //!< easing of the relax (the orbit's)
+constexpr float  kGsCameraRigZoomRelaxMinRate = 0.025f;  //!< log-zoom per second floor, so it lands
+static std::atomic<float>  g_camRigZoomTarget{1.0f};   //!< where the wheel asked to be
+static std::atomic<float>  g_camRigZoomCur{1.0f};      //!< eased value, render thread writes
+static std::atomic<bool>   g_camRigZoomRelaxing{false};
+static std::atomic<double> g_camRigZoomLastWheelSec{-1.0e9};
+//! Photo size of a camera-rig scene that the window has not been shaped to yet
+//! (width << 16 | height; 0 = nothing pending). Set where the scene is framed,
+//! posted to the window thread by the render loop.
+static std::atomic<uint32_t> g_camRigAspectPending{0};
+static const UINT kPhotoAspectMsg = WM_APP + 0x34;
+
+static inline double GsSteadyNowSec() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+static inline float GsClampCameraRigZoom(float z) {
+    if (!(z > kGsCameraRigZoomMin)) return kGsCameraRigZoomMin;
+    return (z < kGsCameraRigZoomMax) ? z : kGsCameraRigZoomMax;
+}
+
 // #100 v2: world-space content AABB for the XR_DXR_depth_budget content-bounds
 // ROI (XrContentBoundsDXR). GsRenderer::getSceneBBox() is an O(N) scan over
 // every splat, so it is cached once per load (CacheSceneAabbForContentRoi_locked,
@@ -714,6 +750,13 @@ static void ApplyRigForLoadedScene_locked() {
             // must re-sample it rather than inherit the previous scene's.
             g_camRigRestSampled = false;
             g_camRigRestOffValid = false;
+            g_camRigZoomTarget.store(1.0f);
+            g_camRigZoomCur.store(1.0f);
+            g_camRigZoomRelaxing.store(false);
+            if (g_camRig.width > 0 && g_camRig.height > 0 &&
+                g_camRig.width < 65536 && g_camRig.height < 65536) {
+                g_camRigAspectPending.store(((uint32_t)g_camRig.width << 16) | (uint32_t)g_camRig.height);
+            }
             g_camRigRestPoseGain = 1.0f;
             g_camRigRestTanGain = 0.0f;
 
@@ -1583,7 +1626,23 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const bool  wasDragging = g_inputState.dragging;
         const float yawBeforeInput = g_inputState.yaw;
         const float pitchBeforeInput = g_inputState.pitch;
+        const float scaleBeforeInput = g_inputState.viewParams.scaleFactor;
         UpdateInputState(g_inputState, msg, wParam, lParam);
+        if (msg == WM_MOUSEWHEEL && g_cameraRigActive.load(std::memory_order_relaxed)) {
+            // The shared handler multiplied scaleFactor (plain wheel only; the
+            // modified wheels drive other knobs and leave it alone). Take that
+            // ratio as the camera rig's zoom step and put scaleFactor back: it is
+            // the display rig's zoom and must not carry over to the next scene.
+            const float after = g_inputState.viewParams.scaleFactor;
+            if (scaleBeforeInput > 0.0f && after > 0.0f && after != scaleBeforeInput) {
+                const float from = g_camRigZoomRelaxing.load() ? g_camRigZoomCur.load()
+                                                               : g_camRigZoomTarget.load();
+                g_camRigZoomTarget.store(GsClampCameraRigZoom(from * (after / scaleBeforeInput)));
+                g_camRigZoomRelaxing.store(false);
+                g_camRigZoomLastWheelSec.store(GsSteadyNowSec());
+                g_inputState.viewParams.scaleFactor = scaleBeforeInput;
+            }
+        }
         if (msg == WM_MOUSEMOVE && wasDragging &&
             g_cameraRigActive.load(std::memory_order_relaxed)) {
             const float vw = (g_windowWidth > 1u) ? (float)g_windowWidth : 1.0f;
@@ -1635,6 +1694,53 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_borderless.load()) return HTCLIENT;
         break;
 
+    case kPhotoAspectMsg: {
+        // A camera-rig scene was framed: give the window the photo's shape, so
+        // the rest view is the whole photo and not a crop of it. Same area as
+        // the window has now, inside the monitor's work area. Only for a plain
+        // visible window: never in fullscreen or maximised, never when the
+        // launch named its own rect, never borderless or hidden (a workspace
+        // owns those), and never again after this (a later user resize stays).
+        const int photoW = (int)wParam, photoH = (int)lParam;
+        const LONG style = GetWindowLong(hwnd, GWL_STYLE);
+        if (photoW <= 0 || photoH <= 0 || g_fullscreen || g_launch.hasRect ||
+            g_borderless.load() || IsZoomed(hwnd) || IsIconic(hwnd) ||
+            (style & WS_VISIBLE) == 0 || (style & WS_POPUP) != 0) {
+            return 0;
+        }
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        const double area = (double)(client.right - client.left) * (double)(client.bottom - client.top);
+        if (area < 1.0) return 0;
+        const double aspect = (double)photoW / (double)photoH;
+        double newW = sqrt(area * aspect), newH = newW / aspect;
+        MONITORINFO mi = { sizeof(mi) };
+        GetMonitorInfo(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
+        RECT frame = {0, 0, 0, 0};
+        AdjustWindowRectEx(&frame, (DWORD)style, FALSE, (DWORD)GetWindowLong(hwnd, GWL_EXSTYLE));
+        const double padW = (double)(frame.right - frame.left), padH = (double)(frame.bottom - frame.top);
+        const double maxW = 0.9 * (double)(mi.rcWork.right - mi.rcWork.left) - padW;
+        const double maxH = 0.9 * (double)(mi.rcWork.bottom - mi.rcWork.top) - padH;
+        if (maxW > 16.0 && newW > maxW) { newW = maxW; newH = newW / aspect; }
+        if (maxH > 16.0 && newH > maxH) { newH = maxH; newW = newH * aspect; }
+        const int cw = (int)(newW + 0.5), ch = (int)(newH + 0.5);
+        if (abs(cw - (int)(client.right - client.left)) < 2 && abs(ch - (int)(client.bottom - client.top)) < 2) {
+            return 0;
+        }
+        RECT outer{};
+        GetWindowRect(hwnd, &outer);
+        const int ow = cw + (int)padW, oh = ch + (int)padH;
+        int ox = outer.left, oy = outer.top;
+        if (ox + ow > mi.rcWork.right) ox = mi.rcWork.right - ow;
+        if (oy + oh > mi.rcWork.bottom) oy = mi.rcWork.bottom - oh;
+        if (ox < mi.rcWork.left) ox = mi.rcWork.left;
+        if (oy < mi.rcWork.top) oy = mi.rcWork.top;
+        SetWindowPos(hwnd, nullptr, ox, oy, ow, oh, SWP_NOZORDER | SWP_NOACTIVATE);
+        LOG_INFO("Camera rig window: shaped to the photo's %dx%d (aspect %.4f): client %dx%d -> %dx%d",
+                 photoW, photoH, aspect, (int)(client.right - client.left),
+                 (int)(client.bottom - client.top), cw, ch);
+        return 0;
+    }
     case kBorderlessMsg: {
         // Ctrl+T style swap on the window-owning thread; client rect
         // preserved (the avatar recipe). Shaping follows on the render
@@ -2192,6 +2298,9 @@ static void RenderThreadFunc(
             inputSnapshot.yaw = 0.0f;
             inputSnapshot.pitch = 0.0f;
             inputSnapshot.viewParams.scaleFactor = 1.0f;
+            g_camRigZoomTarget.store(1.0f);
+            g_camRigZoomCur.store(1.0f);
+            g_camRigZoomRelaxing.store(false);
             renderPitch = 0.0f;
         } else if (resetRequested && g_fitValid.load()) {
             inputSnapshot.cameraPosX = g_fitCenter[0];
@@ -2347,6 +2456,50 @@ static void RenderThreadFunc(
                              xr->currentModeIndex < xr->renderingModeCount)
                                 ? !xr->renderingModeDisplay3D[xr->currentModeIndex]
                                 : false;
+                        if (g_appWindow != nullptr) {
+                            const uint32_t shape = g_camRigAspectPending.exchange(0);
+                            if (shape != 0) {
+                                PostMessage(g_appWindow, kPhotoAspectMsg, (WPARAM)(shape >> 16),
+                                            (LPARAM)(shape & 0xFFFFu));
+                            }
+                        }
+                        // Camera-rig zoom for this frame: eased toward the wheel's target,
+                        // relaxing to 1x once the wheel has been idle (see the constants).
+                        float camZoom = 1.0f;
+                        {
+                            static double s_zoomLastSec = GsSteadyNowSec();
+                            const double nowSec = GsSteadyNowSec();
+                            float dt = (float)(nowSec - s_zoomLastSec);
+                            s_zoomLastSec = nowSec;
+                            if (dt < 0.0f) dt = 0.0f;
+                            if (dt > 0.1f) dt = 0.1f;
+                            if (camRig) {
+                                float tgt = g_camRigZoomTarget.load();
+                                if (tgt != 1.0f &&
+                                    nowSec - g_camRigZoomLastWheelSec.load() > kGsCameraRigZoomIdleSec) {
+                                    g_camRigZoomTarget.store(1.0f);
+                                    g_camRigZoomRelaxing.store(true);
+                                    tgt = 1.0f;
+                                }
+                                float cur = g_camRigZoomCur.load();
+                                if (cur < kGsCameraRigZoomMin) cur = kGsCameraRigZoomMin;
+                                const float gap = logf(tgt / cur);
+                                if (fabsf(gap) < 1.0e-4f) {
+                                    cur = tgt;
+                                    g_camRigZoomRelaxing.store(false);
+                                } else if (g_camRigZoomRelaxing.load()) {
+                                    const float ko = 1.0f - expf(-dt / kGsCameraRigZoomTauRestSec);
+                                    float step = fabsf(gap) * ko;
+                                    if (step < kGsCameraRigZoomRelaxMinRate * dt) step = kGsCameraRigZoomRelaxMinRate * dt;
+                                    if (step > fabsf(gap)) step = fabsf(gap);
+                                    cur *= expf((gap > 0.0f ? 1.0f : -1.0f) * step);
+                                } else {
+                                    cur *= expf(gap * (1.0f - expf(-dt / kGsCameraRigZoomTauDragSec)));
+                                }
+                                g_camRigZoomCur.store(cur);
+                                camZoom = cur;
+                            }
+                        }
                         XrPosef cameraPose;
                         if (camRig) {
                             // The HEAD CENTRE, half a baseline right of the block's `rest`
@@ -2356,13 +2509,25 @@ static void RenderThreadFunc(
                             float rigPos[3], rigRot[4];
                             g_camRig.RigPose(camMonoMode, rigPos, rigRot);
                             cameraPose.orientation = {rigRot[0], rigRot[1], rigRot[2], rigRot[3]};
+                            // Zoom: the rig shrinks about the focus, so the camera moves
+                            // toward it and stops at pivot / zoom.
+                            if (camZoom != 1.0f) {
+                                const XrQuaternionf restQ = {g_camRig.restRotation[0], g_camRig.restRotation[1],
+                                                             g_camRig.restRotation[2], g_camRig.restRotation[3]};
+                                float fx, fy, fz;
+                                quat_rotate_vec3(restQ, g_camRig.focusLocal[0], g_camRig.focusLocal[1],
+                                                 g_camRig.focusLocal[2], &fx, &fy, &fz);
+                                const float pv[3] = {g_camRig.restPosition[0] + fx, g_camRig.restPosition[1] + fy,
+                                                     g_camRig.restPosition[2] + fz};
+                                for (int i = 0; i < 3; i++) rigPos[i] = pv[i] + (rigPos[i] - pv[i]) / camZoom;
+                            }
                             // Move the declared camera by MINUS the rest eye offset, in the
                             // camera's own frame, so the rest eye lands back on the capture
                             // camera. See g_camRigRestEyeXY.
                             if (g_camRigRestOffValid) {
                                 float pose[2], tanUnused[2];
                                 GsRestCancellation(g_camRigRestOffC[0], g_camRigRestOffC[1], true,
-                                                   g_camRigRestPoseGain, 0.0f, 0.0f, pose, tanUnused);
+                                                   g_camRigRestPoseGain / camZoom, 0.0f, 0.0f, pose, tanUnused);
                                 float ox, oy, oz;
                                 quat_rotate_vec3(cameraPose.orientation, pose[0], pose[1], 0.0f,
                                                  &ox, &oy, &oz);
@@ -2406,9 +2571,9 @@ static void RenderThreadFunc(
                             // metric.
                             camRigDesc.pose = cameraPose;
                             camRigDesc.ipdFactor = g_camRig.IpdScale(g_camRigMeasuredIpdM) *
-                                                   inputSnapshot.viewParams.ipdFactor;
-                            camRigDesc.parallaxFactor = inputSnapshot.viewParams.parallaxFactor;
-                            camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters();
+                                                   inputSnapshot.viewParams.ipdFactor / camZoom;
+                            camRigDesc.parallaxFactor = inputSnapshot.viewParams.parallaxFactor / camZoom;
+                            camRigDesc.convergenceDiopters = g_camRig.ConvergenceDiopters() * camZoom;
                             camRigDesc.verticalFov = g_camRig.VerticalFovRad(canvasAspect);
                             camRigDesc.metersToVirtual = 1.0f;
                             locateInfo.next = &camRigDesc;
@@ -2697,6 +2862,12 @@ static void RenderThreadFunc(
                                             float poseGain = 0.0f, tanGain = 0.0f;
                                             if (GsRestGainsFromLocate(offX, offY, lx, ly, tu, tv,
                                                                       &poseGain, &tanGain)) {
+                                                // The eye displacement follows the eye gain, which the
+                                                // zoom divides: keep it as its 1x value. The frustum
+                                                // shear is that displacement over the convergence
+                                                // distance, which shrinks by the same factor, so it
+                                                // does not change with zoom.
+                                                poseGain *= camZoom;
                                                 if (!g_camRigRestSampled ||
                                                     fabsf(poseGain - g_camRigRestPoseGain) > 0.02f ||
                                                     fabsf(tanGain - g_camRigRestTanGain) > 0.005f) {
@@ -2789,7 +2960,7 @@ static void RenderThreadFunc(
                                     // near:far ratio costs no precision. Transparent mode still
                                     // clips at the ZDP, which here is the pivot.
                                     clip.near_z = kGsCameraRigNearM;
-                                    clip.far_z  = g_transparentBg.load() ? g_camRig.pivotM
+                                    clip.far_z  = g_transparentBg.load() ? g_camRig.pivotM / camZoom
                                                                          : kGsCameraRigFarM;
                                     if (clip.far_z < clip.near_z + 1.0e-4f)
                                         clip.far_z = clip.near_z + 1.0e-4f;
@@ -2822,7 +2993,7 @@ static void RenderThreadFunc(
                                 // ZDP depth (pick/transparent). On the camera rig the plane
                                 // that stays put is the pivot, not a virtual display.
                                 stereoViews[eye].eye_display = {0.0f, 0.0f,
-                                    camRig ? g_camRig.pivotM : ez};
+                                    camRig ? g_camRig.pivotM / camZoom : ez};
                                 stereoViews[eye].near_z = clip.near_z;
                                 stereoViews[eye].far_z = clip.far_z;
                                 stereoClipFar[eye] = clip.clipFar;
