@@ -67,7 +67,7 @@ FetchContent_Declare(
     # gtk_shell1 says mutter) + the buffer_device helper in u_wayland_geom.h (#81).
     # v2.36.0: DxrLinuxWindow drains XR_DXR_workspace_client_input, so the app gets
     #   mouse + keyboard under the Linux workspace (displayxr-common#93).
-    GIT_TAG v2.36.0
+    GIT_TAG v2.36.1
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(displayxr_common)
