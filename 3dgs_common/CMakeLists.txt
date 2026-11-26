@@ -313,6 +313,19 @@ if(NOT ANDROID)
         )
     endif()
 
+    # gs_rest_anchor_test: unit test for the camera-rig rest anchor math
+    # (gs_rest_anchor.h, #162): offset of the rest eye from the CURRENT canvas
+    # centre, rig gains from an untracked locate, the cancellation. Header-only
+    # under test — no Vulkan, no OpenXR. CI runs it on Linux; exit 0 = pass.
+    add_executable(gs_rest_anchor_test gs_rest_anchor_test.cpp)
+    target_include_directories(gs_rest_anchor_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    set_target_properties(gs_rest_anchor_test PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON)
+    if(MSVC)
+        set_target_properties(gs_rest_anchor_test PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        )
+    endif()
+
     # gs_raycast_probe: build + per-frame cost of the cursor ray cast
     # (gs_raycast.h) on real assets, checked against a brute-force composite.
     add_executable(gs_raycast_probe gs_raycast_probe.cpp)
