@@ -12,9 +12,9 @@
  * two differ by tens of centimetres, and a later move or F11 left a one-shot
  * sample stale.
  *
- * Header-only and dependency-free so the platform legs (linux/main.cpp today;
- * windows/main.cpp carries the same arithmetic inline, PR #163) and the unit test
- * (gs_rest_anchor_test.cpp) share one definition.
+ * Header-only and dependency-free so the three platform legs (windows/main.cpp,
+ * linux/main.cpp, macos/main.mm) and the unit test (gs_rest_anchor_test.cpp)
+ * share one definition. Windows measured the numbers the test encodes (#163).
  *
  * Conventions: display space is metres, origin at the panel centre, +x right,
  * +y up. Canvas rects are panel pixels, origin top-left, +y down.
