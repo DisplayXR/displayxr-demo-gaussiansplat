@@ -361,9 +361,13 @@ static float g_camRigMeasuredIpdM = 0.0f;
 // Sampled rather than assumed, because the offset is a property of the panel
 // (the display processor reports it) and no two panels agree on it.
 // Render-thread only.
-static bool  g_camRigRestSampled = false;
-static float g_camRigRestEyeXY[2] = {0.0f, 0.0f};  //!< display-space x,y of the untracked centroid
-static float g_camRigRestTan[2]   = {0.0f, 0.0f};  //!< tangent centre of the untracked frustum
+static bool  g_camRigRestSampled = false;           //!< the two gains below were measured
+static float g_camRigRestEyeXY[2] = {0.0f, 0.0f};   //!< display-space x,y of the untracked eye centroid
+static bool  g_camRigRestEyeKnown = false;          //!< an untracked centroid was seen (else: nominal viewer)
+static float g_camRigRestOffC[2]  = {0.0f, 0.0f};   //!< rest eye minus the CURRENT canvas centre, metres (#162)
+static bool  g_camRigRestOffValid = false;          //!< the canvas rect is known, so the offset is
+static float g_camRigRestPoseGain = 1.0f;           //!< rig eye displacement per metre of that offset
+static float g_camRigRestTanGain  = 0.0f;           //!< rig frustum-centre tangent per metre of that offset
 
 // #100 v2: world-space content AABB for the XR_DXR_depth_budget content-bounds
 // ROI (XrContentBoundsDXR). GsRenderer::getSceneBBox() is an O(N) scan over
@@ -708,6 +712,9 @@ static void ApplyRigForLoadedScene_locked() {
             // The rest anchor is a property of (panel, rig): a new camera rig
             // must re-sample it rather than inherit the previous scene's.
             g_camRigRestSampled = false;
+            g_camRigRestOffValid = false;
+            g_camRigRestPoseGain = 1.0f;
+            g_camRigRestTanGain = 0.0f;
 
             {
                 std::lock_guard<std::mutex> lock(g_inputMutex);
@@ -2351,10 +2358,11 @@ static void RenderThreadFunc(
                             // Move the declared camera by MINUS the rest eye offset, in the
                             // camera's own frame, so the rest eye lands back on the capture
                             // camera. See g_camRigRestEyeXY.
-                            if (g_camRigRestSampled) {
+                            if (g_camRigRestOffValid) {
                                 float ox, oy, oz;
                                 quat_rotate_vec3(cameraPose.orientation,
-                                                 -g_camRigRestEyeXY[0], -g_camRigRestEyeXY[1], 0.0f,
+                                                 -g_camRigRestPoseGain * g_camRigRestOffC[0],
+                                                 -g_camRigRestPoseGain * g_camRigRestOffC[1], 0.0f,
                                                  &ox, &oy, &oz);
                                 rigPos[0] += ox; rigPos[1] += oy; rigPos[2] += oz;
                             }
@@ -2625,37 +2633,95 @@ static void RenderThreadFunc(
                             float camShiftU = 0.0f, camShiftV = 0.0f;
                             if (camRig) {
                                 g_camRig.PrincipalShiftTan(camShiftU, camShiftV);
-                                // Sample the rest anchor once, on an UNTRACKED frame: the
-                                // eye centroid the panel reports with no lock, and the
-                                // frustum centre the rig produced from it. Both are then
-                                // cancelled below and in the pose. (Untracked only —
-                                // sampling a tracked frame would bake a real head position
-                                // in as if it were the rest.)
-                                if (!g_camRigRestSampled && eyeCount > 0 &&
-                                    viewRigRaw.isTracking != XR_TRUE) {
-                                    float sx = 0.0f, sy = 0.0f;
-                                    uint32_t n = 0;
-                                    for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
-                                        sx += viewRigRaw.rawEyes[v].x;
-                                        sy += viewRigRaw.rawEyes[v].y;
-                                        n++;
-                                    }
-                                    if (n > 0) {
+                                // The rest anchor, relative to the CANVAS. XrCameraRigDXR measures the eye
+                                // from the canvas centre ("the canvas-centre eye (0, 0, N) maps here"), so
+                                // what has to be cancelled is the rest eye's offset from the centre of the
+                                // window as it sits on the panel NOW: not its display-space position, and
+                                // not a value sampled once at launch (#162: with the window in a corner of
+                                // a large panel the two differ by tens of centimetres, and the rest view
+                                // slid sideways off the photo; a later move or F11 left it stale).
+                                //
+                                // The rest eye is the untracked centroid (kept across tracked frames), or
+                                // the display's nominal viewer until one was seen. The two gains (how far
+                                // the rig moves the eye, and how far it shears the frustum, per metre of
+                                // that offset) are properties of the rig, not of the window, so they are
+                                // measured on untracked frames and reused when the head is tracked.
+                                {
+                                    const bool untracked = (viewRigRaw.isTracking != XR_TRUE);
+                                    if (untracked && viewRigRaw.eyeCountOutput > 0) {
+                                        float sx = 0.0f, sy = 0.0f;
+                                        uint32_t n = 0;
+                                        for (uint32_t v = 0; v < viewRigRaw.eyeCountOutput && v < 8; v++) {
+                                            sx += viewRigRaw.rawEyes[v].x;
+                                            sy += viewRigRaw.rawEyes[v].y;
+                                            n++;
+                                        }
                                         g_camRigRestEyeXY[0] = sx / (float)n;
                                         g_camRigRestEyeXY[1] = sy / (float)n;
+                                        g_camRigRestEyeKnown = true;
                                     }
-                                    const XrFovf& f0 = srcViews[0].fov;
-                                    g_camRigRestTan[0] = 0.5f * (tanf(f0.angleRight) + tanf(f0.angleLeft));
-                                    g_camRigRestTan[1] = 0.5f * (tanf(f0.angleUp) + tanf(f0.angleDown));
-                                    g_camRigRestSampled = true;
-                                    LOG_INFO("Camera rig rest anchor: eye=(%.4f, %.4f) m, "
-                                             "frustum centre tan=(%.5f, %.5f) — cancelled so the "
-                                             "rest view is the capture camera",
-                                             g_camRigRestEyeXY[0], g_camRigRestEyeXY[1],
-                                             g_camRigRestTan[0], g_camRigRestTan[1]);
+                                    const float restEyeX = g_camRigRestEyeKnown ? g_camRigRestEyeXY[0] : xr->nominalViewerX;
+                                    const float restEyeY = g_camRigRestEyeKnown ? g_camRigRestEyeXY[1] : xr->nominalViewerY;
+                                    const XrRect2Di& cr = viewRigRaw.canvasRectPx;
+                                    if (cr.extent.width > 0 && cr.extent.height > 0 &&
+                                        xr->displayPixelWidth > 0 && xr->displayPixelHeight > 0) {
+                                        // Canvas centre in display space: metres, origin at the panel centre,
+                                        // +x right, +y up (pixels run down).
+                                        const float cxPx = (float)cr.offset.x + 0.5f * (float)cr.extent.width;
+                                        const float cyPx = (float)cr.offset.y + 0.5f * (float)cr.extent.height;
+                                        const float canvasCx = (cxPx / (float)xr->displayPixelWidth - 0.5f) * xr->displayWidthM;
+                                        const float canvasCy = (0.5f - cyPx / (float)xr->displayPixelHeight) * xr->displayHeightM;
+                                        const float offX = restEyeX - canvasCx;
+                                        const float offY = restEyeY - canvasCy;
+                                        const float off2 = offX * offX + offY * offY;
+                                        if (untracked && eyeCount > 0 && off2 > 1.0e-4f) {
+                                            // Mean frustum centre and mean eye displacement over the views (the
+                                            // per-eye stereo terms cancel in the mean), the latter in the
+                                            // camera's own frame.
+                                            float tu = 0.0f, tv = 0.0f, px = 0.0f, py = 0.0f, pz = 0.0f;
+                                            for (int e = 0; e < eyeCount; e++) {
+                                                const XrFovf& f = srcViews[e].fov;
+                                                tu += 0.5f * (tanf(f.angleRight) + tanf(f.angleLeft));
+                                                tv += 0.5f * (tanf(f.angleUp) + tanf(f.angleDown));
+                                                px += srcViews[e].pose.position.x - cameraPose.position.x;
+                                                py += srcViews[e].pose.position.y - cameraPose.position.y;
+                                                pz += srcViews[e].pose.position.z - cameraPose.position.z;
+                                            }
+                                            const float inv = 1.0f / (float)eyeCount;
+                                            tu *= inv; tv *= inv; px *= inv; py *= inv; pz *= inv;
+                                            const XrQuaternionf conj = {-cameraPose.orientation.x, -cameraPose.orientation.y,
+                                                                        -cameraPose.orientation.z, cameraPose.orientation.w};
+                                            float lx, ly, lz;
+                                            quat_rotate_vec3(conj, px, py, pz, &lx, &ly, &lz);
+                                            (void)lz;
+                                            const float poseGain = (lx * offX + ly * offY) / off2;
+                                            const float tanGain  = (tu * offX + tv * offY) / off2;
+                                            if (!g_camRigRestSampled ||
+                                                fabsf(poseGain - g_camRigRestPoseGain) > 0.02f ||
+                                                fabsf(tanGain - g_camRigRestTanGain) > 0.005f) {
+                                                LOG_INFO("Camera rig rest anchor: rest eye=(%.4f, %.4f) m, canvas centre="
+                                                         "(%.4f, %.4f) m [%dx%d px at %d,%d] -> offset (%.4f, %.4f) m; "
+                                                         "rig moves the eye %.4f m/m and shears the frustum %.5f tan/m; "
+                                                         "both cancelled so the rest view is the capture camera",
+                                                         restEyeX, restEyeY, canvasCx, canvasCy,
+                                                         cr.extent.width, cr.extent.height, cr.offset.x, cr.offset.y,
+                                                         offX, offY, poseGain, tanGain);
+                                            }
+                                            g_camRigRestPoseGain = poseGain;
+                                            g_camRigRestTanGain = tanGain;
+                                            g_camRigRestSampled = true;
+                                        }
+                                        g_camRigRestOffC[0] = offX;
+                                        g_camRigRestOffC[1] = offY;
+                                        g_camRigRestOffValid = true;
+                                        // Until a gain was measured: the rig shears by the offset over the
+                                        // convergence distance (what an off-axis window at that distance does).
+                                        const float tanGainNow = g_camRigRestSampled ? g_camRigRestTanGain
+                                                                                     : -g_camRig.ConvergenceDiopters();
+                                        camShiftU -= tanGainNow * offX;
+                                        camShiftV -= tanGainNow * offY;
+                                    }
                                 }
-                                camShiftU -= g_camRigRestTan[0];
-                                camShiftV -= g_camRigRestTan[1];
 
                                 // One-shot: what we DECLARED vs what came back. The camera
                                 // rig lives or dies on the returned frustum matching the
