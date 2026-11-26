@@ -387,6 +387,11 @@ constexpr double kGsCameraRigZoomIdleSec = 0.150;    //!< no wheel for this long
 constexpr float  kGsCameraRigZoomTauDragSec = 0.2f;  //!< easing toward the wheel's target
 constexpr float  kGsCameraRigZoomTauRestSec = 0.6f;  //!< easing of the relax (the orbit's)
 constexpr float  kGsCameraRigZoomRelaxMinRate = 0.025f;  //!< log-zoom per second floor, so it lands
+//! The drag orbit relaxes too, as the gallery's does ("tilt-and-relax"): once
+//! the button is up the scene eases back to the capture view with this time
+//! constant. Any deviation from neutral on this rig is a peek.
+constexpr float  kGsCameraRigOrbitTauRestSec = 0.6f;
+constexpr float  kGsCameraRigOrbitSnapRad = 1.7453e-4f;  //!< 0.01 deg: close enough to land
 static std::atomic<float>  g_camRigZoomTarget{1.0f};   //!< where the wheel asked to be
 static std::atomic<float>  g_camRigZoomCur{1.0f};      //!< eased value, render thread writes
 static std::atomic<bool>   g_camRigZoomRelaxing{false};
@@ -2317,6 +2322,23 @@ static void RenderThreadFunc(
             // Land any in-flight refit on the reset target so the animation
             // cannot drag the base back off it over the next frames.
             g_fitTransition.start(g_fitVHeight, g_fitVHeight, 0.0f);
+        }
+
+        // Camera rig: with the button up, the orbit eases back to neutral.
+        if (camRigActive && !resetRequested && !inputSnapshot.dragging &&
+            (inputSnapshot.yaw != 0.0f || inputSnapshot.pitch != 0.0f)) {
+            float dtRelax = perfStats.deltaTime;
+            if (dtRelax < 0.0f) dtRelax = 0.0f;
+            if (dtRelax > 0.1f) dtRelax = 0.1f;
+            const float keep = expf(-dtRelax / kGsCameraRigOrbitTauRestSec);
+            inputSnapshot.yaw *= keep;
+            inputSnapshot.pitch *= keep;
+            if (fabsf(inputSnapshot.yaw) < kGsCameraRigOrbitSnapRad &&
+                fabsf(inputSnapshot.pitch) < kGsCameraRigOrbitSnapRad) {
+                inputSnapshot.yaw = 0.0f;
+                inputSnapshot.pitch = 0.0f;
+            }
+            renderPitch = inputSnapshot.pitch;
         }
 
         {
