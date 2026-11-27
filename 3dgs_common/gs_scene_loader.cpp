@@ -16,6 +16,9 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <memory>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -107,66 +110,197 @@ bool ParsePlyCount(const std::string& token, uint64_t& out)
     return true;
 }
 
-//! Byte size of a PLY scalar type (both the classic and the sized names), or
-//! 0 for a type this loader does not know.
-size_t PlyScalarSize(const std::string& type)
+//! PLY scalar types (classic and sized names map to the same entry).
+enum class PlyType { Int8, UInt8, Int16, UInt16, Int32, UInt32, Float32, Float64 };
+
+bool ParsePlyType(const std::string& s, PlyType& t)
 {
-    if (type == "char" || type == "uchar" || type == "int8" || type == "uint8") return 1;
-    if (type == "short" || type == "ushort" || type == "int16" || type == "uint16") return 2;
-    if (type == "int" || type == "uint" || type == "int32" || type == "uint32") return 4;
-    if (type == "float" || type == "float32") return 4;
-    if (type == "double" || type == "float64") return 8;
+    if (s == "char" || s == "int8") t = PlyType::Int8;
+    else if (s == "uchar" || s == "uint8") t = PlyType::UInt8;
+    else if (s == "short" || s == "int16") t = PlyType::Int16;
+    else if (s == "ushort" || s == "uint16") t = PlyType::UInt16;
+    else if (s == "int" || s == "int32") t = PlyType::Int32;
+    else if (s == "uint" || s == "uint32") t = PlyType::UInt32;
+    else if (s == "float" || s == "float32") t = PlyType::Float32;
+    else if (s == "double" || s == "float64") t = PlyType::Float64;
+    else return false;
+    return true;
+}
+
+size_t PlyTypeSize(PlyType t)
+{
+    switch (t) {
+    case PlyType::Int8:
+    case PlyType::UInt8: return 1;
+    case PlyType::Int16:
+    case PlyType::UInt16: return 2;
+    case PlyType::Int32:
+    case PlyType::UInt32:
+    case PlyType::Float32: return 4;
+    case PlyType::Float64: return 8;
+    }
     return 0;
 }
 
-bool IsPlyFloat32(const std::string& type)
+bool PlyTypeIsInteger(PlyType t)
 {
-    return type == "float" || type == "float32";
+    return t != PlyType::Float32 && t != PlyType::Float64;
 }
 
-//! Where each property the renderer needs sits inside one vertex record, as
-//! byte offsets, plus the record stride. Built from the header BY NAME, so the
-//! property order does not matter, normals are optional, unknown scalar
-//! properties are stepped over, and the SH rest block may be absent (degree 0)
-//! or hold degree 1/2/3.
+enum class PlyFormat { Ascii, BinaryLittleEndian, BinaryBigEndian };
+
+//! One property of an element. `typeName` is kept for messages; `typeOk` is
+//! false for a type this loader does not know, which only matters if the
+//! element has to be read or stepped over (elements after the vertex block
+//! are never touched).
+struct PlyProperty {
+    std::string name;
+    std::string typeName;
+    PlyType type = PlyType::Float32;
+    bool typeOk = false;
+    bool isList = false;
+    PlyType countType = PlyType::UInt8;
+};
+
+struct PlyElement {
+    std::string name;
+    uint64_t count = 0;
+    std::vector<PlyProperty> props;
+};
+
+//! Decode one binary scalar of any PLY type, in either byte order, to double.
+double ReadPlyScalar(const unsigned char* p, PlyType t, bool swap)
+{
+    unsigned char b[8];
+    const size_t n = PlyTypeSize(t);
+    if (swap) {
+        for (size_t i = 0; i < n; i++) b[i] = p[n - 1 - i];
+    } else {
+        std::memcpy(b, p, n);
+    }
+    switch (t) {
+    case PlyType::Int8:    { int8_t v;   std::memcpy(&v, b, 1); return v; }
+    case PlyType::UInt8:   { uint8_t v;  std::memcpy(&v, b, 1); return v; }
+    case PlyType::Int16:   { int16_t v;  std::memcpy(&v, b, 2); return v; }
+    case PlyType::UInt16:  { uint16_t v; std::memcpy(&v, b, 2); return v; }
+    case PlyType::Int32:   { int32_t v;  std::memcpy(&v, b, 4); return v; }
+    case PlyType::UInt32:  { uint32_t v; std::memcpy(&v, b, 4); return v; }
+    case PlyType::Float32: { float v;    std::memcpy(&v, b, 4); return v; }
+    case PlyType::Float64: { double v;   std::memcpy(&v, b, 8); return v; }
+    }
+    return 0.0;
+}
+
+//! Whitespace-separated tokens from the ASCII body, through a fixed buffer
+//! (no unbounded line reads). A token longer than kMaxToken is an error: no
+//! number needs it.
+class PlyAsciiReader {
+public:
+    explicit PlyAsciiReader(std::istream& in) : in_(in) {}
+
+    //! False at end of data or on an over-long token (`tooLong` tells which).
+    bool Next(std::string& tok, bool& tooLong)
+    {
+        tok.clear();
+        tooLong = false;
+        int c;
+        do {
+            c = Get();
+            if (c < 0) return false;
+        } while (IsSpace(c));
+        while (c >= 0 && !IsSpace(c)) {
+            if (tok.size() >= kMaxToken) {
+                tooLong = true;
+                return false;
+            }
+            tok.push_back((char)c);
+            c = Get();
+        }
+        return true;
+    }
+
+private:
+    static constexpr size_t kMaxToken = 64;
+    static bool IsSpace(int c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; }
+    int Get()
+    {
+        if (pos_ == len_) {
+            in_.read(buf_, sizeof(buf_));
+            len_ = (size_t)in_.gcount();
+            pos_ = 0;
+            if (len_ == 0) return -1;
+        }
+        return (unsigned char)buf_[pos_++];
+    }
+    std::istream& in_;
+    char buf_[64 * 1024];
+    size_t pos_ = 0;
+    size_t len_ = 0;
+};
+
+//! Parse an ASCII number (integer or floating) in full; junk is an error.
+bool ParsePlyAsciiNumber(const std::string& tok, double& out)
+{
+    if (tok.empty()) return false;
+    char* end = nullptr;
+    out = std::strtod(tok.c_str(), &end);
+    return end != nullptr && *end == '\0';
+}
+
+//! Where each property the renderer needs sits inside one vertex record: its
+//! byte offset (binary), its index in the property list (ASCII) and its type.
+struct PlyField {
+    size_t offset = 0;
+    size_t index = 0;
+    PlyType type = PlyType::Float32;
+};
+
+//! The vertex record layout, built from the header BY NAME: the property
+//! order does not matter, normals are optional, unknown scalar properties are
+//! stepped over, any scalar type is converted, and the SH rest block may be
+//! absent (degree 0) or hold degree 1/2/3.
 struct PlyLayout {
     size_t stride = 0;
-    size_t pos[3] = {};
-    size_t dc[3] = {};
-    size_t opacity = 0;
-    size_t scale[3] = {};
-    size_t rot[4] = {};
+    PlyField pos[3];
+    PlyField dc[3];
+    PlyField opacity;
+    PlyField scale[3];
+    PlyField rot[4];
     //! f_rest_0..N-1 in file order. N is 0, 9, 24 or 45 (degree 0..3): PLY
     //! stores the rest coefficients channel-major, N/3 per channel.
-    std::vector<size_t> rest;
+    std::vector<PlyField> rest;
     //! True when the vertex element is exactly ExpectedPlyVertexProperties(),
-    //! all float32: the record is then a PlyVertexStorage and is bulk-read.
+    //! all float32: in a little-endian file the record is then a
+    //! PlyVertexStorage and is bulk-read.
     bool standard62 = false;
 };
 
-bool BuildPlyLayout(const std::vector<std::pair<std::string, std::string>>& props,
-                    PlyLayout& layout, std::string& error)
+bool BuildPlyLayout(const std::vector<PlyProperty>& props, PlyLayout& layout, std::string& error)
 {
-    constexpr size_t kMissing = (size_t)-1;
     const char* const required[] = {"x",       "y",       "z",       "f_dc_0", "f_dc_1",
                                     "f_dc_2",  "opacity", "scale_0", "scale_1", "scale_2",
                                     "rot_0",   "rot_1",   "rot_2",   "rot_3"};
     constexpr size_t kRequired = sizeof(required) / sizeof(required[0]);
-    size_t reqOffset[kRequired];
-    for (size_t& o : reqOffset) o = kMissing;
+    PlyField reqField[kRequired];
+    bool reqSeen[kRequired] = {};
 
-    std::vector<size_t> restOffset(45, kMissing);
+    std::vector<PlyField> restField(45);
+    std::vector<bool> restSeen(45, false);
     size_t restCount = 0;
     std::vector<std::string> seen;
     seen.reserve(props.size());
 
     size_t offset = 0;
-    for (const auto& prop : props) {
-        const std::string& type = prop.first;
-        const std::string& name = prop.second;
-        const size_t size = PlyScalarSize(type);
-        if (size == 0) {
-            error = "vertex property '" + name + "' has unsupported type '" + type + "'";
+    for (size_t pi = 0; pi < props.size(); pi++) {
+        const PlyProperty& prop = props[pi];
+        const std::string& name = prop.name;
+        if (prop.isList) {
+            error = "vertex element has a list property '" + name +
+                    "'; only scalar vertex properties are supported";
+            return false;
+        }
+        if (!prop.typeOk) {
+            error = "vertex property '" + name + "' has unsupported type '" + prop.typeName + "'";
             return false;
         }
         if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
@@ -175,14 +309,12 @@ bool BuildPlyLayout(const std::vector<std::pair<std::string, std::string>>& prop
         }
         seen.push_back(name);
 
+        const PlyField field{offset, pi, prop.type};
         bool isRequired = false;
         for (size_t r = 0; r < kRequired; r++) {
             if (name == required[r]) {
-                if (!IsPlyFloat32(type)) {
-                    error = "vertex property '" + name + "' must be float, found '" + type + "'";
-                    return false;
-                }
-                reqOffset[r] = offset;
+                reqField[r] = field;
+                reqSeen[r] = true;
                 isRequired = true;
                 break;
             }
@@ -195,20 +327,17 @@ bool BuildPlyLayout(const std::vector<std::pair<std::string, std::string>>& prop
                         "(f_rest_0..f_rest_44)";
                 return false;
             }
-            if (!IsPlyFloat32(type)) {
-                error = "vertex property '" + name + "' must be float, found '" + type + "'";
-                return false;
-            }
-            restOffset[(size_t)idx] = offset;
+            restField[(size_t)idx] = field;
+            restSeen[(size_t)idx] = true;
             restCount++;
         }
         // nx/ny/nz and any other property: present in the record, not read.
-        offset += size;
+        offset += PlyTypeSize(prop.type);
     }
     layout.stride = offset;
 
     for (size_t r = 0; r < kRequired; r++) {
-        if (reqOffset[r] == kMissing) {
+        if (!reqSeen[r]) {
             error = std::string("missing required vertex property '") + required[r] +
                     "' (a 3DGS PLY needs x y z f_dc_0..2 opacity scale_0..2 rot_0..3)";
             return false;
@@ -222,61 +351,223 @@ bool BuildPlyLayout(const std::vector<std::pair<std::string, std::string>>& prop
     }
     layout.rest.clear();
     for (size_t i = 0; i < restCount; i++) {
-        if (restOffset[i] == kMissing) {
+        if (!restSeen[i]) {
             error = "vertex element has " + std::to_string(restCount) +
                     " f_rest properties but no 'f_rest_" + std::to_string(i) + "'";
             return false;
         }
-        layout.rest.push_back(restOffset[i]);
+        layout.rest.push_back(restField[i]);
     }
 
-    for (int i = 0; i < 3; i++) layout.pos[i] = reqOffset[i];
-    for (int i = 0; i < 3; i++) layout.dc[i] = reqOffset[3 + i];
-    layout.opacity = reqOffset[6];
-    for (int i = 0; i < 3; i++) layout.scale[i] = reqOffset[7 + i];
-    for (int i = 0; i < 4; i++) layout.rot[i] = reqOffset[10 + i];
+    for (int i = 0; i < 3; i++) layout.pos[i] = reqField[i];
+    for (int i = 0; i < 3; i++) layout.dc[i] = reqField[3 + i];
+    layout.opacity = reqField[6];
+    for (int i = 0; i < 3; i++) layout.scale[i] = reqField[7 + i];
+    for (int i = 0; i < 4; i++) layout.rot[i] = reqField[10 + i];
 
     const std::vector<std::string> expected = ExpectedPlyVertexProperties();
     layout.standard62 = props.size() == expected.size();
     for (size_t i = 0; layout.standard62 && i < props.size(); i++) {
-        layout.standard62 = IsPlyFloat32(props[i].first) && props[i].second == expected[i];
+        layout.standard62 = props[i].type == PlyType::Float32 && props[i].name == expected[i];
     }
     return true;
 }
 
 //! Unpack one vertex record of any layout into the standard 62-float storage
 //! (normals zero, absent SH rest coefficients zero), so a single conversion
-//! path serves every layout.
-void DecodePlyRecord(const unsigned char* rec, const PlyLayout& L, PlyVertexStorage& s)
+//! path serves every layout and format. `get` returns a field's value.
+template <typename Get>
+void DecodePlyRecord(const PlyLayout& L, const Get& get, PlyVertexStorage& s)
 {
-    auto rd = [rec](size_t off) {
-        float f;
-        std::memcpy(&f, rec + off, sizeof(f));
-        return f;
-    };
     std::memset(&s, 0, sizeof(s));
-    s.x = rd(L.pos[0]);
-    s.y = rd(L.pos[1]);
-    s.z = rd(L.pos[2]);
-    s.shs[0] = rd(L.dc[0]);
-    s.shs[1] = rd(L.dc[1]);
-    s.shs[2] = rd(L.dc[2]);
+    s.x = get(L.pos[0]);
+    s.y = get(L.pos[1]);
+    s.z = get(L.pos[2]);
+    s.shs[0] = get(L.dc[0]);
+    s.shs[1] = get(L.dc[1]);
+    s.shs[2] = get(L.dc[2]);
     // PLY rest block is channel-major with k = N/3 coefficients per channel;
     // the storage holds 15 per channel, so degree < 3 leaves the tail zero.
     const size_t k = L.rest.size() / 3;
     for (size_t c = 0; c < 3; c++) {
         for (size_t j = 0; j < k; j++) {
-            s.shs[3 + c * 15 + j] = rd(L.rest[c * k + j]);
+            s.shs[3 + c * 15 + j] = get(L.rest[c * k + j]);
         }
     }
-    s.opacity = rd(L.opacity);
-    s.sx = rd(L.scale[0]);
-    s.sy = rd(L.scale[1]);
-    s.sz = rd(L.scale[2]);
-    s.rot_w = rd(L.rot[0]);
-    s.rot_x = rd(L.rot[1]);
-    s.rot_y = rd(L.rot[2]);
-    s.rot_z = rd(L.rot[3]);
+    s.opacity = get(L.opacity);
+    s.sx = get(L.scale[0]);
+    s.sy = get(L.scale[1]);
+    s.sz = get(L.scale[2]);
+    s.rot_w = get(L.rot[0]);
+    s.rot_x = get(L.rot[1]);
+    s.rot_y = get(L.rot[2]);
+    s.rot_z = get(L.rot[3]);
+}
+
+//! PlyVertexStorage (raw 3DGS values, PLY coordinates) -> GsVertex.
+void ConvertPlyVertex(const PlyVertexStorage& s, GsVertex& v)
+{
+    // gsplat-trainer PLY: RDF (Y-down, Z-forward) plus an X-mirror vs
+    // SuperSplat reference. Convert to canonical RUB (+X right, +Y up,
+    // +Z back) at load so the renderer / app code can stay in one
+    // consistent +Y-up convention end-to-end. Without this, runtime
+    // view-stage flips would have to compensate (and that pattern caused
+    // the eye-Y / click-NDC / teleport-target Y inconsistencies).
+    v.position[0] = -s.x;   // undo X-mirror
+    v.position[1] = -s.y;   // RDF Y-down → canonical Y-up
+    v.position[2] = -s.z;   // RDF Z-forward → canonical Z-back
+    v.position[3] = 1.0f;
+
+    // Scale: exp(raw), Opacity: sigmoid(raw)
+    v.scale_opacity[0] = std::exp(s.sx);
+    v.scale_opacity[1] = std::exp(s.sy);
+    v.scale_opacity[2] = std::exp(s.sz);
+    v.scale_opacity[3] = sigmoid(s.opacity);
+
+    // Rotation: normalize quaternion
+    float qw = s.rot_w, qx = s.rot_x, qy = s.rot_y, qz = s.rot_z;
+    float qlen = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
+    if (qlen > 1e-8f) {
+        float inv = 1.0f / qlen;
+        qw *= inv; qx *= inv; qy *= inv; qz *= inv;
+    }
+    // Quaternion under the (-X, -Y, -Z) coord-flip composition:
+    // for q = (w, x, y, z), the rotation conjugated by the -I sign flip
+    // on the imaginary axes leaves the imaginary part unchanged in a
+    // pure 180-about-anything sense; but here we're flipping all three
+    // axes, which is equivalent to negating w (or equivalently the
+    // double-cover identity gives same rotation). Empirically this
+    // pattern matches the position transform for the X+Y+Z mirror:
+    v.rotation[0] = qw;  // w first (matches shader convention: q.x = w)
+    v.rotation[1] = -qx;
+    v.rotation[2] =  qy;
+    v.rotation[3] = -qz;
+
+    // SH coefficients: de-interleave from PLY layout to GPU layout.
+    // PLY:  [R_dc, G_dc, B_dc, R_1..R_15, G_1..G_15, B_1..B_15]
+    // GPU:  [R_dc, G_dc, B_dc, R_1, G_1, B_1, R_2, G_2, B_2, ...]
+    v.sh[0] = s.shs[0];  // R DC
+    v.sh[1] = s.shs[1];  // G DC
+    v.sh[2] = s.shs[2];  // B DC
+
+    for (int j = 1; j < 16; j++) {
+        v.sh[j * 3 + 0] = s.shs[(j - 1) + 3];       // R channel
+        v.sh[j * 3 + 1] = s.shs[(j - 1) + 18];      // G channel (3 + 15)
+        v.sh[j * 3 + 2] = s.shs[(j - 1) + 33];      // B channel (3 + 30)
+    }
+}
+
+//! Step over every record of a binary element that precedes the vertex
+//! block. All-scalar elements are one seek (checked against the file size
+//! first); elements with list properties are walked record by record.
+bool SkipBinaryPlyElement(std::istream& in, const PlyElement& el, bool swap,
+                          std::streamoff fileEnd, std::string& error)
+{
+    bool hasList = false;
+    uint64_t stride = 0;
+    for (const PlyProperty& p : el.props) {
+        if (!p.typeOk) {
+            error = "element '" + el.name + "' property '" + p.name + "' has unsupported type '" +
+                    p.typeName + "'";
+            return false;
+        }
+        if (p.isList) {
+            if (!PlyTypeIsInteger(p.countType)) {
+                error = "element '" + el.name + "' list '" + p.name +
+                        "' has a non-integer count type";
+                return false;
+            }
+            hasList = true;
+        } else {
+            stride += PlyTypeSize(p.type);
+        }
+    }
+    const std::string ends = "element '" + el.name + "' (before the vertex element) ends early";
+
+    if (!hasList) {
+        if (stride == 0 || el.count == 0) return true;
+        const std::streamoff here = (std::streamoff)in.tellg();
+        if (here < 0 || here > fileEnd) {
+            error = "cannot determine file position";
+            return false;
+        }
+        const uint64_t remaining = (uint64_t)(fileEnd - here);
+        if (el.count > remaining / stride) {
+            error = ends;
+            return false;
+        }
+        in.seekg((std::streamoff)(el.count * stride), std::ios::cur);
+        if (!in) {
+            error = ends;
+            return false;
+        }
+        return true;
+    }
+
+    // ignore() at end of file sets only eofbit, so the byte count is checked.
+    auto skip = [&in](uint64_t bytes) {
+        in.ignore((std::streamsize)bytes);
+        return (uint64_t)in.gcount() == bytes;
+    };
+    unsigned char buf[8];
+    for (uint64_t r = 0; r < el.count; r++) {
+        for (const PlyProperty& p : el.props) {
+            if (!p.isList) {
+                if (!skip(PlyTypeSize(p.type))) {
+                    error = ends;
+                    return false;
+                }
+                continue;
+            }
+            in.read(reinterpret_cast<char*>(buf), (std::streamsize)PlyTypeSize(p.countType));
+            if (!in) {
+                error = ends;
+                return false;
+            }
+            const double n = ReadPlyScalar(buf, p.countType, swap);
+            if (n < 0) {
+                error = "element '" + el.name + "' list '" + p.name + "' has a negative count";
+                return false;
+            }
+            const uint64_t bytes = (uint64_t)n * PlyTypeSize(p.type);
+            if (bytes > (uint64_t)fileEnd || !skip(bytes)) {
+                error = ends;
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+//! Same, ASCII: consume the element's tokens (list counts decide how many).
+bool SkipAsciiPlyElement(PlyAsciiReader& rd, const PlyElement& el, std::string& error)
+{
+    const std::string ends = "element '" + el.name + "' (before the vertex element) ends early";
+    std::string tok;
+    bool tooLong = false;
+    for (uint64_t r = 0; r < el.count; r++) {
+        for (const PlyProperty& p : el.props) {
+            uint64_t n = 1;
+            if (p.isList) {
+                if (!rd.Next(tok, tooLong)) {
+                    error = tooLong ? "over-long token in element '" + el.name + "'" : ends;
+                    return false;
+                }
+                if (!ParsePlyCount(tok, n)) {
+                    error = "element '" + el.name + "' list '" + p.name + "' has a bad count '" +
+                            tok + "'";
+                    return false;
+                }
+            }
+            for (uint64_t i = 0; i < n; i++) {
+                if (!rd.Next(tok, tooLong)) {
+                    error = tooLong ? "over-long token in element '" + el.name + "'" : ends;
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
@@ -289,9 +580,8 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
     }
 
     // ── Header ──────────────────────────────────────────────────────────
-    // Every line is read, not just the vertex count: the format, the element
-    // order and the vertex property list all decide how a vertex record is
-    // laid out (see BuildPlyLayout).
+    // Every line is read: the format, every element and every property
+    // decide where the vertex records are and how one is laid out.
     std::string line;
     size_t headerBytes = 0;
     if (!ReadPlyHeaderLine(file, line, headerBytes, error)) return false;
@@ -301,12 +591,10 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
     }
 
     bool haveFormat = false;
-    bool haveVertex = false;
-    bool inVertex = false;
+    PlyFormat format = PlyFormat::BinaryLittleEndian;
     bool foundEnd = false;
-    uint64_t numVertices = 0;
-    // "<type> <name>" per vertex property, in file order.
-    std::vector<std::pair<std::string, std::string>> vertexProps;
+    std::vector<PlyElement> elements;
+    size_t vertexIndex = (size_t)-1;
 
     while (ReadPlyHeaderLine(file, line, headerBytes, error)) {
         std::istringstream ls(line);
@@ -327,9 +615,16 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
                 error = "header has more than one format line";
                 return false;
             }
-            if (fmt != "binary_little_endian" || ver != "1.0" || !extra.empty()) {
+            if (ver != "1.0" || !extra.empty()) {
+                error = "unsupported PLY format '" + line + "' (only version 1.0 is supported)";
+                return false;
+            }
+            if (fmt == "binary_little_endian") format = PlyFormat::BinaryLittleEndian;
+            else if (fmt == "binary_big_endian") format = PlyFormat::BinaryBigEndian;
+            else if (fmt == "ascii") format = PlyFormat::Ascii;
+            else {
                 error = "unsupported PLY format '" + line +
-                        "' (only 'format binary_little_endian 1.0' is supported)";
+                        "' (expected ascii, binary_little_endian or binary_big_endian)";
                 return false;
             }
             haveFormat = true;
@@ -344,44 +639,45 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
                 return false;
             }
             if (name == "vertex") {
-                if (haveVertex) {
+                if (vertexIndex != (size_t)-1) {
                     error = "header declares more than one vertex element";
                     return false;
                 }
-                haveVertex = true;
-                inVertex = true;
-                numVertices = count;
-            } else {
-                // Elements AFTER the vertex block sit past the bytes read
-                // here and are ignored. One BEFORE it would put its data
-                // where the vertices are expected.
-                if (!haveVertex) {
-                    error = "element '" + name +
-                            "' precedes the vertex element (vertex must be first)";
-                    return false;
-                }
-                inVertex = false;
+                vertexIndex = elements.size();
             }
+            elements.push_back(PlyElement{name, count, {}});
             continue;
         }
         if (keyword == "property") {
-            if (!haveVertex) {
+            if (elements.empty()) {
                 error = "property line before any element: '" + line + "'";
                 return false;
             }
-            if (!inVertex) continue;  // a later element's property; not read
-            std::string type, name, extra;
-            ls >> type >> name >> extra;
-            if (type == "list") {
-                error = "vertex element has a list property ('" + line +
-                        "'); only scalar float properties are supported";
-                return false;
+            PlyProperty prop;
+            std::string first, extra;
+            ls >> first;
+            if (first == "list") {
+                std::string countType;
+                ls >> countType >> prop.typeName >> prop.name >> extra;
+                prop.isList = true;
+                if (countType.empty() || !ParsePlyType(countType, prop.countType)) {
+                    // Unknown count type: unreadable, but only an error if
+                    // this element has to be read or stepped over.
+                    prop.typeName = countType;
+                    prop.typeOk = false;
+                } else {
+                    prop.typeOk = ParsePlyType(prop.typeName, prop.type);
+                }
+            } else {
+                prop.typeName = first;
+                ls >> prop.name >> extra;
+                prop.typeOk = ParsePlyType(prop.typeName, prop.type);
             }
-            if (type.empty() || name.empty() || !extra.empty()) {
+            if (prop.typeName.empty() || prop.name.empty() || !extra.empty()) {
                 error = "malformed property line '" + line + "'";
                 return false;
             }
-            vertexProps.emplace_back(type, name);
+            elements.back().props.push_back(prop);
             continue;
         }
         error = "unrecognised header line '" + line + "'";
@@ -393,14 +689,16 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
         error = "header has no format line";
         return false;
     }
-    if (!haveVertex) {
+    if (vertexIndex == (size_t)-1) {
         error = "header has no vertex element";
         return false;
     }
+    const PlyElement& vertexEl = elements[vertexIndex];
+    const uint64_t numVertices = vertexEl.count;
 
     // ── Vertex layout, by property name ────────────────────────────────
     PlyLayout layout;
-    if (!BuildPlyLayout(vertexProps, layout, error)) return false;
+    if (!BuildPlyLayout(vertexEl.props, layout, error)) return false;
     static_assert(sizeof(PlyVertexStorage) == 62 * sizeof(float),
                   "PlyVertexStorage must be the 62-float layout");
 
@@ -423,115 +721,132 @@ bool ParsePlyFileImpl(const std::string& path, std::vector<GsVertex>& vertices,
         return false;
     }
     file.seekg(dataStart, std::ios::beg);
-    const uint64_t remaining = (uint64_t)(fileEnd - dataStart);
-    const uint64_t needed = numVertices * (uint64_t)layout.stride;
-    if (needed > remaining) {
-        error = "header declares " + std::to_string(numVertices) + " gaussians (" +
-                std::to_string(needed) + " bytes) but only " + std::to_string(remaining) +
-                " bytes follow the header";
-        return false;
+    const bool ascii = format == PlyFormat::Ascii;
+    const bool hostLittle = std::endian::native == std::endian::little;
+    const bool swap = !ascii && ((format == PlyFormat::BinaryLittleEndian) != hostLittle);
+
+    // Smallest vertex block the header allows: the record stride in binary;
+    // in ASCII one character plus one separator per value (the last value of
+    // the file may lack its separator). Checked from the end of the header,
+    // i.e. before any preceding element is stepped over, so it is a lower
+    // bound; binary is rechecked exactly at the vertex block below.
+    {
+        const uint64_t remaining = (uint64_t)(fileEnd - dataStart);
+        const uint64_t needed = ascii
+            ? numVertices * (uint64_t)vertexEl.props.size() * 2 - 1
+            : numVertices * (uint64_t)layout.stride;
+        if (needed > remaining) {
+            error = "header declares " + std::to_string(numVertices) + " gaussians (at least " +
+                    std::to_string(needed) + " bytes) but only " + std::to_string(remaining) +
+                    " bytes follow the header";
+            return false;
+        }
     }
-    // A 32-bit ABI cannot address the block even when the file holds it.
-    if (needed > (uint64_t)(std::numeric_limits<size_t>::max)() ||
-        needed > (uint64_t)(std::numeric_limits<std::streamsize>::max)()) {
-        error = "vertex data (" + std::to_string(needed) +
-                " bytes) is too large for this build";
-        return false;
+
+    // ── Elements declared before the vertex element: step over them ────
+    std::unique_ptr<PlyAsciiReader> asciiReader;
+    if (ascii) asciiReader = std::make_unique<PlyAsciiReader>(file);
+    for (size_t e = 0; e < vertexIndex; e++) {
+        const bool ok = ascii ? SkipAsciiPlyElement(*asciiReader, elements[e], error)
+                              : SkipBinaryPlyElement(file, elements[e], swap, fileEnd, error);
+        if (!ok) return false;
+    }
+    // Elements after the vertex block sit past the bytes read here and are
+    // never read.
+
+    uint64_t needed = numVertices * (uint64_t)layout.stride;
+    if (!ascii) {
+        const std::streamoff here = (std::streamoff)file.tellg();
+        if (here < 0 || here > fileEnd) {
+            error = "cannot determine file position";
+            return false;
+        }
+        const uint64_t remaining = (uint64_t)(fileEnd - here);
+        if (needed > remaining) {
+            error = "header declares " + std::to_string(numVertices) + " gaussians (" +
+                    std::to_string(needed) + " bytes) but only " + std::to_string(remaining) +
+                    " bytes follow the header";
+            return false;
+        }
+        // A 32-bit ABI cannot address the block even when the file holds it.
+        if (needed > (uint64_t)(std::numeric_limits<size_t>::max)() ||
+            needed > (uint64_t)(std::numeric_limits<std::streamsize>::max)()) {
+            error = "vertex data (" + std::to_string(needed) +
+                    " bytes) is too large for this build";
+            return false;
+        }
     }
 
     const size_t count = (size_t)numVertices;
-    printf("ParsePlyFile: loading %zu gaussians from %s (%zu-byte records, SH degree %d%s)\n",
-           count, path.c_str(), layout.stride,
+    const bool fast = layout.standard62 && format == PlyFormat::BinaryLittleEndian && hostLittle;
+    printf("ParsePlyFile: loading %zu gaussians from %s (%s, %zu properties, SH degree %d%s)\n",
+           count, path.c_str(),
+           ascii ? "ascii" : format == PlyFormat::BinaryBigEndian ? "big-endian" : "little-endian",
+           vertexEl.props.size(),
            layout.rest.empty() ? 0 : layout.rest.size() == 9 ? 1 : layout.rest.size() == 24 ? 2 : 3,
-           layout.standard62 ? ", standard layout" : "");
+           fast ? ", standard layout" : "");
 
     vertices.resize(count);
 
-    // Fast path: the standard 62-float layout is read straight into
-    // PlyVertexStorage in one go. Any other layout is read in chunks of raw
-    // records and unpacked by name into the same storage.
-    std::vector<PlyVertexStorage> storage;
-    std::vector<unsigned char> raw;
-    size_t chunk = count;
-    if (layout.standard62) {
-        storage.resize(count);
+    if (fast) {
+        // The standard 62-float little-endian layout is read straight into
+        // PlyVertexStorage in one go.
+        std::vector<PlyVertexStorage> storage(count);
         file.read(reinterpret_cast<char*>(storage.data()), (std::streamsize)needed);
         if (!file) {
             error = "failed to read vertex data (expected " + std::to_string(needed) + " bytes)";
             return false;
         }
-    } else {
-        chunk = (std::min)(count, (size_t)65536);
-        raw.resize(chunk * layout.stride);
-        storage.resize(1);
-    }
-
-    for (size_t base = 0; base < count; base += chunk) {
-        const size_t n = (std::min)(chunk, count - base);
-        if (!layout.standard62) {
+        for (size_t i = 0; i < count; i++) ConvertPlyVertex(storage[i], vertices[i]);
+    } else if (!ascii) {
+        // Any other binary layout: raw records in chunks, unpacked by name.
+        const size_t chunk = (std::min)(count, (size_t)65536);
+        std::vector<unsigned char> raw(chunk * layout.stride);
+        PlyVertexStorage s;
+        for (size_t base = 0; base < count; base += chunk) {
+            const size_t n = (std::min)(chunk, count - base);
             file.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)(n * layout.stride));
             if (!file) {
                 error = "failed to read vertex data (expected " + std::to_string(needed) +
                         " bytes)";
                 return false;
             }
+            for (size_t ci = 0; ci < n; ci++) {
+                const unsigned char* rec = raw.data() + ci * layout.stride;
+                DecodePlyRecord(
+                    layout,
+                    [rec, swap](const PlyField& f) {
+                        return (float)ReadPlyScalar(rec + f.offset, f.type, swap);
+                    },
+                    s);
+                ConvertPlyVertex(s, vertices[base + ci]);
+            }
         }
-        for (size_t ci = 0; ci < n; ci++) {
-            const size_t i = base + ci;
-            if (!layout.standard62) {
-                DecodePlyRecord(raw.data() + ci * layout.stride, layout, storage[0]);
+    } else {
+        // ASCII: one value per token, every value parsed (so junk anywhere
+        // in the vertex block is an error, not a silent zero).
+        std::vector<float> vals(vertexEl.props.size());
+        std::string tok;
+        bool tooLong = false;
+        PlyVertexStorage s;
+        for (size_t i = 0; i < count; i++) {
+            for (size_t p = 0; p < vals.size(); p++) {
+                double d = 0.0;
+                if (!asciiReader->Next(tok, tooLong)) {
+                    error = tooLong ? "over-long token in vertex " + std::to_string(i)
+                                    : "vertex data ends at vertex " + std::to_string(i) + " of " +
+                                          std::to_string(count);
+                    return false;
+                }
+                if (!ParsePlyAsciiNumber(tok, d)) {
+                    error = "vertex " + std::to_string(i) + " property '" +
+                            vertexEl.props[p].name + "' is not a number: '" + tok + "'";
+                    return false;
+                }
+                vals[p] = (float)d;
             }
-            const PlyVertexStorage& s = layout.standard62 ? storage[i] : storage[0];
-            GsVertex& v = vertices[i];
-
-            // gsplat-trainer PLY: RDF (Y-down, Z-forward) plus an X-mirror vs
-            // SuperSplat reference. Convert to canonical RUB (+X right, +Y up,
-            // +Z back) at load so the renderer / app code can stay in one
-            // consistent +Y-up convention end-to-end. Without this, runtime
-            // view-stage flips would have to compensate (and that pattern caused
-            // the eye-Y / click-NDC / teleport-target Y inconsistencies).
-            v.position[0] = -s.x;   // undo X-mirror
-            v.position[1] = -s.y;   // RDF Y-down → canonical Y-up
-            v.position[2] = -s.z;   // RDF Z-forward → canonical Z-back
-            v.position[3] = 1.0f;
-
-            // Scale: exp(raw), Opacity: sigmoid(raw)
-            v.scale_opacity[0] = std::exp(s.sx);
-            v.scale_opacity[1] = std::exp(s.sy);
-            v.scale_opacity[2] = std::exp(s.sz);
-            v.scale_opacity[3] = sigmoid(s.opacity);
-
-            // Rotation: normalize quaternion
-            float qw = s.rot_w, qx = s.rot_x, qy = s.rot_y, qz = s.rot_z;
-            float qlen = std::sqrt(qw*qw + qx*qx + qy*qy + qz*qz);
-            if (qlen > 1e-8f) {
-                float inv = 1.0f / qlen;
-                qw *= inv; qx *= inv; qy *= inv; qz *= inv;
-            }
-            // Quaternion under the (-X, -Y, -Z) coord-flip composition:
-            // for q = (w, x, y, z), the rotation conjugated by the -I sign flip
-            // on the imaginary axes leaves the imaginary part unchanged in a
-            // pure 180-about-anything sense; but here we're flipping all three
-            // axes, which is equivalent to negating w (or equivalently the
-            // double-cover identity gives same rotation). Empirically this
-            // pattern matches the position transform for the X+Y+Z mirror:
-            v.rotation[0] = qw;  // w first (matches shader convention: q.x = w)
-            v.rotation[1] = -qx;
-            v.rotation[2] =  qy;
-            v.rotation[3] = -qz;
-
-            // SH coefficients: de-interleave from PLY layout to GPU layout.
-            // PLY:  [R_dc, G_dc, B_dc, R_1..R_15, G_1..G_15, B_1..B_15]
-            // GPU:  [R_dc, G_dc, B_dc, R_1, G_1, B_1, R_2, G_2, B_2, ...]
-            v.sh[0] = s.shs[0];  // R DC
-            v.sh[1] = s.shs[1];  // G DC
-            v.sh[2] = s.shs[2];  // B DC
-
-            for (int j = 1; j < 16; j++) {
-                v.sh[j * 3 + 0] = s.shs[(j - 1) + 3];       // R channel
-                v.sh[j * 3 + 1] = s.shs[(j - 1) + 18];      // G channel (3 + 15)
-                v.sh[j * 3 + 2] = s.shs[(j - 1) + 33];      // B channel (3 + 30)
-            }
+            DecodePlyRecord(layout, [&vals](const PlyField& f) { return vals[f.index]; }, s);
+            ConvertPlyVertex(s, vertices[i]);
         }
     }
 
