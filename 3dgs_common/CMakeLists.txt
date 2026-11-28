@@ -301,8 +301,9 @@ if(NOT ANDROID)
 
     # gs_ply_loader_test: unit test for ParsePlyFile (gs_scene_loader.cpp).
     # Writes tiny synthetic PLYs (standard 62-float, degree-0 14-float, degree
-    # 1/2, unknown extra properties, refusals) to the temp dir and checks the
-    # decode. Compiles the loader directly — no Vulkan, no GPU. CI runs it on
+    # 1/2/3, unknown extra properties, double/integer properties, big-endian,
+    # ascii, elements before/after vertex, refusals) to the temp dir and checks
+    # the decode. Compiles the loader directly — no Vulkan, no GPU. CI runs it on
     # Linux (build-linux.yml); exit code 0 = pass.
     add_executable(gs_ply_loader_test gs_ply_loader_test.cpp gs_scene_loader.cpp)
     target_include_directories(gs_ply_loader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

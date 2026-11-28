@@ -15,6 +15,10 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <algorithm>
+#include <cstdint>
+#include <iterator>
+#include <limits>
 #include <map>
 #include <string>
 #include <vector>
@@ -94,43 +98,129 @@ std::vector<std::string> StandardNames(int restCount, bool normals)
     return n;
 }
 
-void Put(std::ofstream& f, const std::string& type, float value)
+//! Output encoding of a synthetic file.
+enum class Fmt { LE, BE, Ascii };
+
+const char* FmtName(Fmt fmt)
 {
-    if (type == "float") {
-        f.write(reinterpret_cast<const char*>(&value), 4);
-    } else if (type == "double") {
-        double d = value;
-        f.write(reinterpret_cast<const char*>(&d), 8);
-    } else if (type == "uchar") {
-        unsigned char c = 42;
-        f.write(reinterpret_cast<const char*>(&c), 1);
-    } else if (type == "int") {
-        int i = 7;
-        f.write(reinterpret_cast<const char*>(&i), 4);
-    } else {
+    return fmt == Fmt::LE ? "binary_little_endian" : fmt == Fmt::BE ? "binary_big_endian" : "ascii";
+}
+
+template <typename T>
+void PutRaw(std::ofstream& f, Fmt fmt, T v)
+{
+    unsigned char b[sizeof(T)];
+    std::memcpy(b, &v, sizeof(T));
+    if (fmt == Fmt::BE) std::reverse(b, b + sizeof(T));
+    f.write(reinterpret_cast<const char*>(b), sizeof(T));
+}
+
+//! Integer types store the value truncated, or 7 when it does not fit
+//! (unknown properties are 777 and are never read).
+template <typename T>
+T ToInt(float value)
+{
+    const double t = std::trunc((double)value);
+    if (t < (double)(std::numeric_limits<T>::min)() || t > (double)(std::numeric_limits<T>::max)())
+        return (T)7;
+    return (T)t;
+}
+
+void Put(std::ofstream& f, Fmt fmt, const std::string& type, float value)
+{
+    if (fmt == Fmt::Ascii) {
+        char buf[64];
+        if (type == "float" || type == "double")
+            std::snprintf(buf, sizeof(buf), "%.9g ", (double)value);
+        else if (type == "uchar")
+            std::snprintf(buf, sizeof(buf), "%d ", (int)ToInt<uint8_t>(value));
+        else if (type == "short")
+            std::snprintf(buf, sizeof(buf), "%d ", (int)ToInt<int16_t>(value));
+        else if (type == "int")
+            std::snprintf(buf, sizeof(buf), "%d ", (int)ToInt<int32_t>(value));
+        else {
+            std::fprintf(stderr, "test bug: type %s\n", type.c_str());
+            std::abort();
+        }
+        f << buf;
+        return;
+    }
+    if (type == "float") PutRaw(f, fmt, value);
+    else if (type == "double") PutRaw(f, fmt, (double)value);
+    else if (type == "uchar") PutRaw(f, fmt, ToInt<uint8_t>(value));
+    else if (type == "short") PutRaw(f, fmt, ToInt<int16_t>(value));
+    else if (type == "int") PutRaw(f, fmt, ToInt<int32_t>(value));
+    else {
         std::fprintf(stderr, "test bug: type %s\n", type.c_str());
         std::abort();
     }
 }
 
+struct WriteOpts {
+    Fmt fmt = Fmt::LE;
+    //! Two elements BEFORE the vertex element (one all-scalar, one with a
+    //! list property), and a face element after it.
+    bool otherElements = false;
+};
+
 std::string WritePly(const std::filesystem::path& dir, const std::string& name,
-                     const std::vector<Prop>& props, int count)
+                     const std::vector<Prop>& props, int count, WriteOpts o = {})
 {
     const std::filesystem::path p = dir / (name + ".ply");
     std::ofstream f(p, std::ios::binary);
-    f << "ply\nformat binary_little_endian 1.0\ncomment synthetic test\n";
+    f << "ply\nformat " << FmtName(o.fmt) << " 1.0\ncomment synthetic test\n";
+    if (o.otherElements) {
+        f << "element camera 2\nproperty float fx\nproperty double fy\nproperty uchar id\n";
+        f << "element tag 3\nproperty list uchar int ids\nproperty short weight\n";
+    }
     f << "element vertex " << count << "\n";
     for (const auto& pr : props) f << "property " << pr.type << " " << pr.name << "\n";
+    if (o.otherElements) f << "element face 1\nproperty list uchar int vertex_indices\n";
     f << "end_header\n";
+    auto nl = [&] {
+        if (o.fmt == Fmt::Ascii) f << "\n";
+    };
+    if (o.otherElements) {
+        for (int c = 0; c < 2; c++) {
+            Put(f, o.fmt, "float", 500.0f);
+            Put(f, o.fmt, "double", 600.0f);
+            Put(f, o.fmt, "uchar", 9.0f);
+            nl();
+        }
+        for (int t = 0; t < 3; t++) {
+            // A list of t+1 ints, then a short.
+            if (o.fmt == Fmt::Ascii) f << (t + 1) << " ";
+            else PutRaw(f, o.fmt, (uint8_t)(t + 1));
+            for (int i = 0; i <= t; i++) Put(f, o.fmt, "int", 40.0f + (float)i);
+            Put(f, o.fmt, "short", -5.0f);
+            nl();
+        }
+    }
     for (int v = 0; v < count; v++) {
-        for (const auto& pr : props) Put(f, pr.type, ValueFor(v, pr.name));
+        for (const auto& pr : props) Put(f, o.fmt, pr.type, ValueFor(v, pr.name));
+        nl();
+    }
+    if (o.otherElements) {
+        if (o.fmt == Fmt::Ascii) f << "3 ";
+        else PutRaw(f, o.fmt, (uint8_t)3);
+        for (int i = 0; i < 3; i++) Put(f, o.fmt, "int", (float)i);
+        nl();
     }
     return p.string();
 }
 
+//! Every property typed `type`.
+std::vector<Prop> TypedProps(const std::vector<std::string>& names, const std::string& type)
+{
+    std::vector<Prop> out;
+    for (const auto& n : names) out.push_back({type, n});
+    return out;
+}
+
 //! Checks the fields every accepted layout must decode identically, and the
 //! SH rest block for `restCount` (0 = all zero).
-void CheckVertices(const std::vector<GsVertex>& verts, int count, int restCount)
+void CheckVertices(const std::vector<GsVertex>& verts, int count, int restCount,
+                   bool intPos = false)
 {
     CHECK((int)verts.size() == count);
     if ((int)verts.size() != count) return;
@@ -138,9 +228,11 @@ void CheckVertices(const std::vector<GsVertex>& verts, int count, int restCount)
     for (int v = 0; v < count; v++) {
         const GsVertex& g = verts[v];
         // RDF -> RUB: all three axes negated.
-        CHECK(Near(g.position[0], -(1.0f + VDelta(v))));
-        CHECK(Near(g.position[1], -(2.0f + VDelta(v))));
-        CHECK(Near(g.position[2], -(3.0f + VDelta(v))));
+        // Integer-typed positions hold the truncated value (1, 2, 3).
+        const float d = intPos ? 0.0f : VDelta(v);
+        CHECK(Near(g.position[0], -(1.0f + d)));
+        CHECK(Near(g.position[1], -(2.0f + d)));
+        CHECK(Near(g.position[2], -(3.0f + d)));
         CHECK(Near(g.position[3], 1.0f));
         CHECK(Near(g.scale_opacity[0], std::exp(-1.0f + VDelta(v))));
         CHECK(Near(g.scale_opacity[2], std::exp(-3.0f + VDelta(v))));
@@ -168,7 +260,8 @@ void CheckVertices(const std::vector<GsVertex>& verts, int count, int restCount)
     }
 }
 
-void ExpectOk(const char* label, const std::string& path, int count, int restCount)
+void ExpectOk(const char* label, const std::string& path, int count, int restCount,
+              bool intPos = false)
 {
     std::printf("[case] %s\n", label);
     std::vector<GsVertex> verts;
@@ -176,7 +269,7 @@ void ExpectOk(const char* label, const std::string& path, int count, int restCou
     const bool ok = ParsePlyFile(path, verts, &err);
     if (!ok) std::fprintf(stderr, "  unexpected error: %s\n", err.c_str());
     CHECK(ok);
-    if (ok) CheckVertices(verts, count, restCount);
+    if (ok) CheckVertices(verts, count, restCount, intPos);
 }
 
 void ExpectError(const char* label, const std::string& path, const std::string& needle)
@@ -248,6 +341,58 @@ int main()
     ExpectOk("degree-0 70000 records (chunked read)",
              WritePly(dir, "deg0big", FloatProps(Degree0Names()), 70000), 70000, 0);
 
+    // ── Scalar types, byte order, ASCII, other elements ──
+    ExpectOk("degree-3, every property double",
+             WritePly(dir, "deg3dbl", TypedProps(StandardNames(45, true), "double"), n), n, 45);
+    {
+        std::vector<Prop> props = FloatProps(Degree0Names());
+        props[0].type = "int";
+        props[1].type = "short";
+        props[2].type = "uchar";
+        ExpectOk("degree-0, integer-typed x/y/z", WritePly(dir, "intpos", props, n), n, 0, true);
+    }
+    {
+        // Degree 3, every property reversed (f_rest_44 first, x last).
+        std::vector<std::string> names = StandardNames(45, false);
+        std::vector<std::string> shuffled(names.rbegin(), names.rend());
+        ExpectOk("degree-3 reversed property order",
+                 WritePly(dir, "deg3rev", FloatProps(shuffled), n), n, 45);
+    }
+    {
+        WriteOpts o;
+        o.otherElements = true;
+        ExpectOk("degree-0, elements before and after vertex",
+                 WritePly(dir, "lead0", FloatProps(Degree0Names()), n, o), n, 0);
+        ExpectOk("standard 62-float, elements before and after vertex (fast path)",
+                 WritePly(dir, "lead62", FloatProps(StandardNames(45, true)), n, o), n, 45);
+    }
+    {
+        WriteOpts o;
+        o.fmt = Fmt::BE;
+        ExpectOk("big-endian standard 62-float",
+                 WritePly(dir, "be62", FloatProps(StandardNames(45, true)), n, o), n, 45);
+        std::vector<Prop> props = FloatProps(Degree0Names());
+        props.insert(props.begin() + 3, {"double", "timestamp"});
+        props.push_back({"short", "segment_id"});
+        props[0].type = "double";
+        o.otherElements = true;
+        ExpectOk("big-endian degree-0, extras, double x, other elements",
+                 WritePly(dir, "be0", props, n, o), n, 0);
+    }
+    {
+        WriteOpts o;
+        o.fmt = Fmt::Ascii;
+        ExpectOk("ascii degree-0", WritePly(dir, "asc0", FloatProps(Degree0Names()), n, o), n, 0);
+        ExpectOk("ascii standard 62-float",
+                 WritePly(dir, "asc62", FloatProps(StandardNames(45, true)), n, o), n, 45);
+        std::vector<std::string> names = StandardNames(24, false);
+        std::vector<Prop> props = FloatProps(std::vector<std::string>(names.rbegin(), names.rend()));
+        props.insert(props.begin() + 5, {"uchar", "red"});
+        o.otherElements = true;
+        ExpectOk("ascii degree-2 reversed, extras, other elements",
+                 WritePly(dir, "asc2", props, n, o), n, 24);
+    }
+
     // ── Refusals ──
     {
         std::vector<std::string> names = Degree0Names();
@@ -262,9 +407,59 @@ int main()
     ExpectError("f_rest count not a whole SH degree",
                 WritePly(dir, "rest5", FloatProps(StandardNames(5, false)), n), "f_rest");
     {
-        std::vector<Prop> props = FloatProps(Degree0Names());
-        props[0].type = "double";
-        ExpectError("required property not float", WritePly(dir, "xdouble", props, n), "'x'");
+        const std::string p = (dir / "vlist.ply").string();
+        {
+            std::ofstream f(p, std::ios::binary);
+            f << "ply\nformat binary_little_endian 1.0\nelement vertex 1\n";
+            for (const auto& nm : Degree0Names()) f << "property float " << nm << "\n";
+            f << "property list uchar int extra\nend_header\n";
+        }
+        ExpectError("list property in the vertex element", p, "list property 'extra'");
+    }
+    {
+        const std::string p = (dir / "fmt.ply").string();
+        {
+            std::ofstream f(p, std::ios::binary);
+            f << "ply\nformat binary_middle_endian 1.0\nelement vertex 1\nend_header\n";
+        }
+        ExpectError("unknown format", p, "unsupported PLY format");
+    }
+    {
+        WriteOpts o;
+        o.fmt = Fmt::Ascii;
+        const std::string p = WritePly(dir, "asctrunc", FloatProps(Degree0Names()), 40, o);
+        fs::resize_file(p, fs::file_size(p) - 300);
+        ExpectError("ascii truncated", p, "vertex data ends at vertex");
+    }
+    {
+        WriteOpts o;
+        o.fmt = Fmt::Ascii;
+        const std::string p = WritePly(dir, "ascjunk", FloatProps(Degree0Names()), n, o);
+        std::string text;
+        {
+            std::ifstream in(p, std::ios::binary);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        const size_t at = text.find("end_header\n") + 11;
+        text.replace(at, 1, "q");  // first value of vertex 0 becomes junk
+        {
+            std::ofstream out(p, std::ios::binary | std::ios::trunc);
+            out << text;
+        }
+        ExpectError("ascii non-number", p, "is not a number");
+    }
+    {
+        // A leading element whose data is cut short.
+        const std::string p = (dir / "leadtrunc.ply").string();
+        {
+            std::ofstream f(p, std::ios::binary);
+            f << "ply\nformat binary_little_endian 1.0\nelement big 1000000\nproperty double v\n"
+                 "element vertex 1\n";
+            for (const auto& nm : Degree0Names()) f << "property float " << nm << "\n";
+            f << "end_header\n";
+            for (int i = 0; i < 100; i++) PutRaw(f, Fmt::LE, 1.0);
+        }
+        ExpectError("leading element truncated", p, "element 'big'");
     }
     {
         // Truncated data: header promises more records than the file holds.
